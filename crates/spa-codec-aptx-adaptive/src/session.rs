@@ -29,6 +29,16 @@ pub enum Framing {
     HeaderInRtpSwapped,
 }
 
+/// What the RTP timestamp counts in the clock framings. Spec §7E doesn't know which the sink
+/// wants with source type 2; `APTX_ADAPTIVE_TS` picks (see `dev`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TsUnit {
+    /// µs, +14000 per 14 ms packet. The default (§7D).
+    Micros,
+    /// Sample frames, +672 per packet at 48 kHz.
+    Samples,
+}
+
 /// The default; `APTX_ADAPTIVE_FRAMING` overrides it (see `dev`).
 pub const FRAMING: Framing = Framing::Phone;
 
@@ -84,6 +94,9 @@ pub struct Session<C> {
     pcm: Vec<i32>,
     /// Packets sent so far; drives the TTP clock.
     packets: u32,
+    /// DEV ONLY: replaces the RTP SSRC.
+    ssrc: Option<u32>,
+    ts: TsUnit,
 }
 
 impl Session<Encoder> {
@@ -122,6 +135,8 @@ impl Session<AnyCore> {
         s.payload_type = opts.payload_type;
         s.swap = opts.swap;
         s.scmst = opts.scmst;
+        s.ssrc = opts.ssrc;
+        s.ts = opts.ts;
         Ok(s)
     }
 }
@@ -163,6 +178,8 @@ impl<C: Core> Session<C> {
             scmst: None,
             mtu,
             packets: 0,
+            ssrc: None,
+            ts: TsUnit::Micros,
         })
     }
 
@@ -171,16 +188,27 @@ impl<C: Core> Session<C> {
         self.pcm.len() * BYTES_PER_SAMPLE
     }
 
-    /// One packet's duration in µs (14000 for 672 frames at 48 kHz).
-    fn packet_us(&self) -> u32 {
-        let c = self.stream.config();
-        let frames = self.stream.samples_per_packet() as u64 / u64::from(c.channels);
-        (frames * 1_000_000 / u64::from(c.sample_rate)) as u32
+    fn packet_frames(&self) -> u64 {
+        self.stream.samples_per_packet() as u64 / u64::from(self.stream.config().channels)
     }
 
-    /// The §7D timestamp of the next packet: `start + n × packet duration`, wrapping.
+    /// One packet's duration in µs (14000 for 672 frames at 48 kHz).
+    fn packet_us(&self) -> u32 {
+        let rate = u64::from(self.stream.config().sample_rate);
+        (self.packet_frames() * 1_000_000 / rate) as u32
+    }
+
+    /// How far the clock moves per packet, in the chosen unit.
+    fn ts_step(&self) -> u32 {
+        match self.ts {
+            TsUnit::Micros => self.packet_us(),
+            TsUnit::Samples => self.packet_frames() as u32,
+        }
+    }
+
+    /// The §7D timestamp of the next packet: `start + n × step`, wrapping.
     fn ttp_clock(&self, start: u32) -> u32 {
-        start.wrapping_add(self.packets.wrapping_mul(self.packet_us()))
+        start.wrapping_add(self.packets.wrapping_mul(self.ts_step()))
     }
 
     pub fn interval_ns(&self) -> u64 {
@@ -229,7 +257,10 @@ impl<C: Core> Session<C> {
                     0
                 };
                 h[4..8].copy_from_slice(&self.ttp_clock(start).to_be_bytes());
-                h[8..12].copy_from_slice(&aptx[4..8]);
+                match self.ssrc {
+                    Some(ssrc) => h[8..12].copy_from_slice(&ssrc.to_be_bytes()),
+                    None => h[8..12].copy_from_slice(&aptx[4..8]),
+                }
             }
             Framing::HeaderInRtp => h[4..12].copy_from_slice(&aptx),
             Framing::HeaderInRtpSwapped => {
@@ -239,7 +270,7 @@ impl<C: Core> Session<C> {
             }
             Framing::HeaderAfterRtp => {
                 h[4..8].copy_from_slice(&timestamp.to_be_bytes());
-                h[8..12].copy_from_slice(&RTP_SSRC.to_be_bytes());
+                h[8..12].copy_from_slice(&self.ssrc.unwrap_or(RTP_SSRC).to_be_bytes());
                 h[12..len].copy_from_slice(&aptx);
             }
         }
@@ -557,6 +588,46 @@ mod tests {
         let r = s.encode(&src, &mut buf[len..]).unwrap();
         assert_eq!(len + r.written, 13 + smaller);
         assert!(len + r.written <= 600);
+    }
+
+    #[test]
+    fn ssrc_override() {
+        for framing in [Framing::Phone, Framing::TtpClockOffset] {
+            let mut s = session(framing);
+            s.ssrc = Some(0x1234_56a3);
+            let hs = headers(&mut s, 2);
+            assert_eq!(hs[0][8..12], [0x12, 0x34, 0x56, 0xa3]);
+            assert_eq!(hs[1][8..12], [0x12, 0x34, 0x56, 0xa3]);
+        }
+        let mut s = session(Framing::HeaderAfterRtp);
+        s.ssrc = Some(0xa1);
+        let mut buf = [0; 64];
+        s.start_encode(&mut buf, 0, 0).unwrap();
+        assert_eq!(buf[8..12], [0, 0, 0, 0xa1]);
+        let opts = Options {
+            ssrc: Some(7),
+            ts: TsUnit::Samples,
+            ..Options::default()
+        };
+        let s = Session::open(DecoderLevel::R1, MTU, &opts).unwrap();
+        assert_eq!((s.ssrc, s.ts), (Some(7), TsUnit::Samples));
+    }
+
+    #[test]
+    fn ts_in_samples() {
+        let mut s = session(Framing::Phone);
+        s.ts = TsUnit::Samples;
+        let hs = headers(&mut s, 4);
+        for (i, h) in hs.iter().enumerate() {
+            assert_eq!(timestamp(h), i as u32 * 672);
+            assert_eq!(h[8..12], [0, 0, 0, 0xae]);
+        }
+        let mut s = session(Framing::Phone);
+        s.ts = TsUnit::Samples;
+        s.packets = u32::MAX;
+        let hs = headers(&mut s, 2);
+        assert_eq!(timestamp(&hs[0]), u32::MAX.wrapping_mul(672));
+        assert_eq!(timestamp(&hs[1]), 0);
     }
 
     #[test]

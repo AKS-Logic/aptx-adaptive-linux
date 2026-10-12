@@ -190,3 +190,9 @@ The user notes this chime isn't normal headset behaviour. What the captures show
 
 - With only SBC + aptX Adaptive offered (no aptX HD set up first) and KDE's bluedevil module unloaded, connecting gave the headset's normal **connect chime only**, no disconnect chime. So the "disconnect chime right after connecting" comes from the HD → Adaptive codec switch (Close of SEID 7, then reconfigure to SEID 9) on connect. The plugin should make sure aptX Adaptive is set up directly when it's the chosen profile.
 - Same clean connection with A2DP 1.3: SetConfiguration SEID 9 + Delay Reporting, Open, Start, then a 1 kHz tone through mpv for 25 s. **Still silent.**
+
+## source type 2 implemented (2026-10-13)
+
+- Per §7E, `select_config` now sends source type 2: byte 6 = the chosen rate bit | 0x02, with the sink's bits 0..2 cleared. For the Px7 S2e: `d7 00 00 00 ad 00 12 02 37 6a 00 af 64 4b 00 00 aa` + zeros. `validate_config` accepts source type 0 or 2 and only checks bits 3..7 for the rate.
+- Dev switches (`dev-replay` builds only) for A/B on the headset: `APTX_ADAPTIVE_SOURCE_TYPE=0|2`, `APTX_ADAPTIVE_SSRC=0x..` (whole SSRC), `APTX_ADAPTIVE_TS=us|samples`. `scripts/dev-replay.sh phone --no-replay` sets them while running the real encoder.
+- Still open from §7E: the RTP timestamp unit with source type 2, and whether the SSRC low byte selects the latency mode (`a1`..`a4` vs the `ae` we send).

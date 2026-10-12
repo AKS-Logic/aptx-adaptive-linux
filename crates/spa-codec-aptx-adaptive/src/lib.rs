@@ -152,7 +152,14 @@ unsafe extern "C" fn codec_select_config(
     let Some(caps) = (unsafe { bytes(caps, caps_size) }) else {
         return -EINVAL;
     };
-    match caps::select_config(caps) {
+    let source_type = match dev::source_type(|k| std::env::var_os(k)) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "aptx-adaptive: {e}");
+            return -EINVAL;
+        }
+    };
+    match caps::select_config(caps, source_type) {
         Ok(c) => write_out(&c, config),
         Err(e) => caps_err(e),
     }

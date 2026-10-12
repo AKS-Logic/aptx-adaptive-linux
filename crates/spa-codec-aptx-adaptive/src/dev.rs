@@ -13,6 +13,12 @@
 //!   header right after the RTP header, for a sink configured with SCMS-T (needs a bluetoothd that
 //!   puts Content Protection in Set Configuration). The byte is [`SCMST_COPY_FREE`] unless
 //!   `APTX_ADAPTIVE_SCMST_BYTE=0x..` overrides it.
+//! - `APTX_ADAPTIVE_SOURCE_TYPE=0|2`, only with `dev-replay`: the source type `select_config`
+//!   puts in byte 6 (spec §7E; default 2).
+//! - `APTX_ADAPTIVE_SSRC=0x..`, only with `dev-replay`: the whole 32-bit RTP SSRC, instead of
+//!   `00 00 00` + aptX header byte 7.
+//! - `APTX_ADAPTIVE_TS=us|samples`, only with `dev-replay`: step the RTP timestamp by the packet
+//!   duration in µs (default, +14000 per packet) or in samples (+672).
 
 use std::ffi::OsString;
 use std::fs;
@@ -20,7 +26,8 @@ use std::path::PathBuf;
 
 use aptx_adaptive::{Core, Encoder, Progress, Result as CoreResult, WINDOW_SLACK};
 
-use crate::session::{self, Framing};
+use crate::caps::SOURCE_TYPE_HOST;
+use crate::session::{self, Framing, TsUnit};
 
 pub const REPLAY_VAR: &str = "APTX_ADAPTIVE_REPLAY";
 pub const FRAMING_VAR: &str = "APTX_ADAPTIVE_FRAMING";
@@ -28,6 +35,9 @@ pub const PT_VAR: &str = "APTX_ADAPTIVE_PT";
 pub const NOSWAP_VAR: &str = "APTX_ADAPTIVE_NOSWAP";
 pub const SCMST_VAR: &str = "APTX_ADAPTIVE_SCMST";
 pub const SCMST_BYTE_VAR: &str = "APTX_ADAPTIVE_SCMST_BYTE";
+pub const SOURCE_TYPE_VAR: &str = "APTX_ADAPTIVE_SOURCE_TYPE";
+pub const SSRC_VAR: &str = "APTX_ADAPTIVE_SSRC";
+pub const TS_VAR: &str = "APTX_ADAPTIVE_TS";
 
 /// The A2DP content protection header for SCMS-T: bit 0 is the L-bit, bit 1 the Cp-bit (Bluetooth
 /// Assigned Numbers, A/V content protection, note 3). Cp = 1, L = 0 is "copy freely", what
@@ -42,6 +52,39 @@ pub struct Options {
     pub swap: bool,
     /// The SCMS-T header byte to send after the RTP header, if any.
     pub scmst: Option<u8>,
+    /// What `select_config` puts in byte 6 bits 0..2. Read again there, since that runs
+    /// before `init`; here only so `init` can log it.
+    pub source_type: u8,
+    /// Replaces the whole RTP SSRC.
+    pub ssrc: Option<u32>,
+    pub ts: TsUnit,
+}
+
+/// `APTX_ADAPTIVE_SOURCE_TYPE`, for `select_config`: [`SOURCE_TYPE_HOST`] unless overridden in
+/// a `dev-replay` build.
+///
+/// # Errors
+/// A message unless it's 0 or 2.
+pub fn source_type(var: impl Fn(&str) -> Option<OsString>) -> Result<u8, String> {
+    if !cfg!(feature = "dev-replay") {
+        return Ok(SOURCE_TYPE_HOST);
+    }
+    match var(SOURCE_TYPE_VAR) {
+        None => Ok(SOURCE_TYPE_HOST),
+        Some(v) => match v.to_str() {
+            Some("0") => Ok(0),
+            Some("2") => Ok(2),
+            _ => Err(format!("{SOURCE_TYPE_VAR}={} is not 0 or 2", v.display())),
+        },
+    }
+}
+
+fn hex_u32(var: &str, v: &OsString) -> Result<u32, String> {
+    v.to_str()
+        .and_then(|s| s.strip_prefix("0x"))
+        .filter(|s| !s.is_empty() && s.len() <= 8)
+        .and_then(|s| u32::from_str_radix(s, 16).ok())
+        .ok_or_else(|| format!("{var}={} is not 0x0..0xffffffff", v.display()))
 }
 
 impl Default for Options {
@@ -52,6 +95,9 @@ impl Default for Options {
             payload_type: session::RTP_PAYLOAD_TYPE,
             swap: true,
             scmst: None,
+            source_type: SOURCE_TYPE_HOST,
+            ssrc: None,
+            ts: TsUnit::Micros,
         }
     }
 }
@@ -106,12 +152,25 @@ impl Options {
             }),
             _ => None,
         };
+        let source_type = source_type(&var)?;
+        let ssrc = var(SSRC_VAR).map(|v| hex_u32(SSRC_VAR, &v)).transpose()?;
+        let ts = match var(TS_VAR) {
+            None => TsUnit::Micros,
+            Some(v) => match v.to_str() {
+                Some("us") => TsUnit::Micros,
+                Some("samples") => TsUnit::Samples,
+                _ => return Err(format!("{TS_VAR}={} is not us or samples", v.display())),
+            },
+        };
         Ok(Self {
             framing,
             replay,
             payload_type,
             swap,
             scmst,
+            source_type,
+            ssrc,
+            ts,
         })
     }
 
@@ -139,6 +198,15 @@ impl Options {
         }
         if let Some(b) = self.scmst {
             parts.push(format!("SCMS-T header: {b:#04x}"));
+        }
+        if self.source_type != SOURCE_TYPE_HOST {
+            parts.push(format!("source type: {}", self.source_type));
+        }
+        if let Some(s) = self.ssrc {
+            parts.push(format!("SSRC: {s:#010x}"));
+        }
+        if self.ts != TsUnit::Micros {
+            parts.push(format!("timestamp step: {:?}", self.ts));
         }
         (!parts.is_empty()).then(|| format!("aptx-adaptive: {}", parts.join("; ")))
     }
@@ -348,13 +416,78 @@ mod tests {
         assert!(Options::from_env(env(&[(SCMST_VAR, "1"), (SCMST_BYTE_VAR, "0x100")])).is_err());
     }
 
+    #[cfg(feature = "dev-replay")]
+    #[test]
+    fn source_type_with_feature() {
+        assert_eq!(source_type(env(&[])), Ok(2));
+        assert_eq!(source_type(env(&[(SOURCE_TYPE_VAR, "2")])), Ok(2));
+        assert_eq!(source_type(env(&[(SOURCE_TYPE_VAR, "0")])), Ok(0));
+        for bad in ["1", "3", "", "0x02"] {
+            assert!(
+                source_type(env(&[(SOURCE_TYPE_VAR, bad)])).is_err(),
+                "{bad}"
+            );
+        }
+        let e = env(&[(SOURCE_TYPE_VAR, "0")]);
+        let o = Options::from_env(&e).unwrap();
+        assert_eq!(o.source_type, 0);
+        assert_eq!(
+            o.describe(&e).as_deref(),
+            Some("aptx-adaptive: source type: 0")
+        );
+        let e = env(&[(SOURCE_TYPE_VAR, "2")]);
+        assert_eq!(Options::from_env(&e).unwrap().describe(&e), None);
+    }
+
+    #[cfg(feature = "dev-replay")]
+    #[test]
+    fn ssrc_with_feature() {
+        assert_eq!(Options::from_env(env(&[])).unwrap().ssrc, None);
+        let e = env(&[(SSRC_VAR, "0xa1")]);
+        let o = Options::from_env(&e).unwrap();
+        assert_eq!(o.ssrc, Some(0xa1));
+        assert_eq!(
+            o.describe(&e).as_deref(),
+            Some("aptx-adaptive: SSRC: 0x000000a1")
+        );
+        let o = Options::from_env(env(&[(SSRC_VAR, "0xDEADBEEF")])).unwrap();
+        assert_eq!(o.ssrc, Some(0xdead_beef));
+        for bad in ["a1", "0x", "0x100000000", "0xzz", "161"] {
+            assert!(Options::from_env(env(&[(SSRC_VAR, bad)])).is_err(), "{bad}");
+        }
+    }
+
+    #[cfg(feature = "dev-replay")]
+    #[test]
+    fn ts_unit_with_feature() {
+        assert_eq!(Options::from_env(env(&[])).unwrap().ts, TsUnit::Micros);
+        let o = Options::from_env(env(&[(TS_VAR, "us")])).unwrap();
+        assert_eq!(o.ts, TsUnit::Micros);
+        let e = env(&[(TS_VAR, "samples")]);
+        let o = Options::from_env(&e).unwrap();
+        assert_eq!(o.ts, TsUnit::Samples);
+        assert_eq!(
+            o.describe(&e).as_deref(),
+            Some("aptx-adaptive: timestamp step: Samples")
+        );
+        assert!(Options::from_env(env(&[(TS_VAR, "ms")])).is_err());
+    }
+
     #[cfg(not(feature = "dev-replay"))]
     #[test]
     fn ab_switches_ignored_without_feature() {
-        let e = env(&[(PT_VAR, "0"), (NOSWAP_VAR, "1"), (SCMST_VAR, "1")]);
+        let e = env(&[
+            (PT_VAR, "0"),
+            (NOSWAP_VAR, "1"),
+            (SCMST_VAR, "1"),
+            (SOURCE_TYPE_VAR, "0"),
+            (SSRC_VAR, "0xa1"),
+            (TS_VAR, "samples"),
+        ]);
         let o = Options::from_env(&e).unwrap();
         assert_eq!(o, Options::default());
         assert_eq!(o.describe(&e), None);
+        assert_eq!(source_type(&e), Ok(SOURCE_TYPE_HOST));
         for name in [
             "ttp-clock-offset",
             "header-in-rtp",

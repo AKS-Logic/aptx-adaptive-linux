@@ -19,6 +19,12 @@ const CHANNEL_MODES: usize = 7;
 const RATE_MASK: u8 = 0xF8;
 const RATE_48K: u8 = 0x10;
 
+/// Byte 6 bits 0..2 (spec §7E).
+const SOURCE_TYPE_MASK: u8 = 0x07;
+/// The sink times playback itself and uses the RTP timestamp only relatively. What a host
+/// encoder must use (§7E).
+pub const SOURCE_TYPE_HOST: u8 = 0x02;
+
 const CHANNEL_STEREO: u8 = 0x02;
 const CHANNEL_JOINT_STEREO: u8 = 0x08;
 const CHANNEL_MASK: u8 = 0x3F;
@@ -113,13 +119,14 @@ pub fn fill_caps() -> Vec<u8> {
     )
 }
 
-/// Picks 48 kHz and one 2-channel mode, and echoes the sink's own aptx data (§1.4, §1.5). The
-/// result is as long as `caps`, with any bytes past [`CAPS_LEN`] zeroed, because PipeWire
-/// only offers the codec when the lengths match.
+/// Picks 48 kHz and one 2-channel mode, puts `source_type` (normally [`SOURCE_TYPE_HOST`]) in
+/// byte 6 bits 0..2 (§7E), and echoes the sink's own aptx data (§1.4, §1.5). The result is as
+/// long as `caps`, with any bytes past [`CAPS_LEN`] zeroed, because PipeWire only offers the
+/// codec when the lengths match.
 ///
 /// # Errors
 /// As for [`Caps::parse`], or `Unsupported` without 48 kHz and stereo or joint stereo.
-pub fn select_config(bytes: &[u8]) -> Result<Vec<u8>, CapsError> {
+pub fn select_config(bytes: &[u8], source_type: u8) -> Result<Vec<u8>, CapsError> {
     let caps = Caps::parse(bytes)?;
     if caps.rates() & RATE_48K == 0 {
         return Err(CapsError::Unsupported);
@@ -128,14 +135,15 @@ pub fn select_config(bytes: &[u8]) -> Result<Vec<u8>, CapsError> {
         .into_iter()
         .find(|m| caps.channel_modes() & m != 0)
         .ok_or(CapsError::Unsupported)?;
-    Ok(element(bytes.len(), RATE_48K, mode, caps.aptx_data()))
+    let rate = RATE_48K | (source_type & SOURCE_TYPE_MASK);
+    Ok(element(bytes.len(), rate, mode, caps.aptx_data()))
 }
 
 /// Checks a configuration and gives the decoder level the encoder needs.
 ///
 /// # Errors
 /// As for [`Caps::parse`], or `Invalid` unless it picks exactly 48 kHz and exactly one of
-/// stereo or joint stereo.
+/// stereo or joint stereo. The source type bits aren't checked: 0 and 2 are both fine.
 pub fn validate_config(config: &[u8]) -> Result<DecoderLevel, CapsError> {
     let c = Caps::parse(config)?;
     let mode_ok = matches!(c.channel_modes(), CHANNEL_STEREO | CHANNEL_JOINT_STEREO);
@@ -176,6 +184,10 @@ mod tests {
     use super::*;
     use crate::fixtures::{PX7_S2E, PX7_S2E_CONFIG};
 
+    fn select_config_host(bytes: &[u8]) -> Result<Vec<u8>, CapsError> {
+        select_config(bytes, SOURCE_TYPE_HOST)
+    }
+
     const FEATURES: usize = 16;
     const SETUP_PREFS: usize = 20;
     const END_MARKER: usize = 24;
@@ -205,7 +217,7 @@ mod tests {
 
     #[test]
     fn px7_s2e_select_config_matches_spec() {
-        let config = select_config(&PX7_S2E).unwrap();
+        let config = select_config_host(&PX7_S2E).unwrap();
         assert_eq!(config, PX7_S2E_CONFIG);
         assert_eq!(validate_config(&config), Ok(DecoderLevel::R1));
     }
@@ -229,21 +241,21 @@ mod tests {
     #[test]
     fn parse_ignores_trailing_bytes() {
         let long = [&PX7_S2E[..], &[0x55; 4]].concat();
-        let config = select_config(&long).unwrap();
+        let config = select_config_host(&long).unwrap();
         assert_eq!(config.len(), long.len());
         assert_eq!(config[..CAPS_LEN], PX7_S2E_CONFIG);
         assert_eq!(config[CAPS_LEN..], [0; 4]);
         let long_config = [&PX7_S2E_CONFIG[..], &[0x55; 4]].concat();
         assert_eq!(validate_config(&long_config), Ok(DecoderLevel::R1));
-        assert_eq!(select_config(&PX7_S2E[..39]), Err(CapsError::Invalid));
+        assert_eq!(select_config_host(&PX7_S2E[..39]), Err(CapsError::Invalid));
     }
 
     #[test]
     fn r2_select_config_echoes_extension() {
         let caps = r2_caps(0x0F00_0003);
-        let config = select_config(&caps).unwrap();
+        let config = select_config_host(&caps).unwrap();
         assert_eq!(config.len(), CAPS_LEN);
-        assert_eq!(config[RATES..=CHANNEL_MODES], [RATE_48K, CHANNEL_STEREO]);
+        assert_eq!(config[RATES..=CHANNEL_MODES], [0x12, CHANNEL_STEREO]);
         assert_eq!(config[8..26], caps[8..26]);
         assert!(config[26..].iter().all(|&b| b == 0));
         assert_eq!(validate_config(&config), Ok(DecoderLevel::R2));
@@ -253,7 +265,7 @@ mod tests {
     fn r1_select_config_drops_trailing_bytes() {
         let mut caps = PX7_S2E;
         caps[20] = 0x55;
-        assert_eq!(select_config(&caps).unwrap(), PX7_S2E_CONFIG);
+        assert_eq!(select_config_host(&caps).unwrap(), PX7_S2E_CONFIG);
     }
 
     #[test]
@@ -261,7 +273,7 @@ mod tests {
         let mut caps = PX7_S2E;
         caps[CHANNEL_MODES] = CHANNEL_JOINT_STEREO | 0x01;
         assert_eq!(
-            select_config(&caps).unwrap()[CHANNEL_MODES],
+            select_config_host(&caps).unwrap()[CHANNEL_MODES],
             CHANNEL_JOINT_STEREO
         );
     }
@@ -270,20 +282,26 @@ mod tests {
     fn rejects_unusable_caps() {
         let mut no_48k = PX7_S2E;
         no_48k[RATES] = 0x08;
-        assert_eq!(select_config(&no_48k), Err(CapsError::Unsupported));
+        assert_eq!(select_config_host(&no_48k), Err(CapsError::Unsupported));
         let mut mono = PX7_S2E;
         mono[CHANNEL_MODES] = 0x01 | 0x04 | 0x10 | 0x20;
-        assert_eq!(select_config(&mono), Err(CapsError::Unsupported));
-        assert_eq!(select_config(&PX7_S2E[..34]), Err(CapsError::Invalid));
+        assert_eq!(select_config_host(&mono), Err(CapsError::Unsupported));
+        assert_eq!(select_config_host(&PX7_S2E[..34]), Err(CapsError::Invalid));
     }
 
     #[test]
     fn rejects_other_vendor_codecs() {
         let aptx_classic = [0x4f, 0, 0, 0, 0x01, 0, 0x32];
-        assert_eq!(select_config(&aptx_classic), Err(CapsError::Unsupported));
+        assert_eq!(
+            select_config_host(&aptx_classic),
+            Err(CapsError::Unsupported)
+        );
         let aptx_hd = [0xD7, 0, 0, 0, 0x24, 0, 0];
-        assert_eq!(select_config(&aptx_hd), Err(CapsError::Unsupported));
-        assert_eq!(select_config(&VENDOR_HEADER[..2]), Err(CapsError::Invalid));
+        assert_eq!(select_config_host(&aptx_hd), Err(CapsError::Unsupported));
+        assert_eq!(
+            select_config_host(&VENDOR_HEADER[..2]),
+            Err(CapsError::Invalid)
+        );
     }
 
     #[test]
@@ -296,6 +314,32 @@ mod tests {
         assert_eq!(validate_config(&c), Err(CapsError::Invalid));
         c[RATES] = 0x12;
         assert_eq!(validate_config(&c), Ok(DecoderLevel::R1));
+    }
+
+    /// §7E: byte 6 = rate bit | source type; the sink's own bits 0..2 are dropped.
+    #[test]
+    fn select_config_sets_source_type() {
+        assert_eq!(PX7_S2E[RATES], 0x19);
+        assert_eq!(select_config_host(&PX7_S2E).unwrap()[RATES], 0x12);
+        assert_eq!(select_config(&PX7_S2E, 0).unwrap()[RATES], 0x10);
+        let mut caps = PX7_S2E;
+        caps[RATES] = 0x17;
+        assert_eq!(select_config(&caps, 2).unwrap()[RATES], 0x12);
+    }
+
+    #[test]
+    fn validate_accepts_source_type_0_and_2() {
+        for (byte6, ok) in [
+            (0x10, true),
+            (0x12, true),
+            (0x02, false),
+            (0x1a, false),
+            (0x32, false),
+        ] {
+            let mut c = PX7_S2E_CONFIG;
+            c[RATES] = byte6;
+            assert_eq!(validate_config(&c).is_ok(), ok, "{byte6:#04x}");
+        }
     }
 
     #[test]
@@ -311,7 +355,7 @@ mod tests {
             Caps::parse(&caps).unwrap().decoder_level(),
             DecoderLevel::R1
         );
-        assert!(select_config(&caps).is_ok());
+        assert!(select_config_host(&caps).is_ok());
     }
 
     #[test]

@@ -4,7 +4,9 @@
 # -6 dBFS, looping) with the real caps, framing, RTP and timing. Lets us test negotiation and
 # framing on a headset before the codec core exists.
 #
-#   scripts/dev-replay.sh [phone|ttp-clock-offset|header-after-rtp|header-in-rtp|header-in-rtp-swapped] [vector]
+#   scripts/dev-replay.sh [phone|ttp-clock-offset|header-after-rtp|header-in-rtp|header-in-rtp-swapped] [vector|--no-replay]
+#
+# --no-replay installs the same dev build and switches but runs the real encoder on the PCM.
 #
 # Framings (default phone):
 #   phone                  spec §7D, what a Snapdragon phone sends: RTP 80 60, timestamp = µs
@@ -22,6 +24,9 @@
 #                               the RTP header. Only for a sink configured with SCMS-T, which
 #                               stock bluetoothd never does (see .scratch/scmst-test.sh)
 #   APTX_ADAPTIVE_SCMST_BYTE=0x00  the SCMS-T byte to send instead
+#   APTX_ADAPTIVE_SOURCE_TYPE=0|2  config byte 6 source type (spec §7E, default 2)
+#   APTX_ADAPTIVE_SSRC=0x..     the whole RTP SSRC (default 00 00 00 + header byte 7, ae)
+#   APTX_ADAPTIVE_TS=us|samples RTP timestamp step: µs (default, +14000) or samples (+672)
 # e.g. APTX_ADAPTIVE_PT=0 scripts/dev-replay.sh ttp-clock-offset sine1k.r2.bin
 #
 # Doesn't restart anything or touch the headset; it prints the commands for that.
@@ -31,17 +36,21 @@ framing=${1:-phone}
 case $framing in
 phone | ttp-clock-offset | header-in-rtp | header-after-rtp | header-in-rtp-swapped) ;;
 *)
-	echo "usage: $0 [phone|ttp-clock-offset|header-after-rtp|header-in-rtp|header-in-rtp-swapped] [vector]" >&2
+	echo "usage: $0 [phone|ttp-clock-offset|header-after-rtp|header-in-rtp|header-in-rtp-swapped] [vector|--no-replay]" >&2
 	exit 2
 	;;
 esac
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+replay=1
+if [[ ${2-} == --no-replay ]]; then
+	replay=
+fi
 vector=$repo/tests/vectors/r2/${2:-sine1k.r1.bin}
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 dropin=$config_home/systemd/user/wireplumber.service.d/aptx-adaptive-dev-replay.conf
 
-[[ -f $vector ]] || {
+[[ -z $replay || -f $vector ]] || {
 	echo "error: $vector is missing" >&2
 	exit 1
 }
@@ -51,26 +60,32 @@ CARGO_FEATURES=dev-replay "$repo/scripts/install-plugin.sh" >/dev/null
 
 mkdir -p "$(dirname "$dropin")"
 cat >"$dropin" <<EOF
-# DEV ONLY, written by scripts/dev-replay.sh. Delete this file (or run install-plugin.sh) to go back to the encoder.
+# DEV ONLY, written by scripts/dev-replay.sh. Delete this file (or run install-plugin.sh) to go back to the normal build.
 [Service]
-Environment="APTX_ADAPTIVE_REPLAY=$vector"
 Environment="APTX_ADAPTIVE_FRAMING=$framing"
 EOF
+if [[ -n $replay ]]; then
+	echo "Environment=\"APTX_ADAPTIVE_REPLAY=$vector\"" >>"$dropin"
+	core="vector ${vector##*/}"
+else
+	core="real encoder"
+fi
 extra=
-for var in APTX_ADAPTIVE_PT APTX_ADAPTIVE_NOSWAP APTX_ADAPTIVE_SCMST APTX_ADAPTIVE_SCMST_BYTE; do
+for var in APTX_ADAPTIVE_PT APTX_ADAPTIVE_NOSWAP APTX_ADAPTIVE_SCMST APTX_ADAPTIVE_SCMST_BYTE \
+	APTX_ADAPTIVE_SOURCE_TYPE APTX_ADAPTIVE_SSRC APTX_ADAPTIVE_TS; do
 	if [[ -n ${!var-} ]]; then
 		echo "Environment=\"$var=${!var}\"" >>"$dropin"
 		extra+=", $var=${!var}"
 	fi
 done
-echo "wrote $dropin (framing $framing, vector ${vector##*/}$extra)"
+echo "wrote $dropin (framing $framing, $core$extra)"
 if command -v systemctl >/dev/null; then
 	systemctl --user daemon-reload
 fi
 
 cat <<EOF
 
-# (a) restart, then check the plugin logged replay mode
+# (a) restart, then check the plugin logged the dev settings
 systemctl --user restart wireplumber pipewire pipewire-pulse
 journalctl --user -u wireplumber -b --no-pager | grep aptx-adaptive | tail -n 5
 
@@ -79,8 +94,9 @@ card=\$(pactl list cards short | awk '/bluez_card\./ {print \$2; exit}'); echo "
 pactl list cards | grep -A40 "Name: \$card" | grep a2dp-sink
 pactl set-card-profile "\$card" a2dp-sink-aptx_adaptive
 
-# (c) play: the plugin ignores the PCM, so silence is enough to keep the stream running.
-#     You should hear a steady 1 kHz tone. Ctrl-C to stop.
+# (c) play. With replay the plugin ignores the PCM, so silence keeps the stream running and you
+#     should hear a steady 1 kHz tone. With --no-replay, play real audio instead of /dev/zero.
+#     Ctrl-C to stop.
 sink=\$(pactl list sinks short | awk '/bluez_output\./ {print \$2; exit}'); echo "\$sink"
 pw-play --target "\$sink" --raw --format s32 --rate 48000 --channels 2 - </dev/zero
 journalctl --user -u wireplumber -u pipewire -b --no-pager --since -2min | grep -i 'bluez\|a2dp\|aptx' | tail -n 30
@@ -95,5 +111,6 @@ pactl set-card-profile "\$(pactl list cards short | awk '/bluez_card\./ {print \
 
 # To try another framing, vector or switch, re-run e.g.
 #   APTX_ADAPTIVE_PT=0 $0 ttp-clock-offset sine1k.r1.bin
+#   APTX_ADAPTIVE_SOURCE_TYPE=0 APTX_ADAPTIVE_TS=samples $0 phone --no-replay
 # and redo (a)-(c).
 EOF
