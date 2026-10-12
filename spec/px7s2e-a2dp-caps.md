@@ -9,3 +9,10 @@ Modalias bluetooth:v19B5p0030dFFFF
 | sep5 | 0xFF vendor | 4f 00 00 00 01 00 32 | aptX classic (vendor 0x4F, codec 0x0001) 48k/44.1k stereo |
 | sep7 | 0xFF vendor | d7 00 00 00 24 00 32 00 00 00 00 | aptX HD (0xD7, 0x0024) |
 | sep9 | 0xFF vendor | d7 00 00 00 ad 00 19 0a 37 6a 00 af 64 4b 00 00 aa 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 | aptX Adaptive (0xD7, 0x00AD), 40 bytes total, 34 body bytes |
+
+## controller identity (hcitool info, 2026-10-13)
+
+- LMP version 5.2 (0x0b), LMP subversion 0x3924
+- Manufacturer: Cambridge Silicon Radio (company ID 10, Qualcomm's CSR/QCC line)
+- Features page 0 `ff fe 8f fe db ff 5b 87`, page 1 `03`
+- Our source controller (Realtek RTL8922) reports manufacturer 93 (Realtek), LMP 5.3.
