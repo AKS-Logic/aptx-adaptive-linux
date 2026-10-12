@@ -575,7 +575,7 @@ This describes the encoder with the create flag of `a2dp-integration.md` §3.1 s
    | 8 to 15 | 16 | yes |
    | 16 to 31 | 32 | yes |
    | 32 to 47 | 48 | yes |
-   | 48 to 63 | 64 | yes |
+   | 48 to 63 | 64 | no, keep it open |
 
 **UNCERTAIN**, never active in the verified runs: with the create flag set to 0, a constant-bitrate clamp further limits the frame size. The reference wrapper always uses flag 1.
 
@@ -592,7 +592,7 @@ All arithmetic here is unsigned 32-bit, and `>>` is a logical shift.
 1. `q = floor(2·fs / (S·nb))`, then `pps = (q & 1) + (q >> 1)`. This is the packet rate per second, rounded.
 2. `A_new = (410·(Ap + A) + 1640·(W + pad)·pps) >> 10`, then `Ap = A` and `A = A_new`.
 3. `B_new = (410·(Bp + Bq) + 1640·W·pps) >> 10`, then `Bp = Bq` and `Bq = B_new`.
-4. Choose `m`: if `A_new > nominal`, `m = A_new`; otherwise `m = max(A_new, B_new)`.
+4. Choose `m`: if `A_new > nominal`, `m = A_new`; otherwise `m = B_new`. (An earlier revision wrapped the second case in `max()`; that was a typo.) This was checked against the reference on 24 consecutive rate checks of a config-0 stream; the alternatives "always `B_new`" and `max(A_new, B_new)` matched only 12 and 14 of them. The rules differ only when `A_new > nominal`, which happens only when `pad > 0` makes `A_new ≠ B_new`. If "always `B_new`" seems to match, check that A accumulates `W + pad` and B only `W`, each with its own two-step history (`A`/`Ap` and `Bq`/`Bp`).
 5. `v = nominal − m + target`.
 6. Set `target`:
    - if `nominal > v`: `target = nominal`;
@@ -767,6 +767,18 @@ As a cross-check, these rules give silence allocations of 4/4/4/3 per channel on
 - `P_est` in the frame-size rule is the pool from the **previous** allocation (initially the create-time pool), so a bitrate change reaches frame sizing one frame late.
 - Stage-vector `packets.bin` streams totalling 126 packets were also reproduced from raw PCM, driving the encoder with all remaining input per call, no flush and no set-bitrate call; this exercises the rate check (§8.1a). The spec side reports five stage runs, but `tests/vectors/stages/` has six; see QUESTIONS.md "from codec-core allocator" item 1.
 - With §8 implemented, the `frames.json` allocations and block counts in the stage vectors become a check on the allocator rather than a required input.
+
+### 8.8 Packets smaller than the bitrate needs
+
+The reference has no special handling for this:
+
+- It never limits carry-over and never drops frames. Carried bytes are subtracted from the free space the frame-size rule sees, so with little room it picks small frames (8 or 16 blocks) and closes packets early. The carry stays below about one frame. In reference runs at 364 kbps the carry never went above 102 bytes, even with 64-byte packets.
+- The encoder consumes only the PCM it actually codes. The rest stays with the caller, so the caller's backlog grows every period when packets are too small. At 364 kbps the reference coded every block with 400-byte packets, but only about half with 200-byte packets and about an eighth with 64-byte packets.
+- The rate check (§8.1a) raises the internal rate when packets come out short. The only reduction anywhere is the caller's cut to three quarters of the bitrate when the deficit grows (the wrapper loop in §8.1a).
+- The encoder is never told the packet size when it's created, so it can't refuse an undersized one then. Per call, it rejects output windows of 11 bytes or less, consuming nothing, and windows over 2016 bytes. Anything in between behaves as above.
+- The reference source never gets into this state, because it picks the bitrate from the packet size and period (the MTU rule in `a2dp-integration.md` §4), so its packets are always at least 328 bytes.
+
+Recommendation: choose the bitrate from the packet size the same way, and treat a growing backlog as a configuration error rather than dropping frames.
 
 ---
 

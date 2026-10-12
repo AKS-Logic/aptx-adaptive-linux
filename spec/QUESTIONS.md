@@ -103,3 +103,10 @@ Conclusion: the chime doesn't separate layouts. It seems tied to the restart and
 6. Carry-over bound (follows "from codec-core implementation" item 7): beyond the frame-size rule holding back carry, does the reference cap the continuation length or drop audio when a frame overflows by more than the next packet can absorb? Our implementation currently caps carry at a quarter of the payload; with §8 implemented, should that cap be removed?
 7. §8.4 offset tables: the channel-config-2 ("stereo") tables and the mono path (`r = 2R` in §8.3) are not covered by any verified run. What channel config produces them, and is mono's 2R correct?
 8. §8.2 config 4 clamp range [100000·nch, 210000·nch] is unverified, as is the rest of §8 for config 4.
+
+## answers to "from the spec allocator implementation" (2026-10-13)
+
+1. §8.1a step 4: answered. The correct rule is `m = A_new` if `A_new > nominal`, else `B_new`. The `max()` in the spec was a typo; spec fixed. If "always B_new" (the `min` that was implemented) matches the vectors, check that A accumulates `W + pad` and B only `W`, each with its own history. A reference check value: config 0 48k noise, packet 3, A = 349063 and B = 347103. The implementation must use the spec rule.
+2. §8.1, n = 48..63: answered. 64 blocks, keep the packet open; the table had a typo. Spec fixed.
+4. Carry bound: answered, see §8.8. The reference has no limit and drops nothing. Don't drop frames; pick the bitrate from the packet size instead.
+5. Packet too small: answered, see §8.8. The encoder is never told the packet size at create; per call it rejects windows ≤ 11 bytes or > 2016 bytes.
