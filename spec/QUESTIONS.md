@@ -26,3 +26,10 @@
 12. §4: when the MTU caps the packet size, does the period (and so samples per packet) stay the same? We keep the period and only lower size and bitrate.
 13. §7.2 HeaderInRtp hypothesis: the RTP timestamp field then carries TTP/period/cfg instead of a sample clock, so a sink can't use it for timing. Does the sink rely on RTP timestamps at all? Also which RTP payload type: we use 96 like aptX HD, with marker bit 0. And with the header in RTP, does the spec's MTU − 8 budget become MTU − 12?
 14. The R1 cfg byte in the §4.1 table is the same for idx 0/1/3 ("656 / 1"). Is cfg really independent of the decoder level, given R1 and R2 bitstreams differ (config id 0 vs 3)?
+
+## live test 2026-10-12 (Px7 S2e, replaying sine1k.r1 vector packets, other source devices disconnected)
+
+- control: the stock aptX HD codec played a 1 kHz test tone fine
+- header-in-rtp (8 header bytes as RTP timestamp + SSRC, payload type 96): headset stays connected, no disconnect sound, **silence**
+- header-after-rtp (12-byte RTP header, then the 8 header bytes): headset plays its **disconnect sound** and stays silent, though the BT link stays up
+- conclusion: the transport layout is probably header-in-rtp, but the sink isn't decoding the payload. Open: whether the 16-bit swap direction is right, the TTP/header values, a start-of-stream sync or resync requirement, and payload type.
