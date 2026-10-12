@@ -74,3 +74,10 @@ Conclusion: the chime doesn't separate layouts. It seems tied to the restart and
 - ttp-clock with PT 0: inconclusive. The headset was already dropping the link repeatedly.
 - The repeated drops came from WirePlumber saving `a2dp-sink-aptx_adaptive` as the device's default profile, so every reconnect went straight into a non-working stream. Switching back to `a2dp-sink` (aptX HD) fixed it. **Live tests must restore `a2dp-sink` when they finish.** The install script should never leave aptX Adaptive as the saved default until it works.
 - An advancing µs timestamp alone doesn't fix the silence.
+
+## live test round 4: §7C layout, fair test (2026-10-12)
+
+- Normal RTP header (PT 96, sample-count timestamp, SSRC 0), then `1f 63 38 01 00 00 00 ae`, then the swapped sine1k.r1 packets.
+- Setup, then 30 s settle, then 12 s playback. The headset stayed connected, then was restored to aptX HD.
+- Result: **silence** (listener fairly but not fully sure there was no disconnect).
+- So every layout tested gives silence when tested fairly. Still not done fairly: ttp-clock + PT 0.
