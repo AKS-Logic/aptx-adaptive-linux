@@ -264,3 +264,9 @@ btmon, time from sending each media ACL packet to the controller's Number of Com
 - The backlog figure is whatever `media-sink.c` passes to `abr_process`: unconfirmed payload bytes with TX timestamping, or `TIOCOUTQ` socket memory (skb accounting) without. The plugin can't tell which, so the log says "PipeWire unsent".
 - `APTX_ADAPTIVE_DRIFT_LOG=0` (any build) silences the drift line.
 - Start gap 25 → 33: media-sink drops every packet `send()` refuses with EAGAIN and still advances the sequence number. With `send_buf_size` 0 the socket buffer is 4 × MTU (a few packets, ~50 ms). That fits a ~100 ms controller stall about 0.35 s into the stream (inferred, not confirmed: our 14 ms block and timing match the 71.4/s rate, and the encoder never skips a packet). The plugin now sets `send_buf_size` to 32 KiB (~20 packets, ~280 ms). To confirm, recapture: the 25 → 33 gap should be gone, or show as a burst of late packets instead. If it persists, run `PIPEWIRE_DEBUG=spa.bluez5.sink:5` and look for "fail flush".
+
+## stutter, drift log run (2026-10-13 ~08:21)
+
+- Drift log during a stuttering stream: host clock within ±4 ppm of CLOCK_MONOTONIC, "audio ahead" stayed at ±0.2 ms, backlog avg about 600 bytes (max 2004 after start-up; start burst up to 12 KB now absorbed by the 32 KiB buffer). So host-clock drift is ruled out. The +80 ppm in capture 2 was measured against the btmon/kernel capture timestamps, not a real clock error.
+- Stutter onset isn't consistent. After a reconnect it hasn't come back. That points away from steady drift and towards per-connection link conditions: the headset sharing radio time with a second (multipoint) connection, 2.4 GHz interference, sniff/role state, or the headset's buffer state after a particular start.
+- Not yet tested: whether the stutter only happens while the Px7 is also connected to the phone (multipoint).
