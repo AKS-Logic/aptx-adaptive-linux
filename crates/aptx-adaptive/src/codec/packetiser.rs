@@ -1,80 +1,82 @@
-//! Turns PCM into packets: buffers blocks, picks frame sizes and allocations, codes them.
+//! Turns PCM into packets (spec `codec-core.md` §8.1): frame sizing from the padding and
+//! carry histories, per-packet rate check, and the allocator of §8.2–§8.6.
 //!
-//! The reference's allocation policy (§8.2) isn't specified, so it's pluggable. Frame sizes
-//! follow what the reference does under flush (`tests/vectors/r2`): every pending block goes
-//! into the packet, as 64-block frames and then the (even) remainder, e.g. 64 + 64 + 40 for
-//! 672 samples of config 0.
-//!
-//! Each frame aims at its share of the packet's room. One that overshoots spills into the next
-//! packet's continuation, up to [`Packetiser::max_carry`] bytes. Past that the frame falls
-//! back to the floor allocation, then to fewer blocks, and anything still left over is
-//! dropped, so carry and buffering stay bounded however small the packet is.
+//! Like the reference, it never drops frames or bounds the carry (§8.8). Packets too small for
+//! the bitrate show up as input left unconsumed; the caller picks the bitrate from the packet
+//! size so that doesn't happen.
 
-use super::alloc::{self, Allocator};
-use super::pack::{HEADER_BYTES, Packer, continuation_bits, worst_frame_bits};
+use super::alloc;
+use super::pack::{HEADER_BYTES, Packer};
 use super::{Engine, MAX_WIDTH, Params};
 
 pub const MAX_FRAME_BLOCKS: usize = 64;
-/// Blocks the packetiser buffers before it stops taking input, a few periods' worth.
-pub const MAX_PENDING_BLOCKS: usize = 1024;
 
+#[derive(Debug, Clone, Copy)]
+struct Rate {
+    nominal: u32,
+    target: u32,
+    /// `A` in §8.1a: smoothed rate counting padding, latest value.
+    a: u32,
+    /// `Ap` in §8.1a: the previous `A`.
+    ap: u32,
+    /// `Bq` in §8.1a: smoothed rate without padding, latest value.
+    bq: u32,
+    /// `Bp` in §8.1a: the previous `Bq`.
+    bp: u32,
+}
+
+impl Rate {
+    fn new(b: u32) -> Self {
+        Self {
+            nominal: b,
+            target: b,
+            a: b,
+            ap: b,
+            bq: b,
+            bp: b,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Packetiser {
     engine: Engine,
     packer: Packer,
-    allocator: Box<dyn Allocator>,
-    max_bits: &'static [u8],
-    /// Subband values waiting to go into a frame, `width` per block.
-    pending: Vec<i32>,
-    /// Interleaved PCM short of a whole block.
-    partial: Vec<i32>,
-    /// Scratch: the frame's codes, and a trial engine and codes for sizing candidates.
+    /// The current frame's subband values, `width` per block.
+    frame: Vec<i32>,
     codes: Vec<i32>,
-    trial: Engine,
-    trial_codes: Vec<i32>,
-    /// Blocks dropped because even the floor allocation didn't fit.
-    dropped: u64,
-}
-
-impl std::fmt::Debug for Packetiser {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Packetiser")
-            .field("params", &self.engine.params())
-            .field("pending_blocks", &self.pending_blocks())
-            .field("dropped", &self.dropped)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Codes `x` on a copy of `engine` into `codes` (resized, buffer kept).
-fn trial_code(trial: &mut Engine, engine: &Engine, x: &[i32], bits: &[u8], codes: &mut Vec<i32>) {
-    let w = engine.params().width();
-    trial.clone_from(engine);
-    codes.resize(x.len(), 0);
-    for (xb, qb) in x.chunks_exact(w).zip(codes.chunks_exact_mut(w)) {
-        trial.code(xb, bits, qb);
-    }
+    pad_hist: i64,
+    pad1: i64,
+    pad2: i64,
+    /// Padding of the last packet, folded into the history after the next packet's first frame.
+    pending_pad: Option<i64>,
+    ov_hist: i64,
+    ov_prev: i64,
+    p_est: u32,
+    rate: Rate,
+    /// Carried bytes the open packet started with, and blocks coded into it.
+    carry_in: usize,
+    packet_blocks: usize,
 }
 
 impl Packetiser {
-    pub fn new(
-        params: Params,
-        packet_len: usize,
-        bitrate: u32,
-        allocator: Box<dyn Allocator>,
-    ) -> Self {
-        let engine = Engine::new(params);
-        let blocks = MAX_PENDING_BLOCKS * params.width();
+    pub fn new(params: Params, packet_len: usize, bitrate: u32) -> Self {
+        let w = params.width();
         Self {
-            engine,
+            engine: Engine::new(params),
             packer: Packer::new(params, packet_len),
-            allocator,
-            max_bits: params.max_bits(bitrate),
-            pending: Vec::with_capacity(blocks),
-            partial: Vec::with_capacity(params.width()),
-            codes: Vec::with_capacity(MAX_FRAME_BLOCKS * params.width()),
-            trial: engine,
-            trial_codes: Vec::with_capacity(MAX_FRAME_BLOCKS * params.width()),
-            dropped: 0,
+            frame: Vec::with_capacity(MAX_FRAME_BLOCKS * w),
+            codes: Vec::with_capacity(MAX_FRAME_BLOCKS * w),
+            pad_hist: 0,
+            pad1: 0,
+            pad2: 0,
+            pending_pad: None,
+            ov_hist: 0,
+            ov_prev: 0,
+            p_est: alloc::pool(params, bitrate),
+            rate: Rate::new(bitrate),
+            carry_in: 0,
+            packet_blocks: 0,
         }
     }
 
@@ -82,190 +84,193 @@ impl Packetiser {
         self.packer.packet_len()
     }
 
-    /// Most bytes one packet may push into the next one's continuation.
-    pub fn max_carry(&self) -> usize {
-        (self.packet_len() - HEADER_BYTES) / 4
-    }
-
-    pub fn set_bitrate(&mut self, bitrate: u32) {
-        self.max_bits = self.engine.params().max_bits(bitrate);
-    }
-
     fn params(&self) -> Params {
         self.engine.params()
     }
 
-    pub fn pending_blocks(&self) -> usize {
-        self.pending.len() / self.params().width()
+    /// The set-bitrate operation (§8.1a): clamps, then resets the rate check.
+    pub fn set_bitrate(&mut self, bitrate: u32) {
+        let (lo, hi) = alloc::bitrate_range(self.params());
+        self.rate = Rate::new(bitrate.clamp(lo, hi));
     }
 
-    /// Blocks dropped so far because even the floor allocation didn't fit.
-    pub fn dropped(&self) -> u64 {
-        self.dropped
+    fn frame_blocks(&self) -> usize {
+        self.frame.len() / self.params().width()
     }
 
-    #[cfg(test)]
-    pub fn carry_len(&self) -> usize {
-        self.packer.carry_len()
+    fn cap(&self) -> i64 {
+        (self.packet_len() - HEADER_BYTES) as i64
     }
 
-    /// Runs the filterbank over as much of `pcm` as fits in the buffer. Whole blocks go into
-    /// the pending queue, a remainder is held for the next call. Returns the samples taken.
-    pub fn push_pcm(&mut self, pcm: &[i32]) -> usize {
-        let w = self.params().width();
-        let room = (MAX_PENDING_BLOCKS - self.pending_blocks()) * w - self.partial.len();
-        let pcm = &pcm[..pcm.len().min(room)];
-        let mut x = [0; MAX_WIDTH];
-        let mut rest = pcm;
-        if !self.partial.is_empty() {
-            let need = (w - self.partial.len()).min(rest.len());
-            self.partial.extend_from_slice(&rest[..need]);
-            rest = &rest[need..];
-            if self.partial.len() == w {
-                self.engine.analyse(&self.partial, &mut x);
-                self.pending.extend_from_slice(&x[..w]);
-                self.partial.clear();
+    /// The frame-size rule: blocks wanted, and whether that frame closes the packet.
+    fn frame_size(&self) -> (usize, bool) {
+        let (space, hold) = if self.packer.is_open() {
+            (
+                self.cap() - (self.packer.bit_len() / 8) as i64,
+                self.ov_hist,
+            )
+        } else {
+            let carry = self.packer.carry_len() as i64;
+            (self.cap() - carry, carry + self.ov_hist)
+        };
+        let v = space - hold + self.pad_hist.min(30);
+        if v < 0 {
+            return (8, true);
+        }
+        let mut x = 8 * v;
+        let Rate {
+            nominal, target, ..
+        } = self.rate;
+        if target > nominal {
+            let k = i64::from(nominal / (target - nominal));
+            if k != 0 {
+                x += x / k;
             }
         }
-        let mut blocks = rest.chunks_exact(w);
-        for block in &mut blocks {
-            self.engine.analyse(block, &mut x);
-            self.pending.extend_from_slice(&x[..w]);
+        match x / i64::from(self.p_est) {
+            48.. => (64, false),
+            ..=7 => (8, true),
+            8..=15 => (16, true),
+            16..=31 => (32, true),
+            _ => (48, true),
         }
-        self.partial.extend_from_slice(blocks.remainder());
-        pcm.len()
     }
 
-    /// Codes the `blocks` pending blocks from `start` as one frame. Aims at `target` bits;
-    /// must stay within `limit`. Returns false, coding nothing, if even the floor allocation
-    /// doesn't fit.
-    fn frame(&mut self, start: usize, blocks: usize, target: usize, limit: usize) -> bool {
+    /// Allocates, quantises and packs the current frame.
+    fn code_frame(&mut self) {
         let params = self.params();
-        let (w, s) = (params.width(), params.subbands());
-        let x = &self.pending[start * w..(start + blocks) * w];
+        let w = params.width();
+        let blocks = self.frame_blocks();
         let mut bits = [0u8; MAX_WIDTH];
         let bits = &mut bits[..w];
+        self.p_est = alloc::allocate(params, self.rate.target, &self.frame, bits);
+        self.codes.resize(self.frame.len(), 0);
+        for (xb, qb) in self
+            .frame
+            .chunks_exact(w)
+            .zip(self.codes.chunks_exact_mut(w))
         {
-            let (packer, engine, trial, codes) = (
-                &self.packer,
-                &self.engine,
-                &mut self.trial,
-                &mut self.trial_codes,
-            );
-            let mut size = |alloc: &[u8]| {
-                trial_code(trial, engine, x, alloc, codes);
-                packer.frame_bits(alloc, codes, blocks)
-            };
-            self.allocator
-                .allocate(x, self.max_bits, &mut |a| size(a) <= target, bits);
-            let ok = alloc::valid(bits, s)
-                && bits.iter().zip(self.max_bits).all(|(b, m)| b <= m)
-                && size(bits) <= limit;
-            if !ok {
-                alloc::floor(s, bits);
-                if size(bits) > limit {
-                    return false;
-                }
-            }
-        }
-        self.codes.resize(x.len(), 0);
-        for (xb, qb) in x.chunks_exact(w).zip(self.codes.chunks_exact_mut(w)) {
             self.engine.code(xb, bits, qb);
         }
+        let first = !self.packer.is_open();
+        if first {
+            self.carry_in = self.packer.carry_len();
+            self.packer.begin();
+        }
         self.packer.push_frame(bits, &self.codes);
-        true
+        self.frame.clear();
+        self.packet_blocks += blocks;
+        if first && let Some(pad) = self.pending_pad.take() {
+            self.pad2 = self.pad1;
+            self.pad1 = pad;
+            self.pad_hist = (410 * (self.pad_hist + self.pad2) + 205 * self.pad1) >> 10;
+        }
     }
 
-    /// Codes the pending blocks into the current packet and closes it into `out`. An odd
-    /// block stays pending for the next packet; blocks that can't fit are dropped.
-    pub fn emit(&mut self, out: &mut [u8]) {
-        let total = self.pending_blocks() & !1;
-        let limit_bits = self.packer.capacity_bits() + 8 * self.max_carry();
-        let mut start = 0;
-        for n in plan(total) {
-            let left = total - start;
-            let used = self.packer.bit_len();
-            let target = self.packer.capacity_bits().saturating_sub(used) * n / left;
-            let limit = limit_bits.saturating_sub(used);
-            let mut m = n;
-            while m > 0 && !self.frame(start, m, target * m / n, limit) {
-                // Shrink until the floor fits, which makes this the packet's last frame.
-                m = (m / 2) & !1;
+    /// Closes the packet into `out`, then runs the rate check and the carry history.
+    fn close(&mut self, out: &mut [u8]) -> usize {
+        let written = self.packer.bit_len() / 8;
+        let pad = self.packer.finish(out);
+        let carry = self.packer.carry_len() as i64;
+        self.ov_hist = (410 * (self.ov_hist + self.ov_prev) + 205 * carry) >> 10;
+        self.ov_prev = carry;
+        self.pending_pad = Some(pad as i64);
+        let w = (written + HEADER_BYTES - self.carry_in) as u32;
+        self.rate_check(w, pad as u32);
+        self.carry_in = 0;
+        self.packet_blocks = 0;
+        self.packet_len()
+    }
+
+    /// §8.1a, in unsigned 32-bit arithmetic, with `bytes` the packet's own bytes (`W`).
+    fn rate_check(&mut self, bytes: u32, pad: u32) {
+        let blocks = self.packet_blocks as u32;
+        if blocks == 0 {
+            return;
+        }
+        let params = self.params();
+        let per_s = 2 * params.sample_rate / (params.subbands() as u32 * blocks);
+        let pps = (per_s & 1) + (per_s >> 1);
+        let smooth = |cur: u32, prev: u32, bytes: u32| {
+            (410u32.wrapping_mul(prev.wrapping_add(cur)))
+                .wrapping_add(1640u32.wrapping_mul(bytes).wrapping_mul(pps))
+                >> 10
+        };
+        let rate = &mut self.rate;
+        let a_new = smooth(rate.a, rate.ap, bytes + pad);
+        (rate.ap, rate.a) = (rate.a, a_new);
+        let b_new = smooth(rate.bq, rate.bp, bytes);
+        (rate.bp, rate.bq) = (rate.bq, b_new);
+        let measured = if a_new > rate.nominal { a_new } else { b_new };
+        let v = rate
+            .nominal
+            .wrapping_sub(measured)
+            .wrapping_add(rate.target);
+        rate.target = if rate.nominal > v {
+            rate.nominal
+        } else if params.subbands() == 8 {
+            v.min((5 * rate.nominal) >> 2)
+        } else {
+            v
+        };
+    }
+
+    /// An encode call with input. Returns the samples consumed and the packet bytes written to
+    /// `out` (0 if it needs more input).
+    pub fn encode(&mut self, pcm: &[i32], out: &mut [u8]) -> (usize, usize) {
+        let w = self.params().width();
+        let mut pos = 0;
+        loop {
+            let (req, close) = self.frame_size();
+            let have = self.frame_blocks();
+            if have < req {
+                let take = (req - have).min((pcm.len() - pos) / w) & !1;
+                let mut x = [0; MAX_WIDTH];
+                for block in pcm[pos..pos + take * w].chunks_exact(w) {
+                    self.engine.analyse(block, &mut x);
+                    self.frame.extend_from_slice(&x[..w]);
+                }
+                pos += take * w;
+                if have + take < req {
+                    return (pos, 0);
+                }
             }
-            start += m;
-            if m < n {
-                break;
+            self.code_frame();
+            if close || (self.packer.bit_len() / 8) as i64 >= self.cap() {
+                return (pos, self.close(out));
             }
         }
-        self.dropped += (total - start) as u64;
-        self.pending.drain(..total * self.params().width());
-        self.packer.finish(out);
     }
-}
 
-/// Smallest packet that holds `blocks` blocks (one period) at the floor allocation, with no
-/// continuation, whatever the codes. Smaller packets still work but drop audio.
-pub fn min_packet_bytes(params: Params, blocks: usize) -> usize {
-    let mut floor = [0u8; MAX_WIDTH];
-    let floor = &mut floor[..params.width()];
-    alloc::floor(params.subbands(), floor);
-    let bits = continuation_bits(0)
-        + plan(blocks)
-            .map(|n| worst_frame_bits(params, floor, n))
-            .sum::<usize>();
-    (HEADER_BYTES + bits.div_ceil(8)).next_multiple_of(4)
-}
-
-/// Frame sizes for `pending` blocks: 64s, then the even remainder. An odd block waits.
-fn plan(pending: usize) -> impl Iterator<Item = usize> {
-    let even = pending & !1;
-    (0..even.div_ceil(MAX_FRAME_BLOCKS))
-        .map(move |k| (even - k * MAX_FRAME_BLOCKS).min(MAX_FRAME_BLOCKS))
+    /// The flush call: codes the partial frame, if any, and closes the packet.
+    pub fn flush(&mut self, out: &mut [u8]) -> usize {
+        if !self.frame.is_empty() {
+            self.code_frame();
+        }
+        self.close(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Params, plan};
-
-    #[test]
-    fn floor_packet_sizes() {
-        use crate::codec::Variant;
-        let cfg0 = Params {
-            variant: Variant::Cfg0,
-            sample_rate: 48_000,
-        };
-        let need = super::min_packet_bytes(cfg0, 168);
-        assert!((128..656).contains(&need), "{need}");
-        assert!(super::min_packet_bytes(cfg0, 2) < need);
-    }
-
-    #[test]
-    fn frame_plans() {
-        let plan = |n| plan(n).collect::<Vec<_>>();
-        assert_eq!(plan(168), [64, 64, 40]);
-        assert_eq!(plan(114), [64, 50]);
-        assert_eq!(plan(1), [] as [usize; 0]);
-        assert_eq!(plan(64), [64]);
-        assert_eq!(plan(65), [64]);
-        assert_eq!(plan(7), [6]);
-    }
-}
-
-#[cfg(test)]
-mod live {
-    use std::collections::VecDeque;
-    use std::fs;
-    use std::path::PathBuf;
-
     use super::*;
     use crate::codec::Variant;
-    use crate::codec::alloc::WaterFill;
     use crate::codec::decode::{Frame, decode};
 
     const CFG0: Params = Params {
         variant: Variant::Cfg0,
         sample_rate: 48_000,
     };
+
+    fn noise(frames: usize) -> Vec<i32> {
+        let mut s = 1u32;
+        (0..frames * 2)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s as i32) >> 8
+            })
+            .collect()
+    }
 
     fn sine(frames: usize, rate: f64) -> Vec<i32> {
         (0..frames)
@@ -278,223 +283,184 @@ mod live {
             .collect()
     }
 
-    fn noise(frames: usize) -> Vec<i32> {
-        let mut s = 1u32;
-        (0..frames * 2)
-            .map(|_| {
-                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                (s as i32) >> 10
-            })
-            .collect()
-    }
-
-    /// Gives back a fixed list of allocations in order, ignoring the budget.
-    struct Replay(VecDeque<Vec<u8>>);
-
-    impl Allocator for Replay {
-        fn allocate(
-            &mut self,
-            _: &[i32],
-            _: &[u8],
-            _: &mut dyn FnMut(&[u8]) -> bool,
-            out: &mut [u8],
-        ) {
-            out.copy_from_slice(&self.0.pop_front().expect("ran out of allocations"));
-        }
-    }
-
-    /// Spends every bit it's offered and then some: the most it's allowed, ignoring the budget.
-    struct Greedy;
-
-    impl Allocator for Greedy {
-        fn allocate(
-            &mut self,
-            _: &[i32],
-            max: &[u8],
-            _: &mut dyn FnMut(&[u8]) -> bool,
-            out: &mut [u8],
-        ) {
-            out.copy_from_slice(max);
-            for b in out.iter_mut() {
-                if *b == 1 {
-                    *b = 2;
-                }
-            }
-        }
-    }
-
-    fn read_s32(path: &PathBuf) -> Vec<i32> {
-        fs::read(path)
-            .unwrap()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| i32::from_le_bytes(*b))
-            .collect()
-    }
-
-    /// Encodes `pcm` a period at a time. Returns the packets.
-    fn encode(p: &mut Packetiser, period: usize, pcm: &[i32]) -> Vec<u8> {
+    /// The wrapper loop with `period`-sample chunks: encode, then flush if nothing came out.
+    fn run(p: &mut Packetiser, period: usize, pcm: &[i32]) -> Vec<u8> {
+        let len = p.packet_len();
+        let mut out = vec![0; len];
         let mut packets = Vec::new();
-        let mut out = vec![0; p.packet_len()];
+        let mut buf = Vec::new();
         for chunk in pcm.chunks_exact(period) {
-            assert_eq!(p.push_pcm(chunk), chunk.len());
-            p.emit(&mut out);
+            buf.extend_from_slice(chunk);
+            let (consumed, written) = p.encode(&buf, &mut out);
+            buf.drain(..consumed);
+            if written == 0 {
+                p.flush(&mut out);
+            }
             packets.extend_from_slice(&out);
-            assert!(p.carry_len() <= p.max_carry());
         }
         packets
     }
 
-    fn check_frames(params: Params, frames: &[Frame], max: &[u8]) {
-        for f in frames {
-            assert!(alloc::valid(&f.bits, params.subbands()), "{:?}", f.bits);
-            assert!(f.bits.iter().zip(max).all(|(b, m)| b <= m), "{:?}", f.bits);
-        }
-    }
-
-    /// The live path (`push_pcm`, `plan`, budget split, `emit`) with the reference's allocations
-    /// gives the reference's packets byte for byte, 64 + 64 + 40 frames each.
-    #[test]
-    fn replayed_allocations_give_r1_packets() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/vectors/r2");
-        for name in ["silence", "sine1k", "noise"] {
-            let want = fs::read(dir.join(format!("{name}.r1.bin"))).unwrap();
-            let pcm = read_s32(&dir.join(format!("{name}.s32le")));
-            let frames = decode(CFG0, &want, 656);
-            for k in 0..70 {
-                let sizes: Vec<_> = frames
-                    .iter()
-                    .filter(|f| f.packet == k)
-                    .map(Frame::blocks)
-                    .collect();
-                assert_eq!(sizes, [64, 64, 40], "{name} packet {k}");
-            }
-            let allocs = frames.iter().map(|f| f.bits.clone()).collect();
-            let mut p = Packetiser::new(CFG0, 656, 364_000, Box::new(Replay(allocs)));
-            let got = encode(&mut p, 1344, &pcm[..1344 * 70]);
-            assert_eq!(p.dropped(), 0);
-            for (i, (g, w)) in got.chunks(656).zip(want.chunks(656)).enumerate() {
-                assert!(g == w, "{name} packet {i}");
-            }
-        }
-    }
-
-    /// Frames that overshoot spill into the next packet's continuation, which stays bounded
-    /// and still parses.
-    #[test]
-    fn overshoot_carries_and_decodes() {
-        let mut p = Packetiser::new(CFG0, 656, 427_000, Box::new(Greedy));
-        let packets = encode(&mut p, 1344, &noise(14_400));
-        let carried = packets.chunks(656).filter(|pk| pk[3] & 0x80 == 0).count();
-        assert!(carried > 0, "no packet had a continuation");
-        let frames = decode(CFG0, &packets, 656);
-        check_frames(CFG0, &frames, CFG0.max_bits(427_000));
-        assert!(
-            frames.iter().any(|f| f.bits == [4, 0, 0, 0, 4, 0, 0, 0]),
-            "never fell back"
-        );
-    }
-
-    /// Packets too small for a period at the floor allocation drop blocks rather than grow the
-    /// carry or the buffer.
-    #[test]
-    fn small_packets_stay_bounded() {
-        for len in [128, 132, 136, 140] {
-            let mut p = Packetiser::new(CFG0, len, 364_000, Box::new(WaterFill));
-            let pcm = noise(672 * 2000);
-            let mut out = vec![0; len];
-            let mut packets = Vec::new();
-            for chunk in pcm.as_chunks::<1344>().0 {
-                p.push_pcm(chunk);
-                p.emit(&mut out);
-                assert!(p.carry_len() <= p.max_carry());
-                assert!(p.pending_blocks() <= 1);
-                assert!(p.pending.capacity() <= MAX_PENDING_BLOCKS * 8);
-                if packets.len() < 50 * len {
-                    packets.extend_from_slice(&out);
-                }
-            }
-            assert!(p.dropped() > 0, "{len}: expected drops");
-            check_frames(CFG0, &decode(CFG0, &packets, len), CFG0.max_bits(364_000));
+    fn parses(params: Params, len: usize, bitrate: u32, period: usize, pcm: &[i32]) {
+        let mut p = Packetiser::new(params, len, bitrate);
+        let packets = run(&mut p, period, pcm);
+        let frames = decode(params, &packets, len);
+        let blocks: usize = frames.iter().map(Frame::blocks).sum();
+        let all = pcm.len() / params.width();
+        // The last packet's carry isn't out yet, and an odd block may wait.
+        assert!(all - blocks < 2 * MAX_FRAME_BLOCKS, "{blocks} of {all}");
+        for f in &frames {
+            assert!(f.bits.iter().all(|&b| b != 1), "{:?}", f.bits);
         }
     }
 
     #[test]
-    fn push_pcm_stops_at_the_buffer_limit() {
-        let mut p = Packetiser::new(CFG0, 656, 364_000, Box::new(WaterFill));
-        let taken = p.push_pcm(&vec![0; 8 * MAX_PENDING_BLOCKS * 2]);
-        assert_eq!(taken, 8 * MAX_PENDING_BLOCKS);
-        assert_eq!(p.push_pcm(&[0; 8]), 0);
-        // Odd samples carry across calls.
-        let mut q = Packetiser::new(CFG0, 656, 364_000, Box::new(WaterFill));
-        q.push_pcm(&[1, 2, 3]);
-        q.push_pcm(&[4, 5, 6, 7, 8, 9]);
-        assert_eq!((q.pending_blocks(), q.partial.len()), (1, 1));
-    }
-
-    /// Encodes `pcm` a period at a time with `WaterFill`, then parses the packets back.
-    fn run(params: Params, packet_len: usize, bitrate: u32, period: usize, pcm: &[i32]) {
-        let mut p = Packetiser::new(params, packet_len, bitrate, Box::new(WaterFill));
-        let packets = encode(&mut p, period, pcm);
-        assert_eq!(p.dropped(), 0);
-        check_frames(
-            params,
-            &decode(params, &packets, packet_len),
-            params.max_bits(bitrate),
-        );
-    }
-
-    #[test]
-    fn cfg0_packets_parse() {
+    fn packets_parse_back() {
         for pcm in [sine(48_000, 48_000.0), noise(48_000), vec![0; 96_000]] {
-            run(CFG0, 656, 364_000, 1344, &pcm);
+            parses(CFG0, 656, 364_000, 1344, &pcm);
         }
-    }
-
-    #[test]
-    fn cfg1_and_cfg3_packets_parse() {
         let cfg1 = Params {
             variant: Variant::Cfg1,
-            sample_rate: 48_000,
+            ..CFG0
         };
-        run(cfg1, 348, 265_000, 960, &noise(24_000));
+        parses(cfg1, 348, 265_000, 960, &noise(24_000));
         let cfg3 = Params {
             variant: Variant::Cfg3,
-            sample_rate: 48_000,
+            ..CFG0
         };
-        run(cfg3, 656, 270_000, 1824, &sine(24_000, 48_000.0));
+        parses(cfg3, 656, 270_000, 1824, &sine(24_000, 48_000.0));
         let cfg3_96k = Params {
             variant: Variant::Cfg3,
             sample_rate: 96_000,
         };
-        run(cfg3_96k, 656, 340_000, 2880, &noise(48_000));
+        parses(cfg3_96k, 656, 340_000, 2880, &noise(48_000));
     }
 
-    /// The coded subbands follow the input: reconstruction (prediction + difference) against
-    /// the analysis output, for a sine at the Px7's rate.
+    /// §8.8: with packets far too small for the bitrate, nothing is dropped and the carry stays
+    /// small; the input the encoder can't code is left with the caller, whose backlog grows.
     #[test]
-    fn cfg0_reconstruction_tracks_signal() {
+    fn small_packets_leave_input_unconsumed() {
+        for len in [64, 128, 200] {
+            let mut p = Packetiser::new(CFG0, len, 364_000);
+            let mut out = vec![0; len];
+            let (mut buf, mut max_carry, mut backlog) = (Vec::new(), 0, Vec::new());
+            for chunk in noise(48_000).as_chunks::<1344>().0 {
+                buf.extend_from_slice(chunk);
+                let (consumed, written) = p.encode(&buf, &mut out);
+                buf.drain(..consumed);
+                if written == 0 {
+                    p.flush(&mut out);
+                }
+                max_carry = max_carry.max(p.packer.carry_len());
+                backlog.push(buf.len());
+            }
+            assert!(max_carry <= 128, "{len}: carry {max_carry}");
+            assert!(backlog.windows(2).all(|b| b[1] >= b[0]), "{len}");
+            assert!(backlog[backlog.len() - 1] > 10 * 1344, "{len}: {backlog:?}");
+        }
+    }
+
+    /// §8.1a check value from the spec side: config 0 48k noise stage run, A = 349063 and
+    /// B = 347103 after packet 3 (zero-based).
+    #[test]
+    fn rate_check_value() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/vectors/stages/cfg0_48k_noise/pcm_in.s32");
+        let bytes = std::fs::read(dir).unwrap();
+        let pcm: Vec<i32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| i32::from_le_bytes(*b))
+            .collect();
+        let mut p = Packetiser::new(CFG0, 656, 364_000);
+        let mut out = [0; 656];
+        let mut pos = 0;
+        let mut ab = Vec::new();
+        while ab.len() < 5 {
+            let (consumed, written) = p.encode(&pcm[pos..], &mut out);
+            pos += consumed;
+            assert!(written > 0);
+            ab.push((p.rate.a, p.rate.bq));
+        }
+        // Packet 3 is the first padded one, so A and B part there.
+        assert_eq!(ab[3], (349_063, 347_103), "{ab:?}");
+        assert!(ab[..3].iter().all(|(a, b)| a == b));
+    }
+
+    /// Steady state allocates nothing: every buffer keeps its first capacity, even with packets
+    /// far too small for the bitrate.
+    #[test]
+    fn buffers_never_grow() {
+        let cfg3 = Params {
+            variant: Variant::Cfg3,
+            ..CFG0
+        };
+        for (params, len, bitrate) in [
+            (CFG0, 656, 364_000),
+            (CFG0, 64, 364_000),
+            (cfg3, 128, 270_000),
+        ] {
+            let mut p = Packetiser::new(params, len, bitrate);
+            let caps = |p: &Packetiser| {
+                (
+                    p.frame.capacity(),
+                    p.codes.capacity(),
+                    p.packer.capacities(),
+                )
+            };
+            let before = caps(&p);
+            run(&mut p, 1344, &noise(48_000));
+            run(&mut p, 1344, &sine(48_000, 48_000.0));
+            assert_eq!(caps(&p), before);
+        }
+    }
+
+    /// 48- and 672-frame chunks give the same output (`codec-core.md` §8).
+    #[test]
+    fn chunking_does_not_matter() {
+        let pcm = noise(9600);
+        let encode = |step: usize| {
+            let mut p = Packetiser::new(CFG0, 656, 364_000);
+            let mut out = vec![0; 656];
+            let (mut packets, mut buf, mut consumed) = (Vec::new(), Vec::new(), 0);
+            for chunk in pcm.chunks(step) {
+                buf.extend_from_slice(chunk);
+                let (c, w) = p.encode(&buf, &mut out);
+                buf.drain(..c);
+                consumed += c;
+                let w = if w == 0 && consumed >= 1344 {
+                    p.flush(&mut out)
+                } else {
+                    w
+                };
+                if w > 0 {
+                    packets.extend_from_slice(&out);
+                    consumed = 0;
+                }
+            }
+            packets
+        };
+        let whole = encode(1344);
+        assert_eq!(whole.len(), 14 * 656);
+        assert!(encode(96).iter().eq(whole.iter()));
+    }
+
+    /// The coded subbands follow the input: reconstruction against the analysis output.
+    #[test]
+    fn reconstruction_tracks_signal() {
         let w = CFG0.width();
         let pcm = sine(9600, 48_000.0);
         let mut engine = Engine::new(CFG0);
-        let packer = Packer::new(CFG0, 656);
         let mut x = vec![0; pcm.len() / 2];
         for (p, xb) in pcm.chunks_exact(w).zip(x.chunks_exact_mut(w)) {
             engine.analyse(p, xb);
         }
-        // About a packet's payload per 168 blocks, as at 364 kbps.
-        let budget = 64 * packer.capacity_bits() / 168;
         let (mut sig, mut err) = (0f64, 0f64);
         let mut pred = vec![0; w];
-        let (mut trial, mut codes) = (engine, Vec::new());
         for frame in x.chunks_exact(64 * w) {
-            let mut bits = vec![0; w];
-            let mut fits = |alloc: &[u8]| {
-                trial_code(&mut trial, &engine, frame, alloc, &mut codes);
-                packer.frame_bits(alloc, &codes, 64) <= budget
-            };
-            WaterFill.allocate(frame, CFG0.max_bits(364_000), &mut fits, &mut bits);
+            let mut bits = [0; 8];
+            alloc::allocate(CFG0, 364_000, frame, &mut bits);
             let mut q = vec![0; w];
             for xb in frame.chunks_exact(w) {
                 let trace = engine.code_traced(xb, &bits, &mut q);

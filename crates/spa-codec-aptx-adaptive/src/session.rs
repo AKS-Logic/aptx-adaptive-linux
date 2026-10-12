@@ -6,7 +6,6 @@ use aptx_adaptive::{
 };
 
 use std::io::Write as _;
-use std::time::{Duration, Instant};
 
 use crate::dev::{AnyCore, Options, Replay};
 
@@ -66,30 +65,6 @@ impl From<Error> for SessionError {
     }
 }
 
-/// Reports dropped audio to stderr when the count goes up, at most once per [`DropLog::EVERY`].
-#[derive(Debug, Default)]
-struct DropLog {
-    reported: u64,
-    last: Option<Instant>,
-}
-
-impl DropLog {
-    const EVERY: Duration = Duration::from_secs(1);
-
-    /// The message to log, if any, for `dropped` blocks so far at `now`.
-    fn check(&mut self, dropped: u64, now: Instant) -> Option<String> {
-        if dropped <= self.reported || self.last.is_some_and(|t| now - t < Self::EVERY) {
-            return None;
-        }
-        let new = dropped - self.reported;
-        self.reported = dropped;
-        self.last = Some(now);
-        Some(format!(
-            "aptx-adaptive: dropped {new} blocks of audio ({dropped} total): packets too small"
-        ))
-    }
-}
-
 pub struct EncodeResult {
     pub consumed: usize,
     pub written: usize,
@@ -105,7 +80,6 @@ pub struct Session<C> {
     pcm: Vec<i32>,
     /// Packets sent so far; drives the TTP clock.
     packets: u32,
-    drops: DropLog,
 }
 
 impl Session<Encoder> {
@@ -182,7 +156,6 @@ impl<C: Core> Session<C> {
             swap: true,
             mtu,
             packets: 0,
-            drops: DropLog::default(),
         })
     }
 
@@ -290,12 +263,6 @@ impl<C: Core> Session<C> {
         let written = self.stream.push(&self.pcm, &mut dst[..room])?;
         if written.is_some() {
             self.packets = self.packets.wrapping_add(1);
-            if let Some(msg) = self
-                .drops
-                .check(self.stream.dropped_blocks(), Instant::now())
-            {
-                let _ = writeln!(std::io::stderr(), "{msg}");
-            }
         }
         if let (Some(n), false) = (written, self.swap) {
             // The stream always swaps; swapping again undoes it.
@@ -318,27 +285,6 @@ mod tests {
     use super::*;
 
     const MTU: usize = 895;
-
-    #[test]
-    fn drop_log_reports_increases_at_most_once_a_second() {
-        let mut log = DropLog::default();
-        let t0 = Instant::now();
-        let ms = |n| t0 + Duration::from_millis(n);
-        assert_eq!(log.check(0, ms(0)), None);
-        assert!(
-            log.check(5, ms(0))
-                .unwrap()
-                .contains("dropped 5 blocks of audio (5 total)")
-        );
-        assert_eq!(log.check(9, ms(500)), None);
-        assert!(
-            log.check(9, ms(1000))
-                .unwrap()
-                .contains("dropped 4 blocks of audio (9 total)")
-        );
-        assert_eq!(log.check(9, ms(5000)), None);
-        assert!(log.check(10, ms(5000)).is_some());
-    }
 
     fn session(framing: Framing) -> Session<Fake> {
         session_with(framing, MTU, budget(framing, MTU))
@@ -548,8 +494,8 @@ mod tests {
             Session::new(DecoderLevel::R1, 100),
             Err(SessionError::NoSpace)
         ));
-        // Nor can a packet that doesn't fit a period of audio at the cheapest allocation.
-        let need = aptx_adaptive::min_packet_bytes(config(DecoderLevel::R1), 1344).unwrap();
+        // Nor can a packet whose MTU-fitted bitrate is below the encoder's lowest (§8.8).
+        let need = aptx_adaptive::min_packet_bytes(config(DecoderLevel::R1), 14).unwrap();
         let mtu = need + header_len(FRAMING);
         assert!(matches!(
             Session::new(DecoderLevel::R1, mtu - 4),

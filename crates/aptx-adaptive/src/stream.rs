@@ -17,10 +17,6 @@ pub trait Core {
     /// Encoder failures.
     fn flush(&mut self, window: &mut [u8]) -> Result<usize>;
     fn set_bitrate(&mut self, bps: u32);
-    /// See [`Encoder::dropped_blocks`]. Cores that never drop audio keep the default.
-    fn dropped_blocks(&self) -> u64 {
-        0
-    }
 }
 
 /// Above this many interleaved samples of deficit the bitrate drops by 25%.
@@ -55,14 +51,14 @@ impl Stream<Encoder> {
 ///
 /// # Errors
 /// `UnsupportedConfig` if there's no row or encoder for `config`, `PacketTooSmall` if the
-/// fitted packet can't carry a period (see [`crate::min_packet_bytes`]).
+/// fitted row's bitrate is below what the encoder runs at, which would grow the backlog every
+/// period (`codec-core.md` §8.8, [`crate::min_packet_bytes`]).
 pub fn table_row(config: Config, budget: usize) -> Result<Row> {
     let index = tables::index(config.profile, config.level, Link::default());
     let row = tables::row(config.profile, index, DEFAULT_QUALITY)
         .ok_or(Error::UnsupportedConfig)?
         .fit(budget);
-    let samples = row.interleaved_samples(config.sample_rate, config.channels.into());
-    if row.packet_bytes < crate::min_packet_bytes(config, samples)? {
+    if row.bitrate < crate::min_bitrate(config)? {
         return Err(Error::PacketTooSmall);
     }
     Ok(row)
@@ -104,12 +100,6 @@ impl<C: Core> Stream<C> {
         frame::header(self.config.profile, &self.row)
     }
 
-    /// Blocks of audio the encoder has dropped so far (see [`Encoder::dropped_blocks`]).
-    #[must_use]
-    pub fn dropped_blocks(&self) -> u64 {
-        self.core.dropped_blocks()
-    }
-
     #[cfg(test)]
     pub fn core(&self) -> &C {
         &self.core
@@ -117,6 +107,10 @@ impl<C: Core> Stream<C> {
 
     /// Feeds interleaved 24-bit PCM. If a packet is out, writes it byte-swapped (no header) to
     /// `out` and returns its length.
+    ///
+    /// At most one packet comes out per call. A caller that feeds more than
+    /// [`Stream::samples_per_packet`] at a time must then call `push(&[], out)` until it
+    /// returns `None`, or the queued input grows without limit.
     ///
     /// # Errors
     /// `OutputTooSmall` if `out` can't hold a packet, or encoder failures.
@@ -266,9 +260,38 @@ mod tests {
     #[test]
     fn rejects_packets_that_cant_hold_a_period() {
         assert_eq!(table_row(PX7, 128).unwrap_err(), Error::PacketTooSmall);
-        let need = crate::min_packet_bytes(PX7, 1344).unwrap();
+        let need = crate::min_packet_bytes(PX7, 14).unwrap();
         assert_eq!(table_row(PX7, need).unwrap().packet_bytes, need);
         assert!(table_row(PX7, need - 4).is_err());
+    }
+
+    /// Config 1 (960-sample period) fed 1344 samples a call for 30 s, draining with empty
+    /// pushes: the queue stays under two periods.
+    #[test]
+    fn oversized_pushes_stay_bounded_when_drained() {
+        let config = Config {
+            profile: Profile::Ll,
+            ..PX7
+        };
+        let row = table_row(config, packet_budget(895)).unwrap();
+        let mut s = Stream::with_core(Encoder::new(config, row.bitrate).unwrap(), config, row);
+        assert_eq!(s.samples_per_packet(), 960);
+        let mut out = [0; 2008];
+        let chunk: Vec<i32> = (0..1344).map(|i| (i * 2654) % 65_536 - 32_768).collect();
+        let (mut fed, mut packets, mut most) = (0, 0, 0);
+        while fed < 30 * 96_000 {
+            packets += usize::from(s.push(&chunk, &mut out).unwrap().is_some());
+            while s.push(&[], &mut out).unwrap().is_some() {
+                packets += 1;
+            }
+            fed += chunk.len();
+            most = most.max(s.pcm.len());
+        }
+        assert!(most < 2 * 960, "queue reached {most}");
+        assert!(
+            packets.abs_diff(fed / 960) <= 2,
+            "{packets} packets for {fed}"
+        );
     }
 
     #[test]
@@ -277,25 +300,35 @@ mod tests {
         assert_eq!(s.push(&[0; 2], &mut [0; 655]), Err(Error::OutputTooSmall));
     }
 
-    /// One second of the r1 sine through the real encoder: 71 forced packets, each starting
-    /// `00 01 a1` or `00 81 a1` before the swap.
+    /// The real encoder through this loop, 48-frame blocks: every r2 vector byte for byte,
+    /// after undoing the swap.
     #[test]
-    fn real_encoder_gives_71_packets() {
-        let mut s = Stream::new(PX7, 887).unwrap();
-        assert_eq!(s.samples_per_packet(), 1344);
-        assert_eq!(s.row().bitrate, 364_000);
-        let pcm = read_pcm("sine1k.s32le");
-        let mut out = [0; 656];
-        let mut n = 0;
-        for block in pcm.chunks(1344) {
-            if let Some(len) = s.push(block, &mut out).unwrap() {
-                assert_eq!(len, 656);
-                // Byte 1 (swapped to 0) is the frame type, with 0x80 if padded.
-                assert_eq!(out[0] & 0x7F, 0x01);
-                assert_eq!(out[1..4], [0x00, 0xD0 | (out[2] & 0xF), 0xA1]);
-                n += 1;
+    fn real_encoder_gives_the_vectors() {
+        for level in [DecoderLevel::R1, DecoderLevel::R2] {
+            let tag = if level == DecoderLevel::R1 {
+                "r1"
+            } else {
+                "r2"
+            };
+            let config = Config { level, ..PX7 };
+            for name in ["silence", "sine1k", "noise"] {
+                // The vectors use the index-0 row (364 kbps, 14 ms) for both levels.
+                let row = table_row(PX7, 887).unwrap();
+                let core = Encoder::new(config, row.bitrate).unwrap();
+                let mut s = Stream::with_core(core, config, row);
+                assert_eq!(s.samples_per_packet(), 1344);
+                let want = fs::read(vectors().join(format!("{name}.{tag}.bin"))).unwrap();
+                let mut got = Vec::new();
+                let mut out = [0; 656];
+                for block in read_pcm(&format!("{name}.s32le")).chunks(96) {
+                    if let Some(len) = s.push(block, &mut out).unwrap() {
+                        let mut packet = [0; 656];
+                        frame::swap16(&out[..len], &mut packet);
+                        got.extend_from_slice(&packet);
+                    }
+                }
+                assert!(got == want, "{name}.{tag}");
             }
         }
-        assert_eq!(n, 71);
     }
 }

@@ -224,8 +224,7 @@ pub fn decode(params: Params, packets: &[u8], packet_len: usize) -> Vec<Frame> {
                 bits: bits.clone(),
                 codes,
             };
-            // The reference's flush closes the last frame at any even size (§7.1 lists only
-            // 8, 16, 32, 48 and 64; see QUESTIONS.md).
+            // A flush closes the last frame at any even size (§7.1, §8.0).
             assert!(
                 f.blocks() <= 64 && f.blocks().is_multiple_of(2),
                 "packet {packet}: frame of {} blocks",

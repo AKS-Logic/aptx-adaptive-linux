@@ -6,13 +6,13 @@ pub mod fake;
 mod frame;
 mod stream;
 mod tables;
+#[cfg(test)]
+mod vectors;
 
 use std::fmt;
 
-use codec::packetiser::{self, Packetiser};
-use codec::{Params, Variant};
-
-pub use codec::alloc;
+use codec::packetiser::Packetiser;
+use codec::{Params, Variant, alloc};
 
 pub use frame::HEADER_LEN;
 pub use stream::{Core, Stream, table_row};
@@ -34,7 +34,8 @@ pub enum Error {
     WindowSize,
     /// Caller's buffer can't hold a packet.
     OutputTooSmall,
-    /// The packet size the link allows can't carry a period of audio.
+    /// The packet size the link allows gives a bitrate below what the encoder runs at, so
+    /// unencoded audio would pile up (`codec-core.md` §8.8).
     PacketTooSmall,
 }
 
@@ -44,7 +45,9 @@ impl fmt::Display for Error {
             Self::UnsupportedConfig => f.write_str("unsupported encoder configuration"),
             Self::WindowSize => f.write_str("encoder window size out of range"),
             Self::OutputTooSmall => f.write_str("output buffer too small"),
-            Self::PacketTooSmall => f.write_str("packet size too small for a period of audio"),
+            Self::PacketTooSmall => {
+                f.write_str("packet size too small for the encoder's lowest bitrate")
+            }
         }
     }
 }
@@ -69,8 +72,6 @@ pub const WINDOW_SLACK: usize = 64;
 pub struct Encoder {
     params: Params,
     bitrate: u32,
-    /// Taken by the packetiser on the first call.
-    allocator: Option<Box<dyn alloc::Allocator>>,
     /// Built on the first call, once the packet size (the window) is known.
     packetiser: Option<Box<Packetiser>>,
 }
@@ -105,17 +106,26 @@ fn params(config: Config) -> Result<Params> {
     })
 }
 
-/// The smallest packet that carries `interleaved_samples` of PCM without dropping any, at the
-/// cheapest allocation and the longest codewords.
+/// The lowest bitrate the encoder runs at: set-bitrate clamps anything lower up to this
+/// (`codec-core.md` §8.1a).
 ///
 /// # Errors
 /// As for [`Encoder::new`].
-pub fn min_packet_bytes(config: Config, interleaved_samples: usize) -> Result<usize> {
-    let params = params(config)?;
-    Ok(packetiser::min_packet_bytes(
-        params,
-        interleaved_samples / params.width(),
-    ))
+pub fn min_bitrate(config: Config) -> Result<u32> {
+    Ok(alloc::bitrate_range(params(config)?).0)
+}
+
+/// The smallest packet for a `period_ms` row whose MTU-fitted bitrate ([`Row::fit`]) the
+/// encoder can run at. Below it the encoder codes faster than the packets carry, so the
+/// unconsumed input grows every period (`codec-core.md` §8.8).
+///
+/// # Errors
+/// As for [`Encoder::new`].
+pub fn min_packet_bytes(config: Config, period_ms: u32) -> Result<usize> {
+    let lo = u64::from(min_bitrate(config)?);
+    // Inverse of `Row::fit`: size·8000/period − 25000 ≥ lo.
+    let bytes = ((lo + 25_000) * u64::from(period_ms)).div_ceil(8000);
+    Ok((bytes as usize).next_multiple_of(4))
 }
 
 impl Encoder {
@@ -123,26 +133,12 @@ impl Encoder {
     /// `UnsupportedConfig` for anything but stereo configs 0, 1 and 3 at their sample rates,
     /// or a zero bitrate.
     pub fn new(config: Config, bitrate: u32) -> Result<Self> {
-        Self::with_allocator(config, bitrate, Box::new(alloc::WaterFill))
-    }
-
-    /// An encoder that picks bit allocations with `allocator`. Allocations it gets wrong are
-    /// replaced by the floor (see [`alloc::Allocator`]).
-    ///
-    /// # Errors
-    /// As for [`Encoder::new`].
-    pub fn with_allocator(
-        config: Config,
-        bitrate: u32,
-        allocator: Box<dyn alloc::Allocator>,
-    ) -> Result<Self> {
         if config.channels != 2 || bitrate == 0 {
             return Err(Error::UnsupportedConfig);
         }
         Ok(Self {
             params: params(config)?,
             bitrate,
-            allocator: Some(allocator),
             packetiser: None,
         })
     }
@@ -150,11 +146,9 @@ impl Encoder {
     fn packetiser(&mut self, window: &[u8]) -> Result<&mut Packetiser> {
         let size = check_window(window)?;
         let (params, bitrate) = (self.params, self.bitrate);
-        let allocator = &mut self.allocator;
-        let p = self.packetiser.get_or_insert_with(|| {
-            let allocator = allocator.take().expect("taken once, with the packetiser");
-            Box::new(Packetiser::new(params, size, bitrate, allocator))
-        });
+        let p = self
+            .packetiser
+            .get_or_insert_with(|| Box::new(Packetiser::new(params, size, bitrate)));
         if p.packet_len() == size {
             Ok(p)
         } else {
@@ -165,45 +159,32 @@ impl Encoder {
     /// Takes any amount of interleaved 24-bit PCM (sign-extended in `i32`). Writes at most one
     /// packet into `window`, which is the table packet size plus [`WINDOW_SLACK`].
     ///
-    /// Like the reference in steady state, this leaves packets to [`Encoder::flush`]. It
-    /// consumes everything unless several packets' worth is already buffered.
+    /// Like the reference, this mostly leaves packets to [`Encoder::flush`]: it only writes one
+    /// when the frame-size rule closes the packet first (`codec-core.md` §8.1). Unconsumed
+    /// input must be passed again.
     ///
     /// # Errors
     /// `WindowSize` unless the packet size is a multiple of 4 in 12..=[`MAX_PACKET`] bytes and
     /// the same on every call.
     pub fn encode_packet(&mut self, pcm: &[i32], window: &mut [u8]) -> Result<Progress> {
-        let consumed = self.packetiser(window)?.push_pcm(pcm);
-        Ok(Progress {
-            consumed,
-            written: 0,
-        })
+        let (consumed, written) = self.packetiser(window)?.encode(pcm, window);
+        Ok(Progress { consumed, written })
     }
 
-    /// Emits the packet currently being built.
+    /// Codes whatever is buffered and emits the packet currently being built.
     ///
     /// # Errors
     /// As for [`Encoder::encode_packet`].
     pub fn flush(&mut self, window: &mut [u8]) -> Result<usize> {
-        let p = self.packetiser(window)?;
-        let size = p.packet_len();
-        p.emit(&mut window[..size]);
-        Ok(size)
+        Ok(self.packetiser(window)?.flush(window))
     }
 
-    /// Blocks of audio (one subband sample per band per channel) dropped so far because a
-    /// packet couldn't hold them even at the cheapest allocation. Only happens with packets
-    /// near [`min_packet_bytes`].
-    #[must_use]
-    pub fn dropped_blocks(&self) -> u64 {
-        self.packetiser.as_ref().map_or(0, |p| p.dropped())
-    }
-
-    /// Picks the allocation caps. UNCERTAIN: the reference clamps this to a [min, max] range
-    /// derived at create time, which the spec doesn't give.
+    /// The set-bitrate operation: clamps to the encoder's range and resets its rate control
+    /// (§8.1a).
     pub fn set_bitrate(&mut self, bps: u32) {
-        self.bitrate = bps;
-        if let Some(p) = &mut self.packetiser {
-            p.set_bitrate(bps);
+        match &mut self.packetiser {
+            Some(p) => p.set_bitrate(bps),
+            None => self.bitrate = bps,
         }
     }
 }
@@ -227,9 +208,6 @@ impl Core for Encoder {
     }
     fn set_bitrate(&mut self, bps: u32) {
         Encoder::set_bitrate(self, bps);
-    }
-    fn dropped_blocks(&self) -> u64 {
-        Encoder::dropped_blocks(self)
     }
 }
 
@@ -299,57 +277,19 @@ mod tests {
         assert_eq!(r1_48k.variant, Variant::Cfg0);
     }
 
-    /// An injected allocator is used; one that breaks the rules is overridden by the floor.
-    #[test]
-    fn takes_an_allocator() {
-        struct Bad;
-        impl alloc::Allocator for Bad {
-            fn allocate(
-                &mut self,
-                _: &[i32],
-                _: &[u8],
-                _: &mut dyn FnMut(&[u8]) -> bool,
-                out: &mut [u8],
-            ) {
-                out.fill(1);
-            }
-        }
-        let mut enc = Encoder::with_allocator(STEREO_48K, 364_000, Box::new(Bad)).unwrap();
-        let mut out = [0u8; 656 + WINDOW_SLACK];
-        enc.encode_packet(&[1000; 1344], &mut out).unwrap();
-        enc.flush(&mut out).unwrap();
-        // Header 0xA, then pairs (4, 0) twice: ρ = 3, 0.
-        let p = enc.packetiser.as_ref().unwrap();
-        assert_eq!(p.pending_blocks(), 0);
-        assert_eq!(out[3] >> 3, 0b1_1010);
-    }
-
-    /// A packet below the minimum drops blocks, and the count shows on the encoder.
-    #[test]
-    fn counts_dropped_blocks() {
-        let mut enc = Encoder::new(STEREO_48K, 364_000).unwrap();
-        let mut out = [0u8; 128 + WINDOW_SLACK];
-        let mut s = 1u32;
-        let pcm: Vec<i32> = (0..1344)
-            .map(|_| {
-                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                (s as i32) >> 10
-            })
-            .collect();
-        assert_eq!(enc.dropped_blocks(), 0);
-        for _ in 0..4 {
-            enc.encode_packet(&pcm, &mut out).unwrap();
-            enc.flush(&mut out).unwrap();
-        }
-        assert!(enc.dropped_blocks() > 0);
-        let fine = Encoder::new(STEREO_48K, 364_000).unwrap();
-        assert_eq!(Core::dropped_blocks(&fine), 0);
-    }
-
     #[test]
     fn min_packet_is_under_the_px7_packet() {
-        let need = min_packet_bytes(STEREO_48K, 1344).unwrap();
+        let need = min_packet_bytes(STEREO_48K, 14).unwrap();
         assert!(need <= 656 && need > 128, "{need}");
+        let row = Row {
+            bitrate: 364_000,
+            period_ms: 14,
+            samples_per_channel: 672,
+            packet_bytes: 656,
+            cfg: 1,
+        };
+        assert!(row.fit(need).bitrate >= min_bitrate(STEREO_48K).unwrap());
+        assert!(row.fit(need - 4).bitrate < min_bitrate(STEREO_48K).unwrap());
     }
 
     #[test]

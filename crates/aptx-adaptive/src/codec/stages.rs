@@ -1,4 +1,6 @@
-//! Stage-by-stage checks against `tests/vectors/stages` (see its README).
+//! Stage-by-stage checks against `tests/vectors/stages` (see its README). The packets
+//! themselves are checked from raw PCM in `crate::vectors`; these pin down the intermediate
+//! values, given the reference allocations, which our allocator reproduces.
 
 #![expect(clippy::many_single_char_names, reason = "names follow the spec")]
 
@@ -6,14 +8,12 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::decode::{coded, decode};
-use super::pack::Packer;
 use super::{Engine, Params, Variant};
 
 struct Vectors {
     dir: PathBuf,
     params: Params,
     packet_len: usize,
-    n_packets: usize,
     blocks: usize,
     /// (packet, blocks, bits)
     frames: Vec<(usize, usize, Vec<u8>)>,
@@ -63,7 +63,6 @@ impl Vectors {
             dir,
             params,
             packet_len: m[0] as usize,
-            n_packets: m[1] as usize,
             blocks: m[2] as usize,
             frames,
         }
@@ -136,43 +135,6 @@ fn check_quant_predict(v: &Vectors, name: &str) {
     first_mismatch(name, "pred_out", w, &pred, &v.s32("pred_out.s32"));
 }
 
-fn check_packets(v: &Vectors, name: &str) {
-    let w = v.params.width();
-    let codes = v.s32("quant_codes.s32");
-    let want = fs::read(v.dir.join("packets.bin")).unwrap();
-    let mut packer = Packer::new(v.params, v.packet_len);
-    let mut got = Vec::new();
-    let mut out = vec![0; v.packet_len];
-    let mut block = 0;
-    let mut current = 0;
-    for (p, n, bits) in &v.frames {
-        while current < *p {
-            packer.finish(&mut out);
-            got.extend_from_slice(&out);
-            current += 1;
-        }
-        packer.push_frame(bits, &codes[block * w..(block + n) * w]);
-        block += n;
-    }
-    packer.finish(&mut out);
-    got.extend_from_slice(&out);
-    assert_eq!(got.len(), v.n_packets * v.packet_len, "{name} packet count");
-    assert_eq!(want.len(), got.len(), "{name} packets.bin length");
-    for (i, (g, expect)) in got
-        .chunks(v.packet_len)
-        .zip(want.chunks(v.packet_len))
-        .enumerate()
-    {
-        if let Some(b) = g.iter().zip(expect).position(|(a, b)| a != b) {
-            panic!(
-                "{name} packet {i} byte {b}: got {:02x?}, want {:02x?}",
-                &g[b..(b + 8).min(g.len())],
-                &expect[b..(b + 8).min(g.len())]
-            );
-        }
-    }
-}
-
 /// Our parser reads the reference packets back to `frames.json` and the coded codes.
 fn check_decode(v: &Vectors, name: &str) {
     let w = v.params.width();
@@ -210,7 +172,6 @@ macro_rules! stage_tests {
     ($($name:ident: $dir:literal, $variant:expr, $rate:literal;)*) => {
         mod analysis { use super::*; $(#[test] fn $name() { check_analysis(&Vectors::load($dir, $variant, $rate), $dir); })* }
         mod quant_predict { use super::*; $(#[test] fn $name() { check_quant_predict(&Vectors::load($dir, $variant, $rate), $dir); })* }
-        mod packets { use super::*; $(#[test] fn $name() { check_packets(&Vectors::load($dir, $variant, $rate), $dir); })* }
         mod decode { use super::*; $(#[test] fn $name() { check_decode(&Vectors::load($dir, $variant, $rate), $dir); })* }
     };
 }
@@ -222,73 +183,4 @@ stage_tests! {
     cfg3_noise: "cfg3_48k_noise", Variant::Cfg3, 48_000;
     cfg3_sine: "cfg3_48k_sine", Variant::Cfg3, 48_000;
     cfg3_96k_noise: "cfg3_96k_noise", Variant::Cfg3, 96_000;
-}
-
-/// End to end on `tests/vectors/r2` (1 s, 364 kbps, 656 bytes): PCM through the encoder with
-/// the reference's allocations and frame sizes, read back from its own packets, must give its
-/// packets byte for byte.
-fn check_end_to_end(name: &str, variant: Variant) {
-    let params = Params {
-        variant,
-        sample_rate: 48_000,
-    };
-    let w = params.width();
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/vectors/r2");
-    let level = if variant == Variant::Cfg0 { "r1" } else { "r2" };
-    let want = fs::read(dir.join(format!("{name}.{level}.bin"))).unwrap();
-    let pcm: Vec<i32> = fs::read(dir.join(format!("{name}.s32le")))
-        .unwrap()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| i32::from_le_bytes(*b))
-        .collect();
-    let frames = decode(params, &want, 656);
-
-    let mut engine = Engine::new(params);
-    let mut packer = Packer::new(params, 656);
-    let mut got = Vec::new();
-    let mut out = vec![0; 656];
-    let mut blocks = pcm.chunks_exact(w);
-    let mut x = vec![0; w];
-    let mut current = 0;
-    for f in &frames {
-        while current < f.packet {
-            packer.finish(&mut out);
-            got.extend_from_slice(&out);
-            current += 1;
-        }
-        let mut codes = vec![0; f.blocks() * w];
-        for q in codes.chunks_exact_mut(w) {
-            engine.analyse(blocks.next().unwrap(), &mut x);
-            engine.code(&x, &f.bits, q);
-        }
-        packer.push_frame(&f.bits, &codes);
-    }
-    packer.finish(&mut out);
-    got.extend_from_slice(&out);
-    assert_eq!(got.len(), want.len(), "{name}.{level} length");
-    // The last packet's continuation isn't in the file, so its final frame is short.
-    let last = want.len() - 656;
-    if let Some(b) = got[..last].iter().zip(&want).position(|(a, b)| a != b) {
-        panic!(
-            "{name}.{level}: first difference at packet {} byte {}",
-            b / 656,
-            b % 656
-        );
-    }
-}
-
-#[test]
-fn end_to_end_r1() {
-    for name in ["silence", "sine1k", "noise"] {
-        check_end_to_end(name, Variant::Cfg0);
-    }
-}
-
-#[test]
-fn end_to_end_r2() {
-    for name in ["silence", "sine1k", "noise"] {
-        check_end_to_end(name, Variant::Cfg3);
-    }
 }

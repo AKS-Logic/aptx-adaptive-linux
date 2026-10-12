@@ -43,24 +43,13 @@ struct Descriptor {
     low_power: bool,
     /// Zero taps per band, 0 = predictor off (§6), at 44.1/48 and 88.2/96 kHz.
     taps: [&'static [usize]; 2],
-    /// (above kbps, caps) from the highest threshold down, then the floor, at 44.1/48 and
-    /// 88.2/96 kHz (`spec/tables/allocator.json`, §8.3).
-    max_bits: [&'static [(u32, &'static [u8])]; 2],
 }
-
-const MAX_BITS_4BAND: &[(u32, &[u8])] = &[
-    (370, &tables::MAX_BITS_4BAND_MAX),
-    (320, &tables::MAX_BITS_4BAND_370),
-    (250, &tables::MAX_BITS_4BAND_320),
-    (0, &tables::MAX_BITS_4BAND_250),
-];
 
 const CFG0: Descriptor = Descriptor {
     subbands: 4,
     frame_type: 1,
     low_power: false,
     taps: [&tables::TAPS_4BAND; 2],
-    max_bits: [MAX_BITS_4BAND; 2],
 };
 
 const CFG1: Descriptor = Descriptor {
@@ -74,23 +63,6 @@ const CFG3: Descriptor = Descriptor {
     frame_type: 3,
     low_power: false,
     taps: [&tables::TAPS_8BAND_48K, &tables::TAPS_8BAND_96K],
-    max_bits: [
-        &[
-            (520, &tables::MAX_BITS_8BAND_MAX),
-            (420, &tables::MAX_BITS_8BAND_520),
-            (370, &tables::MAX_BITS_8BAND_420),
-            (320, &tables::MAX_BITS_8BAND_370),
-            (250, &tables::MAX_BITS_8BAND_320),
-            (0, &tables::MAX_BITS_8BAND_250),
-        ],
-        &[
-            (650, &tables::MAX_BITS_8BAND_96K_MAX),
-            (600, &tables::MAX_BITS_8BAND_96K_650),
-            (500, &tables::MAX_BITS_8BAND_96K_600),
-            (420, &tables::MAX_BITS_8BAND_96K_500),
-            (0, &tables::MAX_BITS_8BAND_96K_420),
-        ],
-    ],
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,17 +120,6 @@ impl Params {
 
     fn taps(self) -> &'static [usize] {
         self.desc().taps[self.high_rate()]
-    }
-
-    /// Per-band allocation caps, ch0 bands then ch1.
-    pub fn max_bits(self, bitrate: u32) -> &'static [u8] {
-        let kbps = bitrate / 1000;
-        let ladder = self.desc().max_bits[self.high_rate()];
-        ladder
-            .iter()
-            .find(|(above, _)| kbps > *above)
-            .unwrap_or(&ladder[ladder.len() - 1])
-            .1
     }
 }
 
@@ -293,27 +254,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn caps_follow_rate_and_bitrate() {
+    fn alloc_headers() {
         let p = |variant, sample_rate| Params {
             variant,
             sample_rate,
         };
-        assert_eq!(
-            p(Variant::Cfg0, 48_000).max_bits(364_000),
-            tables::MAX_BITS_4BAND_370
-        );
-        assert_eq!(
-            p(Variant::Cfg0, 48_000).max_bits(100_000),
-            tables::MAX_BITS_4BAND_250
-        );
-        assert_eq!(
-            p(Variant::Cfg3, 48_000).max_bits(420_000),
-            tables::MAX_BITS_8BAND_420
-        );
-        assert_eq!(
-            p(Variant::Cfg3, 96_000).max_bits(820_000),
-            tables::MAX_BITS_8BAND_96K_MAX
-        );
         assert_eq!(p(Variant::Cfg3, 96_000).alloc_header(), 0xE);
         assert_eq!(p(Variant::Cfg1, 48_000).alloc_header(), 0xB);
     }

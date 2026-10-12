@@ -1,115 +1,311 @@
-//! Bit allocation (spec `codec-core.md` §8.2). The reference allocator isn't specified, so this
-//! is pluggable: any allocation in {0, 2..16} within the per-band caps decodes.
+//! Bit allocation (spec `codec-core.md` §8.2–§8.6): bit pool, ceilings, scale factors, bit
+//! need, water level and distribution.
 
-use super::MAX_WIDTH;
-use super::pack::min_pair_bits;
+use super::tables::{
+    MAX_BITS_4BAND_320, MAX_BITS_4BAND_370, MAX_BITS_4BAND_MAX, MAX_BITS_8BAND_96K_420,
+    MAX_BITS_8BAND_96K_500, MAX_BITS_8BAND_96K_600, MAX_BITS_8BAND_96K_650, MAX_BITS_8BAND_96K_MAX,
+    MAX_BITS_8BAND_250, MAX_BITS_8BAND_320, MAX_BITS_8BAND_370, MAX_BITS_8BAND_420,
+    MAX_BITS_8BAND_520, MAX_BITS_8BAND_MAX, OFFSET_4BAND_DUAL_MONO, OFFSET_8BAND_DUAL_MONO,
+    OFFSET_8BAND_DUAL_MONO_TONE,
+};
+use super::{CHANNELS, MAX_WIDTH, Params, Variant};
 
-/// Picks one frame's allocation.
-pub trait Allocator: Send {
-    /// `x` is the frame's subband values, `max.len()` per block. `max` caps each band. `fits`
-    /// codes the frame exactly and says whether the result fits the frame's share of the
-    /// packet. Writes `max.len()` allocations to `out`.
-    ///
-    /// The packetiser checks the result: anything invalid (see [`valid`]) or past the packet's
-    /// hard limit is replaced by [`floor`].
-    fn allocate(
-        &mut self,
-        x: &[i32],
-        max: &[u8],
-        fits: &mut dyn FnMut(&[u8]) -> bool,
-        out: &mut [u8],
-    );
-}
+const NCH: u32 = CHANNELS as u32;
 
-/// What [`floor`] and [`WaterFill`] give band 0 of each channel at least, so a block pair
-/// costs at least a byte (see [`valid`]).
-pub const MIN_LOW_BAND_BITS: u8 = 4;
-
-/// Highest allocation the absolute coding can carry: 4-band pairs have no escape (§7.2).
+/// The range the set-bitrate operation clamps to (§8.1a).
 #[must_use]
-pub fn max_alloc(subbands: usize) -> u8 {
-    if subbands == 4 { 9 } else { 16 }
-}
-
-/// Whether an allocation can be coded and parsed back. A frame's end is only implied by where
-/// the data stops (§7.1), and the last byte has up to 7 zero pad bits, so every block pair has
-/// to cost at least 8 bits. The exception is all zero on 8 bands, which carries its block count
-/// (§7.2).
-#[must_use]
-pub fn valid(bits: &[u8], subbands: usize) -> bool {
-    let top = max_alloc(subbands);
-    let codable = bits.iter().all(|&b| b == 0 || (2..=top).contains(&b));
-    let zero_escape = subbands == 8 && bits.iter().all(|&b| b == 0);
-    codable && (zero_escape || min_pair_bits(subbands, bits) >= 8)
-}
-
-/// The cheapest valid allocation: band 0 of each channel at [`MIN_LOW_BAND_BITS`].
-pub fn floor(subbands: usize, out: &mut [u8]) {
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = if i % subbands == 0 {
-            MIN_LOW_BAND_BITS
-        } else {
-            0
-        };
+pub fn bitrate_range(params: Params) -> (u32, u32) {
+    match params.variant {
+        Variant::Cfg0 | Variant::Cfg1 => (100_000 * NCH, 300_000 * NCH),
+        Variant::Cfg3 => (90_000, 500_000 * NCH),
     }
 }
 
-/// Water-filling on per-band peak level: about one bit per 6 dB above a common water level,
-/// with the level searched for the most bits that fit. Not the reference's allocator.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct WaterFill;
+/// The target bitrate clamped for the pool and ceilings (§8.2).
+fn pool_rate(params: Params, target: u32) -> u32 {
+    let (lo, hi) = match params.variant {
+        Variant::Cfg0 | Variant::Cfg1 => (100_000 * NCH, 350_000 * NCH),
+        Variant::Cfg3 => (90_000, 550_000 * NCH),
+    };
+    target.clamp(lo, hi)
+}
 
-const LEVEL_MIN: i32 = -40;
-/// High enough that every band is at its minimum.
-const LEVEL_MAX: i32 = 40;
+/// Bits per block for both channels at `target` bit/s (§8.2).
+#[must_use]
+pub fn pool(params: Params, target: u32) -> u32 {
+    let r = u64::from(pool_rate(params, target));
+    let (fs, s) = (u64::from(params.sample_rate), params.subbands() as u64);
+    (r / fs * s + (r % fs) * s / fs) as u32
+}
 
-/// Peak magnitude per band in the 24-bit domain, as a bit length.
-fn peak_bits(x: &[i32], width: usize) -> [i32; MAX_WIDTH] {
-    let mut peaks = [0u32; MAX_WIDTH];
-    for block in x.chunks_exact(width) {
-        for (p, v) in peaks.iter_mut().zip(block) {
-            *p = (*p).max(v.unsigned_abs() >> 8);
+/// Per-band ceilings for clamped rate `r` (§8.3).
+fn max_bits(params: Params, r: u32, tonal: bool) -> &'static [u8] {
+    let pick = |ladder: &[(u32, &'static [u8])], top: &'static [u8]| {
+        ladder
+            .iter()
+            .find(|(upto, _)| r <= *upto)
+            .map_or(top, |l| l.1)
+    };
+    match (params.subbands(), params.sample_rate > 48_000) {
+        (4, _) => pick(
+            &[
+                (319_999, &MAX_BITS_4BAND_320),
+                (369_999, &MAX_BITS_4BAND_370),
+            ],
+            &MAX_BITS_4BAND_MAX,
+        ),
+        (_, false) if tonal => &MAX_BITS_8BAND_MAX,
+        (_, true) if tonal => &MAX_BITS_8BAND_96K_MAX,
+        (_, false) => pick(
+            &[
+                (249_999, &MAX_BITS_8BAND_250),
+                (319_999, &MAX_BITS_8BAND_320),
+                (369_999, &MAX_BITS_8BAND_370),
+                (419_999, &MAX_BITS_8BAND_420),
+                (519_999, &MAX_BITS_8BAND_520),
+            ],
+            &MAX_BITS_8BAND_MAX,
+        ),
+        (_, true) => pick(
+            &[
+                (419_999, &MAX_BITS_8BAND_96K_420),
+                (499_999, &MAX_BITS_8BAND_96K_500),
+                (599_999, &MAX_BITS_8BAND_96K_600),
+                (649_999, &MAX_BITS_8BAND_96K_650),
+            ],
+            &MAX_BITS_8BAND_96K_MAX,
+        ),
+    }
+}
+
+/// `sf` for a band whose largest magnitude is `a` (§8.4).
+fn scale_factor(a: u32) -> i32 {
+    let j = ((u64::from(a) << 24) + (1 << 31)) >> 32;
+    let j = j.min((1 << 31) - 1);
+    let (mut lim, mut c) = (2u64, 0);
+    while j > lim {
+        lim *= 2;
+        c += 1;
+    }
+    c
+}
+
+fn rate_idx(fs: u32) -> usize {
+    [16_000, 32_000, 44_100, 48_000]
+        .iter()
+        .take_while(|&&r| fs > r)
+        .count()
+}
+
+/// The water level (§8.5).
+fn slice(p: i32, need: &[i32], maxb: &[u8], m: i32) -> i32 {
+    let mut l = m + 1;
+    if m <= -12 {
+        return if p == 0 { l - 1 } else { l };
+    }
+    let (mut acc, mut prev) = (0, 0);
+    let cnt = loop {
+        let cnt: i32 = need
+            .iter()
+            .zip(maxb)
+            .map(|(&n, &mb)| {
+                if n == l {
+                    2
+                } else {
+                    i32::from(n > l && i32::from(mb) + l - 1 > n)
+                }
+            })
+            .sum();
+        acc += prev;
+        if cnt + acc >= p || l <= -10 {
+            break cnt;
+        }
+        prev = cnt;
+        l -= 1;
+    };
+    acc += cnt;
+    if acc == p { l - 2 } else { l - 1 }
+}
+
+/// Scale factors and tonal flag for one frame (§8.4).
+fn scale_factors(params: Params, x: &[i32], sf: &mut [i32]) -> bool {
+    let (s, w) = (params.subbands(), params.width());
+    let mut peak = [0u32; MAX_WIDTH];
+    for block in x.chunks_exact(w) {
+        for (pk, v) in peak.iter_mut().zip(block) {
+            *pk = (*pk).max(v.unsigned_abs());
         }
     }
-    peaks.map(|p| (32 - p.leading_zeros()) as i32)
+    for (f, &a) in sf.iter_mut().zip(&peak) {
+        *f = scale_factor(a);
+    }
+    s == 8
+        && sf.chunks_exact(s).any(|ch| {
+            let hi = *ch.iter().max().expect("8 bands");
+            let lo = *ch.iter().min().expect("8 bands");
+            hi - lo > 10 && ch.iter().filter(|&&v| v < hi - 10).count() >= 6
+        })
 }
 
-fn at_level(peaks: &[i32], max: &[u8], subbands: usize, level: i32, out: &mut [u8]) {
-    for (i, ((o, &p), &m)) in out.iter_mut().zip(peaks).zip(max).enumerate() {
-        let m = m.min(max_alloc(subbands));
-        let b = (p - level).clamp(0, i32::from(m)) as u8;
-        let b = if b == 1 { 2.min(m) } else { b };
-        *o = if i % subbands == 0 {
-            b.max(MIN_LOW_BAND_BITS)
-        } else {
-            b
+/// Bit need per band (§8.4).
+fn bit_need(params: Params, sf: &[i32], tonal: bool, need: &mut [i32]) {
+    let w = params.width();
+    let offsets: &[i8] = match (params.subbands(), tonal) {
+        (4, _) => &OFFSET_4BAND_DUAL_MONO,
+        (_, true) => &OFFSET_8BAND_DUAL_MONO_TONE,
+        (_, false) => &OFFSET_8BAND_DUAL_MONO,
+    };
+    let off = &offsets[w * rate_idx(params.sample_rate)..][..w];
+    for ((n, &f), &o) in need.iter_mut().zip(sf).zip(off) {
+        let d = f - i32::from(o);
+        *n = match (f, d) {
+            (0, _) => -5,
+            (_, 1..) => (d + 1) >> 1,
+            _ => d,
         };
     }
 }
 
-impl Allocator for WaterFill {
-    fn allocate(
-        &mut self,
-        x: &[i32],
-        max: &[u8],
-        fits: &mut dyn FnMut(&[u8]) -> bool,
-        out: &mut [u8],
-    ) {
-        let width = max.len();
-        let subbands = width / 2;
-        let peaks = peak_bits(x, width);
-        // Smallest level (most bits) that fits. LEVEL_MAX is the fallback, fitting or not.
-        let (mut lo, mut hi) = (LEVEL_MIN, LEVEL_MAX);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            at_level(&peaks[..width], max, subbands, mid, out);
-            if fits(out) {
-                hi = mid;
-            } else {
-                lo = mid + 1;
+/// Distribution steps 1–4 (§8.6), on allocations `out` held as `i32`.
+fn distribute(s: usize, pool: i32, need: &[i32], maxb: &[i32], sl: i32, out: &mut [i32]) {
+    let w = need.len();
+    out.fill(0);
+    out[0] = 2;
+    out[s] = 2;
+    let mut tot = 0;
+    for i in 0..w {
+        if need[i] >= sl + 2 {
+            out[i] = (need[i] - sl).min(maxb[i]);
+        }
+        tot += out[i];
+    }
+
+    if tot < pool {
+        'fill: for k in 0..s {
+            for i in [k, s + k] {
+                if out[i] > 1 && maxb[i] > out[i] {
+                    out[i] += 1;
+                    tot += 1;
+                } else if need[i] == sl + 1 && pool > tot + 1 && maxb[i] > 0 {
+                    out[i] = 2;
+                    tot += 2;
+                }
+                if tot >= pool {
+                    break 'fill;
+                }
             }
         }
-        at_level(&peaks[..width], max, subbands, lo, out);
+    }
+
+    if tot < pool {
+        for i in (0..w).cycle().take(32) {
+            if out[i] > 1 && maxb[i] > out[i] {
+                out[i] += 1;
+                tot += 1;
+            } else if out[i] == 0 && maxb[i] > 0 {
+                out[i] = 2;
+                tot += 2;
+            }
+            if tot >= pool {
+                break;
+            }
+        }
+    }
+
+    if tot > pool {
+        for i in (0..w).rev() {
+            if out[i] > 2 {
+                out[i] -= 1;
+                tot -= 1;
+            }
+            if tot <= pool {
+                break;
+            }
+        }
+    }
+}
+
+/// Allocates one frame: `x` is its subband values, `width()` per block, before quantisation.
+/// Writes `width()` allocations to `out` and returns the pool it used.
+pub fn allocate(params: Params, target: u32, x: &[i32], out: &mut [u8]) -> u32 {
+    let w = params.width();
+    let rate = pool_rate(params, target);
+    let bits = pool(params, target);
+
+    let mut sf = [0i32; MAX_WIDTH];
+    let tonal = scale_factors(params, x, &mut sf[..w]);
+    let sf = &sf[..w];
+    let mut need = [0i32; MAX_WIDTH];
+    bit_need(params, sf, tonal, &mut need[..w]);
+    let need = &need[..w];
+    let top = need.iter().copied().max().unwrap_or(0).max(0);
+    let caps = max_bits(params, rate, tonal);
+    let sl = slice(bits as i32, need, caps, top);
+
+    let mut maxb = [0i32; MAX_WIDTH];
+    for (m, &c) in maxb.iter_mut().zip(caps) {
+        *m = c.into();
+    }
+    let maxb = &maxb[..w];
+    let mut alloc = [0i32; MAX_WIDTH];
+    let alloc = &mut alloc[..w];
+    distribute(params.subbands(), bits as i32, need, maxb, sl, alloc);
+    if params.variant == Variant::Cfg3 {
+        digital_black(sf, maxb, params.subbands(), rate <= 179_999, alloc);
+    }
+    for (b, &v) in out.iter_mut().zip(alloc.iter()) {
+        *b = v as u8;
+    }
+    bits
+}
+
+/// §8.6 step 5.
+fn digital_black(sf: &[i32], maxb: &[i32], s: usize, alternate: bool, o: &mut [i32]) {
+    let sum = |ch: usize| -> i32 {
+        (ch * s..(ch + 1) * s)
+            .filter(|&i| sf[i] != 0)
+            .map(|i| o[i])
+            .sum()
+    };
+    let (s0, s1) = (sum(0), sum(1));
+    for (v, &f) in o.iter_mut().zip(sf) {
+        if f == 0 {
+            *v = 0;
+        }
+    }
+    if s0 + s1 == 0 {
+        return;
+    }
+    let mut total = s0 + s1;
+    if !alternate {
+        if s1 == 0 {
+            o[s] = 2;
+            total += 2;
+        }
+        if s0 == 0 {
+            o[0] = 2;
+            total += 2;
+        }
+    }
+    // UNCERTAIN in the spec, never seen in the vectors.
+    if (1..=6).contains(&total) {
+        let mut extra = 7 - total;
+        for pass_all in [false, true] {
+            for (v, &mb) in o.iter_mut().zip(maxb) {
+                if extra <= 0 {
+                    return;
+                }
+                if pass_all || *v > 0 {
+                    let add = extra.min(mb - *v).max(0);
+                    *v += add;
+                    extra -= add;
+                    if *v == 1 {
+                        *v = 2;
+                        extra -= 1;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -117,31 +313,74 @@ impl Allocator for WaterFill {
 mod tests {
     use super::*;
 
+    const CFG0: Params = Params {
+        variant: Variant::Cfg0,
+        sample_rate: 48_000,
+    };
+    const CFG1: Params = Params {
+        variant: Variant::Cfg1,
+        ..CFG0
+    };
+    const CFG3: Params = Params {
+        variant: Variant::Cfg3,
+        ..CFG0
+    };
+    const CFG3_96K: Params = Params {
+        variant: Variant::Cfg3,
+        sample_rate: 96_000,
+    };
+
     #[test]
-    fn valid_allocations() {
-        let max = [9; 8];
-        let x: Vec<i32> = (0..64 * 8).map(|i| (i * 7919 % 100_003) << 8).collect();
-        for budget in [0, 50, 200, 1000, 100_000] {
-            let mut out = [0; 8];
-            WaterFill.allocate(
-                &x,
-                &max,
-                &mut |b| b.iter().map(|&v| usize::from(v)).sum::<usize>() * 64 <= budget,
-                &mut out,
-            );
-            assert!(valid(&out, 4), "{budget}: {out:?}");
-            assert!(out.iter().zip(&max).all(|(b, m)| b <= m));
-        }
-        let mut f = [9; 8];
-        floor(4, &mut f);
-        assert_eq!(f, [4, 0, 0, 0, 4, 0, 0, 0]);
-        assert!(valid(&f, 4));
-        assert!(!valid(&[4, 1, 0, 0, 4, 0, 0, 0], 4));
-        assert!(!valid(&[10, 0, 0, 0, 4, 0, 0, 0], 4));
-        // A pair at 3 + 2 bits costs at least 4 + 3 bits, which pad bits could imitate.
-        assert!(!valid(&[3, 0, 0, 0, 2, 0, 0, 0], 4));
-        assert!(valid(&[3, 0, 0, 0, 3, 0, 0, 0], 4));
-        assert!(!valid(&[0; 8], 4));
-        assert!(valid(&[0; 16], 8));
+    fn pools() {
+        assert_eq!(pool(CFG0, 364_000), 30);
+        assert_eq!(pool(CFG1, 265_000), 22);
+        assert_eq!(pool(CFG3, 420_000), 70);
+        // Clamped to 350000·2.
+        assert_eq!(pool(CFG0, 2_000_000), pool(CFG0, 700_000));
+        assert_eq!(pool(CFG3, 1), pool(CFG3, 90_000));
+    }
+
+    #[test]
+    fn ceilings_follow_rate() {
+        assert_eq!(max_bits(CFG0, 319_999, false), MAX_BITS_4BAND_320);
+        assert_eq!(max_bits(CFG0, 320_000, false), MAX_BITS_4BAND_370);
+        assert_eq!(max_bits(CFG0, 364_000, false), MAX_BITS_4BAND_370);
+        assert_eq!(max_bits(CFG0, 370_000, false), MAX_BITS_4BAND_MAX);
+        assert_eq!(max_bits(CFG3, 420_000, false), MAX_BITS_8BAND_520);
+        assert_eq!(max_bits(CFG3, 250_000, true), MAX_BITS_8BAND_MAX);
+        assert_eq!(max_bits(CFG3_96K, 420_000, false), MAX_BITS_8BAND_96K_500);
+        assert_eq!(max_bits(CFG3_96K, 820_000, false), MAX_BITS_8BAND_96K_MAX);
+    }
+
+    #[test]
+    fn scale_factors() {
+        assert_eq!(scale_factor(0), 0);
+        assert_eq!(scale_factor(2 << 8), 0);
+        assert_eq!(scale_factor(3 << 8), 1);
+        assert_eq!(scale_factor(1 << 31), 22);
+    }
+
+    /// §8.6: silence on config 0 at 364 kbps gives 4/4/4/3 per channel, and on config 3
+    /// all zero.
+    #[test]
+    fn silence() {
+        let mut out = [0; 8];
+        assert_eq!(allocate(CFG0, 364_000, &[0; 64 * 8], &mut out), 30);
+        assert_eq!(out, [4, 4, 4, 3, 4, 4, 4, 3]);
+        let mut out = [9; 16];
+        allocate(CFG3, 364_000, &[0; 64 * 16], &mut out);
+        assert_eq!(out, [0; 16]);
+    }
+
+    /// One quiet channel on config 3 keeps band 0 at 2 bits.
+    #[test]
+    fn digital_black_keeps_a_channel_alive() {
+        let x: Vec<i32> = (0..64 * 16)
+            .map(|i| if i % 16 < 8 { (i * 7919) << 12 } else { 0 })
+            .collect();
+        let mut out = [0; 16];
+        allocate(CFG3, 420_000, &x, &mut out);
+        assert!(out[..8].iter().any(|&b| b > 2), "{out:?}");
+        assert_eq!(out[8..], [2, 0, 0, 0, 0, 0, 0, 0]);
     }
 }
