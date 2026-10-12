@@ -544,3 +544,43 @@ None of this sideband exists unless the Bluetooth controller supplies it. Recomm
 3. What are the OTA sample-rate bit values for 44.1 and 96 kHz? What does source-type bit 0x01 mean? What do the Px7's TTP bytes `37 6a 00 af 64 4b` mean, and in what units?
 4. What does the create-parameter flag mean? The reference always sets it to 1.
 5. Does the Px7 accept the echoed aptx_data block, or does it need the R1 defaults `50 64 64 64 ff ff`?
+
+## 7A. Transport re-check after the first live test (2026-10-12)
+
+This supersedes §7 where they disagree. None of it has been verified over the air.
+
+### 7A.1 What the source does to each codec packet
+
+- The 16-bit byte swap is unconditional on the normal (non-split-TX) path: codec bytes `b0 b1 b2 b3 …` go on air as `b1 b0 b3 b2 …`. Sink-side evidence agrees: the sink reads the frame type from the first payload byte after undoing the swap, and an unswapped packet would put 0x00 there, which is invalid. The live test used the swapped form, so the swap direction is very likely right.
+- The 8-byte header is written byte by byte in this order:
+
+| byte | value |
+|---|---|
+| 0 | TTP adjustment, low byte |
+| 1 | TTP adjustment, high byte |
+| 2 | period in ms × 4 |
+| 3 | table cfg byte |
+| 4 | 0x00 (0x80/0xA0/0xC0 only for split-TX left/right/deferred, which we don't do) |
+| 5, 6 | 0x00 |
+| 7 | 0xAE for HQ, 0xAD for LL |
+
+- TTP adjustment, R1 HQ: `4000·70 − (period_ms + 1)·1000 − 62000` µs, minus the duration of any sample deficit, clamped to `[30000, 810000]` µs, then divided by 8. With no deficit at 14 ms that is 203000 µs → 25375 → bytes `1F 63`. If TWM is active, 1250 is added before the bytes are written (not our case).
+- For the Px7 S2e the header is `1F 63 38 01 00 00 00 AE` on every packet.
+- No RTP header is built at this layer. A later stage maps the 8 bytes into the RTP header.
+- There is no special first packet, sync word, resync marker or metadata packet for R1/R2. A freshly created encoder's first packet is an ordinary packet, and every packet carries an absolute bit allocation, so a decoder can lock on to any packet.
+- A 100 ms raised-cosine fade-in is applied to the PCM at start. It doesn't change the packet format.
+
+### 7A.2 RTP mapping (best inference)
+
+- A newer generation of the same vendor's codec builds its own RTP header: byte 0 = 0x80 (V=2), byte 1 = 0x00 (marker clear, **payload type 0**), bytes 2..3 = sequence number big-endian, +1 per packet. The timestamp and SSRC fields carry codec side information (TTP and mode), not a sample clock or a random SSRC.
+- For R1/R2 the best inference is that the 8 header bytes are copied **verbatim** into RTP octets 4..11 (option a): `80 PT sq sq 1F 63 38 01 00 00 00 AE`. The alternative (option b) is that each 4-byte half is reversed: `01 38 63 1F AE 00 00 00`. Option a is favoured.
+- Payload type: no R1/R2 value is known. 0 is the only value seen in this vendor's aptX Adaptive RTP code; Android's generic vendor-codec path uses 96.
+
+### 7A.3 Things to try for "accepted but silent", most likely first
+
+1. Payload type 0 instead of 96.
+2. Header option b (each 4-byte half reversed).
+3. The R2 vector (`sine1k.r2.bin`, cfg 3 bitstream) with the same framing. That checks whether the sink actually expects R2 despite the R1 caps.
+4. Unswapped payload, to rule the swap out completely.
+5. Check that the sequence number increases by exactly 1 per packet and that packets go out every 14 ms, not in bursts.
+6. Check the 664-byte payload (8 + 656) plus the 12-byte RTP header fits the negotiated MTU.
