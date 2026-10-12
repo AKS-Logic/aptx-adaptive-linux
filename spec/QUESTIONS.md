@@ -196,3 +196,7 @@ The user notes this chime isn't normal headset behaviour. What the captures show
 - Per §7E, `select_config` now sends source type 2: byte 6 = the chosen rate bit | 0x02, with the sink's bits 0..2 cleared. For the Px7 S2e: `d7 00 00 00 ad 00 12 02 37 6a 00 af 64 4b 00 00 aa` + zeros. `validate_config` accepts source type 0 or 2 and only checks bits 3..7 for the rate.
 - Dev switches (`dev-replay` builds only) for A/B on the headset: `APTX_ADAPTIVE_SOURCE_TYPE=0|2`, `APTX_ADAPTIVE_SSRC=0x..` (whole SSRC), `APTX_ADAPTIVE_TS=us|samples`. `scripts/dev-replay.sh phone --no-replay` sets them while running the real encoder.
 - Still open from §7E: the RTP timestamp unit with source type 2, and whether the SSRC low byte selects the latency mode (`a1`..`a4` vs the `ae` we send).
+
+## BREAKTHROUGH (2026-10-13 07:32): source type 2 → audible output
+
+With SetConfiguration byte 6 = `0x12` (source type 2, spec §7E), A2DP 1.3, phone framing (µs timestamps, SSRC `00 00 00 ae`), and the real encoder on a 1 kHz tone, the Px7 S2e **produced sound**: "crackly morse code". The headset now decodes our stream; what remains is timing or quality. Next: SSRC (`a3`), timestamp unit (samples), and packet pacing (the drops after packet 25).
