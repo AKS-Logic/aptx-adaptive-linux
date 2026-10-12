@@ -2,7 +2,12 @@
 
 use aptx_adaptive::{
     Config, Core, DecoderLevel, Encoder, Error, HEADER_LEN, Profile, Stream, packet_budget,
+    table_row,
 };
+
+use std::io::Write as _;
+
+use crate::dev::{AnyCore, Options, Replay};
 
 /// How the 8-byte aptX Adaptive header goes on air (spec §7.2, `QUESTIONS.md`). Unconfirmed
 /// either way; needs a capture from an Android source.
@@ -12,10 +17,10 @@ pub enum Framing {
     /// significant byte first. No payload prefix.
     HeaderInRtp,
     /// A normal RTP header (timestamp in samples), then the 8 bytes as a payload prefix.
-    #[cfg_attr(not(test), expect(dead_code, reason = "selected by editing FRAMING"))]
     HeaderAfterRtp,
 }
 
+/// The default; `APTX_ADAPTIVE_FRAMING` overrides it (see `dev`).
 pub const FRAMING: Framing = Framing::HeaderInRtp;
 
 pub const RTP_HEADER_LEN: usize = 12;
@@ -39,6 +44,8 @@ fn config(level: DecoderLevel) -> Config {
 pub enum SessionError {
     NoSpace,
     Unsupported,
+    /// A dev setting (see `dev`) that can't be used.
+    BadDevSetting,
 }
 
 impl From<Error> for SessionError {
@@ -66,9 +73,35 @@ pub struct Session<C> {
 impl Session<Encoder> {
     /// # Errors
     /// Whatever the encoder rejects, or `NoSpace` if the MTU can't fit a packet.
+    #[cfg(test)]
     pub fn new(level: DecoderLevel, mtu: usize) -> Result<Self, SessionError> {
         let stream = Stream::new(config(level), budget(FRAMING, mtu))?;
         Self::with_stream(stream, FRAMING, mtu)
+    }
+}
+
+impl Session<AnyCore> {
+    /// A fixed HQ level-3 session on the real encoder, or on a replay core and with the framing
+    /// given by `opts`.
+    ///
+    /// # Errors
+    /// Whatever the encoder rejects, `NoSpace` if the MTU can't fit a packet, or `BadDevSetting` if the replay file can't be used (the reason
+    /// goes to stderr).
+    pub fn open(level: DecoderLevel, mtu: usize, opts: &Options) -> Result<Self, SessionError> {
+        let config = config(level);
+        let row = table_row(config, budget(opts.framing, mtu)).ok_or(Error::UnsupportedConfig)?;
+        let core = match &opts.replay {
+            None => AnyCore::Encoder(Encoder::new(config, row.bitrate)?),
+            Some(path) => {
+                let samples = row.interleaved_samples(config.sample_rate, config.channels.into());
+                let replay = Replay::from_file(path, row.packet_bytes, samples).map_err(|e| {
+                    let _ = writeln!(std::io::stderr(), "aptx-adaptive: {e}");
+                    SessionError::BadDevSetting
+                })?;
+                AnyCore::Replay(replay)
+            }
+        };
+        Self::with_stream(Stream::with_core(core, config, row), opts.framing, mtu)
     }
 }
 
@@ -324,6 +357,95 @@ mod tests {
                 assert_eq!(p[header..header + 2], [first, first]);
             }
         }
+    }
+
+    fn vector(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/vectors/r2")
+            .join(name)
+    }
+
+    /// 2.5 s of PCM through a replay session: every packet is the next vector packet, swapped,
+    /// behind the right headers, wrapping after 71.
+    #[test]
+    fn replay_loops_vector_packets_with_framing() {
+        let path = vector("sine1k.r1.bin");
+        let file = std::fs::read(&path).unwrap();
+        assert_eq!(file.len(), 71 * 656);
+        for framing in [Framing::HeaderInRtp, Framing::HeaderAfterRtp] {
+            let opts = Options {
+                framing,
+                replay: Some(path.clone()),
+            };
+            let mut s = Session::open(DecoderLevel::R1, MTU, &opts).unwrap();
+            let header = header_len(framing);
+            let src = vec![0x55u8; s.block_size()];
+            let mut buffer = vec![0u8; 8192];
+            let mut used = s.start_encode(&mut buffer, 0, 0).unwrap();
+            let mut sent = Vec::new();
+            for _ in 0..178 {
+                let r = s.encode(&src, &mut buffer[used..]).unwrap();
+                assert_eq!(r.consumed, src.len());
+                assert!(r.flush);
+                used += r.written;
+                sent.push(buffer[..used].to_vec());
+                used = s.start_encode(&mut buffer, sent.len() as u16, 0).unwrap();
+            }
+            for (i, p) in sent.iter().enumerate() {
+                assert_eq!(p.len(), header + 656, "{framing:?} packet {i}");
+                assert_eq!(p[2..4], (i as u16).to_be_bytes());
+                assert_eq!(
+                    p[header - 8..header],
+                    [0x1f, 0x63, 0x38, 0x01, 0, 0, 0, 0xae]
+                );
+                let want = &file[(i % 71) * 656..][..656];
+                let mut swapped = [0u8; 656];
+                for (o, w) in swapped
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .zip(want.as_chunks::<2>().0)
+                {
+                    *o = [w[1], w[0]];
+                }
+                assert_eq!(p[header..], swapped, "{framing:?} packet {i}");
+            }
+            // R1 packets begin 00 81 a1 d?; on air they're swapped.
+            let p = &sent[0][header..];
+            assert_eq!((p[0], p[1], p[2] & 0xf0, p[3]), (0x81, 0x00, 0xd0, 0xa1));
+        }
+    }
+
+    #[test]
+    fn replay_rejects_bad_files() {
+        let opts = |p: &str| Options {
+            framing: FRAMING,
+            replay: Some(vector(p)),
+        };
+        assert!(matches!(
+            Session::open(DecoderLevel::R1, MTU, &opts("missing.bin")),
+            Err(SessionError::BadDevSetting)
+        ));
+        // 96000 samples × 4 bytes isn't a multiple of 656.
+        assert!(matches!(
+            Session::open(DecoderLevel::R1, MTU, &opts("sine1k.s32le")),
+            Err(SessionError::BadDevSetting)
+        ));
+    }
+
+    #[test]
+    fn open_without_replay_uses_encoder() {
+        let opts = Options {
+            framing: Framing::HeaderAfterRtp,
+            replay: None,
+        };
+        let mut s = Session::open(DecoderLevel::R1, MTU, &opts).unwrap();
+        assert_eq!(s.start_encode(&mut [0; 64], 0, 0), Ok(20));
+        let src = vec![0u8; s.block_size()];
+        assert_eq!(
+            s.encode(&src, &mut [0; 1000]).err(),
+            Some(SessionError::Unsupported)
+        );
     }
 
     #[test]

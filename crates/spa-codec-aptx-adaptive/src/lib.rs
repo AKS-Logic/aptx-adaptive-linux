@@ -4,6 +4,7 @@
 //! C ABI glue; codec behaviour lives in `caps` and `session`.
 
 mod caps;
+mod dev;
 mod ffi;
 #[cfg(test)]
 mod fixtures;
@@ -12,6 +13,7 @@ mod pod;
 mod session;
 
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::io::Write as _;
 use std::ptr;
 use std::slice;
 
@@ -103,6 +105,7 @@ fn session_err(e: SessionError) -> c_int {
     match e {
         SessionError::NoSpace => -ENOSPC,
         SessionError::Unsupported => -ENOTSUP,
+        SessionError::BadDevSetting => -EINVAL,
     }
 }
 
@@ -297,7 +300,17 @@ unsafe extern "C" fn codec_init(
             channels: info.raw.channels,
         };
         let level = caps::check_stream(config, &stream).map_err(caps_err)?;
-        Session::new(level, mtu).map_err(session_err)
+        let var = |k: &str| std::env::var_os(k);
+        // stderr lands in the journal of whichever service loaded us. Write errors are ignored
+        // so nothing can panic here.
+        let opts = dev::Options::from_env(var).map_err(|e| {
+            let _ = writeln!(std::io::stderr(), "aptx-adaptive: {e}");
+            -EINVAL
+        })?;
+        if let Some(msg) = opts.describe(var) {
+            let _ = writeln!(std::io::stderr(), "{msg}");
+        }
+        Session::open(level, mtu, &opts).map_err(session_err)
     })();
     match res {
         Ok(s) => Box::into_raw(Box::new(s)).cast(),
@@ -310,7 +323,7 @@ unsafe extern "C" fn codec_init(
 
 /// # Safety
 /// `data` must come from `codec_init` and not have been passed to `codec_deinit`.
-unsafe fn session<'a>(data: *mut c_void) -> &'a mut Session<aptx_adaptive::Encoder> {
+unsafe fn session<'a>(data: *mut c_void) -> &'a mut Session<dev::AnyCore> {
     // SAFETY: caller contract.
     unsafe { &mut *data.cast() }
 }
@@ -318,7 +331,7 @@ unsafe fn session<'a>(data: *mut c_void) -> &'a mut Session<aptx_adaptive::Encod
 unsafe extern "C" fn codec_deinit(data: *mut c_void) {
     if !data.is_null() {
         // SAFETY: data came from Box::into_raw in codec_init.
-        drop(unsafe { Box::from_raw(data.cast::<Session<aptx_adaptive::Encoder>>()) });
+        drop(unsafe { Box::from_raw(data.cast::<Session<dev::AnyCore>>()) });
     }
 }
 

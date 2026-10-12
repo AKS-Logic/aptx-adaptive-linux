@@ -11,6 +11,10 @@ crate-type = ["cdylib"]
 [dependencies]
 aptx-adaptive = { path = "../aptx-adaptive" }
 
+[features]
+# DEV ONLY: honour APTX_ADAPTIVE_REPLAY (see src/dev.rs). Off in normal installs.
+dev-replay = []
+
 [lints]
 workspace = true
 

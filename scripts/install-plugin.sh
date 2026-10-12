@@ -2,6 +2,7 @@
 # Builds the plugin and installs it for the current user in the LC3plus HR slot
 # (docs/adr/0001-architecture.md). Safe to re-run. Doesn't restart anything.
 # Needs cargo, pkg-config with libspa-0.2, and python3.
+# CARGO_FEATURES (optional) is passed to cargo build --features, e.g. dev-replay.
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -18,7 +19,11 @@ if [[ -e $system_plugin_dir/bluez5/libspa-codec-bluez5-lc3plus.so ]]; then
 	echo "warning: $system_plugin_dir has a real LC3plus plugin; ours shadows it" >&2
 fi
 
-cargo build --release --manifest-path "$repo/Cargo.toml" -p spa-codec-aptx-adaptive
+features=()
+if [[ -n ${CARGO_FEATURES:-} ]]; then
+	features=(--features "$CARGO_FEATURES")
+fi
+cargo build --release --manifest-path "$repo/Cargo.toml" -p spa-codec-aptx-adaptive "${features[@]}"
 target_dir=$(cargo metadata --manifest-path "$repo/Cargo.toml" --format-version 1 --no-deps |
 	python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
 install -Dm644 "$target_dir/release/libspa_codec_aptx_adaptive.so" "$dest"
@@ -38,6 +43,13 @@ for unit in wireplumber.service pipewire.service; do
 	printf '%s' "$dropin_body" >"$dropin"
 	echo "wrote $dropin"
 done
+
+# Left by scripts/dev-replay.sh. A normal install goes back to the encoder.
+dev_dropin=$config_home/systemd/user/wireplumber.service.d/aptx-adaptive-dev-replay.conf
+if [[ -e $dev_dropin ]]; then
+	rm -f "$dev_dropin"
+	echo "removed dev replay drop-in $dev_dropin"
+fi
 
 if command -v systemctl >/dev/null; then
 	systemctl --user daemon-reload
