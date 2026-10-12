@@ -294,8 +294,12 @@ fn init_and_encode_a_real_packet() {
         let mut out = [0u8; 1024];
         let hdr = c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), 1, 0);
         assert_eq!(hdr, 12);
-        // Spec §7D: 80 60, sequence, µs clock from 0, SSRC 00 00 00 ae, no payload prefix.
-        assert_eq!(out[..12], [0x80, 0x60, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xae]);
+        // Spec §7F: 80 60, sequence, timestamp 672 samples (adjust 0), SSRC a3 (HQ), no
+        // payload prefix.
+        assert_eq!(
+            out[..12],
+            [0x80, 0x60, 0, 1, 0, 0, 0x02, 0xa0, 0, 0, 0, 0xa3]
+        );
         let pcm = vec![0u8; block as usize];
         let (mut written, mut flush) = (0usize, 0);
         let res = c.encode.unwrap()(

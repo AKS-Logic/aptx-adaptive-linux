@@ -226,3 +226,9 @@ btmon, time from sending each media ACL packet to the controller's Number of Com
   1. **The sink paces its intake from the RTP timestamp, in units we don't match.** µs made it much worse (310 ms completion); samples (+672 per packet) is better but not right. Next candidates: 1/90 kHz? `ms·4`? Timestamps in the encoder's sample rate but per channel times 2 (+1344)?
   2. **Packet size / bitrate:** the sink may expect a packet rate matching its own table for source type 2 (maybe a different period, e.g. 20 ms at 279 kbps).
   3. **TTP bytes:** the config echoes the sink's `37 6a 00 af 64 4b`. For a non-Q2Q source the public defaults are `50 64 64 64 ff ff`; a TTP of 0x00 for HQ low may make the sink underrun and back-pressure.
+
+## §7F RTP fields implemented (2026-10-13)
+
+- Default RTP header with source type 2 is now §7F: timestamp = `adjust_ms << 16 | samples per channel in this packet` with adjust 0 (`00 00 02 a0` on every 672-sample packet), SSRC `0x000000a3` (HQ; `0x000000a1` if the profile were LL0), constant for the session. Sequence +1, swapped payload right after the 12-byte header. First packets: `80 60 00 01 00 00 02 a0 00 00 00 a3`, `80 60 00 02 00 00 02 a0 00 00 00 a3`, …
+- The old `00 00 00 ae` SSRC (header bytes 4..7) and the µs clock are no longer the default. Dev switches (`dev-replay`): `APTX_ADAPTIVE_TS=samples-per-packet|us|samples` (the last two are the old running clocks), `APTX_ADAPTIVE_SSRC=0x..` still overrides; non-default values are logged at init.
+- Still open: the §7F UNCERTAIN older-sink reading of the timestamp as µs, and whether the latency adjustment should ever be non-zero.

@@ -16,18 +16,20 @@
 //! - `APTX_ADAPTIVE_SOURCE_TYPE=0|2`, only with `dev-replay`: the source type `select_config`
 //!   puts in byte 6 (spec §7E; default 2).
 //! - `APTX_ADAPTIVE_SSRC=0x..`, only with `dev-replay`: the whole 32-bit RTP SSRC, instead of
-//!   `00 00 00` + aptX header byte 7.
-//! - `APTX_ADAPTIVE_TS=us|samples`, only with `dev-replay`: step the RTP timestamp by the packet
-//!   duration in µs (default, +14000 per packet) or in samples (+672).
+//!   the §7F latency mode (`0x000000a3` for HQ).
+//! - `APTX_ADAPTIVE_TS=samples-per-packet|us|samples`, only with `dev-replay`: the RTP
+//!   timestamp. `samples-per-packet` is the default (§7F: `0x000002a0` on every 672-sample
+//!   packet); `us` and `samples` are clocks stepping by the packet duration in µs (+14000 per
+//!   packet) or in samples (+672).
 
 use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 
-use aptx_adaptive::{Core, Encoder, Progress, Result as CoreResult, WINDOW_SLACK};
+use aptx_adaptive::{Core, Encoder, Profile, Progress, Result as CoreResult, WINDOW_SLACK};
 
 use crate::caps::SOURCE_TYPE_HOST;
-use crate::session::{self, Framing, TsUnit};
+use crate::session::{self, Framing, TS_UNIT, TsUnit};
 
 pub const REPLAY_VAR: &str = "APTX_ADAPTIVE_REPLAY";
 pub const FRAMING_VAR: &str = "APTX_ADAPTIVE_FRAMING";
@@ -97,7 +99,7 @@ impl Default for Options {
             scmst: None,
             source_type: SOURCE_TYPE_HOST,
             ssrc: None,
-            ts: TsUnit::Micros,
+            ts: TS_UNIT,
         }
     }
 }
@@ -155,11 +157,17 @@ impl Options {
         let source_type = source_type(&var)?;
         let ssrc = var(SSRC_VAR).map(|v| hex_u32(SSRC_VAR, &v)).transpose()?;
         let ts = match var(TS_VAR) {
-            None => TsUnit::Micros,
+            None => TS_UNIT,
             Some(v) => match v.to_str() {
+                Some("samples-per-packet") => TsUnit::SamplesPerPacket,
                 Some("us") => TsUnit::Micros,
                 Some("samples") => TsUnit::Samples,
-                _ => return Err(format!("{TS_VAR}={} is not us or samples", v.display())),
+                _ => {
+                    return Err(format!(
+                        "{TS_VAR}={} is not samples-per-packet, us or samples",
+                        v.display()
+                    ));
+                }
             },
         };
         Ok(Self {
@@ -202,11 +210,11 @@ impl Options {
         if self.source_type != SOURCE_TYPE_HOST {
             parts.push(format!("source type: {}", self.source_type));
         }
-        if let Some(s) = self.ssrc {
+        if let Some(s) = self.ssrc.filter(|s| *s != session::mode_ssrc(Profile::Hq)) {
             parts.push(format!("SSRC: {s:#010x}"));
         }
-        if self.ts != TsUnit::Micros {
-            parts.push(format!("timestamp step: {:?}", self.ts));
+        if self.ts != TS_UNIT {
+            parts.push(format!("timestamp: {:?}", self.ts));
         }
         (!parts.is_empty()).then(|| format!("aptx-adaptive: {}", parts.join("; ")))
     }
@@ -450,6 +458,8 @@ mod tests {
             o.describe(&e).as_deref(),
             Some("aptx-adaptive: SSRC: 0x000000a1")
         );
+        let e = env(&[(SSRC_VAR, "0xa3")]);
+        assert_eq!(Options::from_env(&e).unwrap().describe(&e), None);
         let o = Options::from_env(env(&[(SSRC_VAR, "0xDEADBEEF")])).unwrap();
         assert_eq!(o.ssrc, Some(0xdead_beef));
         for bad in ["a1", "0x", "0x100000000", "0xzz", "161"] {
@@ -460,15 +470,27 @@ mod tests {
     #[cfg(feature = "dev-replay")]
     #[test]
     fn ts_unit_with_feature() {
-        assert_eq!(Options::from_env(env(&[])).unwrap().ts, TsUnit::Micros);
-        let o = Options::from_env(env(&[(TS_VAR, "us")])).unwrap();
+        assert_eq!(
+            Options::from_env(env(&[])).unwrap().ts,
+            TsUnit::SamplesPerPacket
+        );
+        let e = env(&[(TS_VAR, "samples-per-packet")]);
+        let o = Options::from_env(&e).unwrap();
+        assert_eq!(o.ts, TsUnit::SamplesPerPacket);
+        assert_eq!(o.describe(&e), None);
+        let e = env(&[(TS_VAR, "us")]);
+        let o = Options::from_env(&e).unwrap();
         assert_eq!(o.ts, TsUnit::Micros);
+        assert_eq!(
+            o.describe(&e).as_deref(),
+            Some("aptx-adaptive: timestamp: Micros")
+        );
         let e = env(&[(TS_VAR, "samples")]);
         let o = Options::from_env(&e).unwrap();
         assert_eq!(o.ts, TsUnit::Samples);
         assert_eq!(
             o.describe(&e).as_deref(),
-            Some("aptx-adaptive: timestamp step: Samples")
+            Some("aptx-adaptive: timestamp: Samples")
         );
         assert!(Options::from_env(env(&[(TS_VAR, "ms")])).is_err());
     }

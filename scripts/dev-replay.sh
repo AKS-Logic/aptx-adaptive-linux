@@ -25,8 +25,10 @@
 #                               stock bluetoothd never does (see .scratch/scmst-test.sh)
 #   APTX_ADAPTIVE_SCMST_BYTE=0x00  the SCMS-T byte to send instead
 #   APTX_ADAPTIVE_SOURCE_TYPE=0|2  config byte 6 source type (spec §7E, default 2)
-#   APTX_ADAPTIVE_SSRC=0x..     the whole RTP SSRC (default 00 00 00 + header byte 7, ae)
-#   APTX_ADAPTIVE_TS=us|samples RTP timestamp step: µs (default, +14000) or samples (+672)
+#   APTX_ADAPTIVE_SSRC=0x..     the whole RTP SSRC (default 0x000000a3, HQ, spec §7F)
+#   APTX_ADAPTIVE_TS=samples-per-packet|us|samples  RTP timestamp: samples per channel in the
+#                               packet, 0x000002a0 every packet (default, §7F), or a clock in
+#                               µs (+14000) or samples (+672)
 # e.g. APTX_ADAPTIVE_PT=0 scripts/dev-replay.sh ttp-clock-offset sine1k.r2.bin
 #
 # Doesn't restart anything or touch the headset; it prints the commands for that.
