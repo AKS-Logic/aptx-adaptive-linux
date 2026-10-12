@@ -636,3 +636,15 @@ Codec element byte 6 carries the sample rate in bits 3..7 and a **source type** 
 - The RTP timestamp unit in this mode isn't known. Try µs (+14000 per 14 ms packet) first, then samples (+672).
 
 This supersedes the earlier recommendation of byte 6 = `0x10`, which is correct only for sources whose controller supplies link-clock timestamps.
+
+## 7F. RTP fields with source type 2 (2026-10-13)
+
+With source type 2 (§7E), the sink reads the RTP header like this:
+
+- **Timestamp:** not a clock. Bits 0..15 = **samples per channel in this packet** (672 for a 14 ms packet at 48 kHz). Bits 16..31 = a signed latency adjustment in ms (0 normally). So every 14 ms packet carries the same timestamp, `0x000002A0`. The sink plays the first packet at arrival time + target latency, and each later packet at the previous packet's play time + its sample count / sample rate. A running counter, in samples or in µs, makes every packet claim far too much audio. The sink's buffer then fills and it takes data at well below real time, which comes out crackly, slow to start and slow to stop.
+- **SSRC:** the full 32-bit value selects the latency mode. `0x000000A1` LL0, `0x000000A2` LL1, **`0x000000A3` HQ**, `0x000000A4` TWS. Keep it constant; changing it mid-stream resets the sink's timing.
+- **Target latency:** from config bytes 8..11 (LL0 ms, LL1 ms, HQ in 2 ms units, TWS in 2 ms units). Out-of-range values become the minimum, so the Px7's HQ byte `0x00` gives 200 ms. That's fine.
+- **Sequence number:** +1 per packet.
+- **Payload:** one codec packet per RTP packet, directly after the 12-byte header.
+
+UNCERTAIN: an older generation of the sink reads the timestamp as plain µs. Test results so far fit the newer reading above.
