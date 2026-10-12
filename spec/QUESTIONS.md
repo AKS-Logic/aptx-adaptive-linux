@@ -81,3 +81,14 @@ Conclusion: the chime doesn't separate layouts. It seems tied to the restart and
 - Setup, then 30 s settle, then 12 s playback. The headset stayed connected, then was restored to aptX HD.
 - Result: **silence** (listener fairly but not fully sure there was no disconnect).
 - So every layout tested gives silence when tested fairly. Still not done fairly: ttp-clock + PT 0.
+
+## from codec-core implementation
+
+1. §7.1 says the last frame of a packet has 8, 16, 32, 48 or 64 blocks. In `tests/vectors/r2/*.r1.bin` (the flush-driven loop the Px7 path uses) every packet is 64 + 64 + **40** blocks: 672 samples / 4 = 168 blocks, all coded into the packet, padded, no continuation. The stage vectors (encoder called once per packet with all remaining input) do follow the {8..64} rule. So it looks like a flush closes the last frame at whatever even count is buffered. Is that right, and is the {8, 16, 32, 48, 64} set only the non-flush policy (§8.1)? What happens to an odd block left at flush?
+2. `a2dp-integration.md` §3.2/§6 and `tests/vectors/r2/README.md` say R1 packets begin `00 81`. That's only true when the packet is padded (0x80 flag, §7.1). Unpadded packets start `00 01`, as in `stages/cfg0_*`. The r2 vectors happen to be padded throughout.
+3. §5.2 step 2 (extension), "restore (L, H) to the interval before the last split": we read this as the interval at the start of the last iteration. That matches the 10–16-bit bands in `cfg3_48k_sine`, but they're the only coverage. Confirm.
+4. §5.3 low-power quirk: the top band keeps its previous r. Does it still update `step`/`ld` (and so the low-power carry) from the new code? We do, and cfg1 matches, but cfg1 never gives band 3 a non-zero allocation in two consecutive blocks with B ≥ 3, so this is thinly covered.
+5. §7.2 4-band absolute coding has no escapes, so reduced allocations above 8 can't be coded with tables A/B (no codes past nibble 8). Is the config 0/1 cap really 9 bits (`max_bits_4band_max`), so ρ ≤ 8 always?
+6. Encoder delay for `get_delay` (old Q6): the filterbank adds group delay even though §3.2 says "latency 0". Is 0 what the reference reports to the stack, regardless of the actual filter delay?
+7. Encoder-side choice, not in the spec: a packet may push at most a quarter of its payload (`(Lp − 3)/4` bytes) into the next packet's continuation. Past that a frame falls back to the cheapest allocation, then to fewer blocks, and anything left is dropped (counted, logged by the plugin). Without some cap the continuation can grow without bound when packets are small. What does the reference do: is there a carry limit, and does it ever drop audio?
+8. Contradiction: §7.1 byte 2 is `Lp/4 − 3` in 8 bits, so the largest packet it can describe is 1032 bytes, but `a2dp-integration.md` §2 clamps the packet budget to 128..2008 and §3.4 allows windows up to 2016. We cap packets at 1032. Does the reference clamp too, or does byte 2 mean something else for bigger packets?

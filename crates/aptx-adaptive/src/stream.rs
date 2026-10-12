@@ -17,6 +17,10 @@ pub trait Core {
     /// Encoder failures.
     fn flush(&mut self, window: &mut [u8]) -> Result<usize>;
     fn set_bitrate(&mut self, bps: u32);
+    /// See [`Encoder::dropped_blocks`]. Cores that never drop audio keep the default.
+    fn dropped_blocks(&self) -> u64 {
+        0
+    }
 }
 
 /// Above this many interleaved samples of deficit the bitrate drops by 25%.
@@ -41,17 +45,27 @@ impl Stream<Encoder> {
     /// # Errors
     /// Whatever the encoder rejects.
     pub fn new(config: Config, budget: usize) -> Result<Self> {
-        let row = table_row(config, budget).ok_or(Error::UnsupportedConfig)?;
+        let row = table_row(config, budget)?;
         let core = Encoder::new(config, row.bitrate)?;
         Ok(Self::with_core(core, config, row))
     }
 }
 
 /// The level-3 row with no QHS, TWM or 96 kHz, fitted to `budget`.
-#[must_use]
-pub fn table_row(config: Config, budget: usize) -> Option<Row> {
+///
+/// # Errors
+/// `UnsupportedConfig` if there's no row or encoder for `config`, `PacketTooSmall` if the
+/// fitted packet can't carry a period (see [`crate::min_packet_bytes`]).
+pub fn table_row(config: Config, budget: usize) -> Result<Row> {
     let index = tables::index(config.profile, config.level, Link::default());
-    Some(tables::row(config.profile, index, DEFAULT_QUALITY)?.fit(budget))
+    let row = tables::row(config.profile, index, DEFAULT_QUALITY)
+        .ok_or(Error::UnsupportedConfig)?
+        .fit(budget);
+    let samples = row.interleaved_samples(config.sample_rate, config.channels.into());
+    if row.packet_bytes < crate::min_packet_bytes(config, samples)? {
+        return Err(Error::PacketTooSmall);
+    }
+    Ok(row)
 }
 
 impl<C: Core> Stream<C> {
@@ -88,6 +102,12 @@ impl<C: Core> Stream<C> {
     #[must_use]
     pub fn header(&self) -> [u8; HEADER_LEN] {
         frame::header(self.config.profile, &self.row)
+    }
+
+    /// Blocks of audio the encoder has dropped so far (see [`Encoder::dropped_blocks`]).
+    #[must_use]
+    pub fn dropped_blocks(&self) -> u64 {
+        self.core.dropped_blocks()
     }
 
     #[cfg(test)]
@@ -244,16 +264,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_packets_that_cant_hold_a_period() {
+        assert_eq!(table_row(PX7, 128).unwrap_err(), Error::PacketTooSmall);
+        let need = crate::min_packet_bytes(PX7, 1344).unwrap();
+        assert_eq!(table_row(PX7, need).unwrap().packet_bytes, need);
+        assert!(table_row(PX7, need - 4).is_err());
+    }
+
+    #[test]
     fn rejects_small_output() {
         let mut s = px7();
         assert_eq!(s.push(&[0; 2], &mut [0; 655]), Err(Error::OutputTooSmall));
     }
 
+    /// One second of the r1 sine through the real encoder: 71 forced packets, each starting
+    /// `00 01 a1` or `00 81 a1` before the swap.
     #[test]
-    fn real_encoder_is_unimplemented() {
+    fn real_encoder_gives_71_packets() {
         let mut s = Stream::new(PX7, 887).unwrap();
         assert_eq!(s.samples_per_packet(), 1344);
         assert_eq!(s.row().bitrate, 364_000);
-        assert_eq!(s.push(&[0; 1344], &mut [0; 656]), Err(Error::Unimplemented));
+        let pcm = read_pcm("sine1k.s32le");
+        let mut out = [0; 656];
+        let mut n = 0;
+        for block in pcm.chunks(1344) {
+            if let Some(len) = s.push(block, &mut out).unwrap() {
+                assert_eq!(len, 656);
+                // Byte 1 (swapped to 0) is the frame type, with 0x80 if padded.
+                assert_eq!(out[0] & 0x7F, 0x01);
+                assert_eq!(out[1..4], [0x00, 0xD0 | (out[2] & 0xF), 0xA1]);
+                n += 1;
+            }
+        }
+        assert_eq!(n, 71);
     }
 }

@@ -6,6 +6,7 @@ use aptx_adaptive::{
 };
 
 use std::io::Write as _;
+use std::time::{Duration, Instant};
 
 use crate::dev::{AnyCore, Options, Replay};
 
@@ -59,9 +60,33 @@ pub enum SessionError {
 impl From<Error> for SessionError {
     fn from(e: Error) -> Self {
         match e {
-            Error::OutputTooSmall | Error::WindowSize => Self::NoSpace,
-            Error::UnsupportedConfig | Error::Unimplemented => Self::Unsupported,
+            Error::OutputTooSmall | Error::WindowSize | Error::PacketTooSmall => Self::NoSpace,
+            Error::UnsupportedConfig => Self::Unsupported,
         }
+    }
+}
+
+/// Reports dropped audio to stderr when the count goes up, at most once per [`DropLog::EVERY`].
+#[derive(Debug, Default)]
+struct DropLog {
+    reported: u64,
+    last: Option<Instant>,
+}
+
+impl DropLog {
+    const EVERY: Duration = Duration::from_secs(1);
+
+    /// The message to log, if any, for `dropped` blocks so far at `now`.
+    fn check(&mut self, dropped: u64, now: Instant) -> Option<String> {
+        if dropped <= self.reported || self.last.is_some_and(|t| now - t < Self::EVERY) {
+            return None;
+        }
+        let new = dropped - self.reported;
+        self.reported = dropped;
+        self.last = Some(now);
+        Some(format!(
+            "aptx-adaptive: dropped {new} blocks of audio ({dropped} total): packets too small"
+        ))
     }
 }
 
@@ -80,6 +105,7 @@ pub struct Session<C> {
     pcm: Vec<i32>,
     /// Packets sent so far; drives the TTP clock.
     packets: u32,
+    drops: DropLog,
 }
 
 impl Session<Encoder> {
@@ -101,7 +127,7 @@ impl Session<AnyCore> {
     /// goes to stderr).
     pub fn open(level: DecoderLevel, mtu: usize, opts: &Options) -> Result<Self, SessionError> {
         let config = config(level);
-        let row = table_row(config, budget(opts.framing, mtu)).ok_or(Error::UnsupportedConfig)?;
+        let row = table_row(config, budget(opts.framing, mtu))?;
         let core = match &opts.replay {
             None => AnyCore::Encoder(Encoder::new(config, row.bitrate)?),
             Some(path) => {
@@ -156,6 +182,7 @@ impl<C: Core> Session<C> {
             swap: true,
             mtu,
             packets: 0,
+            drops: DropLog::default(),
         })
     }
 
@@ -263,6 +290,12 @@ impl<C: Core> Session<C> {
         let written = self.stream.push(&self.pcm, &mut dst[..room])?;
         if written.is_some() {
             self.packets = self.packets.wrapping_add(1);
+            if let Some(msg) = self
+                .drops
+                .check(self.stream.dropped_blocks(), Instant::now())
+            {
+                let _ = writeln!(std::io::stderr(), "{msg}");
+            }
         }
         if let (Some(n), false) = (written, self.swap) {
             // The stream always swaps; swapping again undoes it.
@@ -285,6 +318,27 @@ mod tests {
     use super::*;
 
     const MTU: usize = 895;
+
+    #[test]
+    fn drop_log_reports_increases_at_most_once_a_second() {
+        let mut log = DropLog::default();
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        assert_eq!(log.check(0, ms(0)), None);
+        assert!(
+            log.check(5, ms(0))
+                .unwrap()
+                .contains("dropped 5 blocks of audio (5 total)")
+        );
+        assert_eq!(log.check(9, ms(500)), None);
+        assert!(
+            log.check(9, ms(1000))
+                .unwrap()
+                .contains("dropped 4 blocks of audio (9 total)")
+        );
+        assert_eq!(log.check(9, ms(5000)), None);
+        assert!(log.check(10, ms(5000)).is_some());
+    }
 
     fn session(framing: Framing) -> Session<Fake> {
         session_with(framing, MTU, budget(framing, MTU))
@@ -494,7 +548,21 @@ mod tests {
             Session::new(DecoderLevel::R1, 100),
             Err(SessionError::NoSpace)
         ));
-        assert!(Session::new(DecoderLevel::R1, 148).is_ok());
+        // Nor can a packet that doesn't fit a period of audio at the cheapest allocation.
+        let need = aptx_adaptive::min_packet_bytes(config(DecoderLevel::R1), 1344).unwrap();
+        let mtu = need + header_len(FRAMING);
+        assert!(matches!(
+            Session::new(DecoderLevel::R1, mtu - 4),
+            Err(SessionError::NoSpace)
+        ));
+        assert_eq!(
+            Session::new(DecoderLevel::R1, mtu)
+                .unwrap()
+                .stream
+                .row()
+                .packet_bytes,
+            need
+        );
     }
 
     /// 1 s through the codec the way `media-sink.c` drives it: `start_encode` into a fresh
@@ -629,10 +697,8 @@ mod tests {
         let mut s = Session::open(DecoderLevel::R1, MTU, &opts).unwrap();
         assert_eq!(s.start_encode(&mut [0; 64], 0, 0), Ok(20));
         let src = vec![0u8; s.block_size()];
-        assert_eq!(
-            s.encode(&src, &mut [0; 1000]).err(),
-            Some(SessionError::Unsupported)
-        );
+        let r = s.encode(&src, &mut [0; 1000]).unwrap();
+        assert_eq!((r.written, r.flush), (656, true));
     }
 
     #[test]
@@ -644,14 +710,17 @@ mod tests {
         assert_eq!(s.stream.row().packet_bytes, 580);
     }
 
+    /// Real packets from the real encoder: swapped `00 01 a1 ..` (config 0, Lp 656).
     #[test]
-    fn real_encoder_is_unimplemented() {
+    fn real_encoder_packets() {
         let mut s = Session::new(DecoderLevel::R1, MTU).unwrap();
         assert_eq!(s.stream.row().packet_bytes, 656);
-        let src = vec![0u8; s.block_size()];
-        assert_eq!(
-            s.encode(&src, &mut [0; 1000]).err(),
-            Some(SessionError::Unsupported)
-        );
+        let src: Vec<u8> = (0..s.block_size() / 4)
+            .flat_map(|i| ((i as i32 % 200 - 100) << 12).to_ne_bytes())
+            .collect();
+        let mut dst = [0u8; 1000];
+        let r = s.encode(&src, &mut dst).unwrap();
+        assert_eq!((r.written, r.flush), (656, true));
+        assert_eq!((dst[0] & 0x7F, dst[1], dst[3]), (0x01, 0x00, 0xA1));
     }
 }

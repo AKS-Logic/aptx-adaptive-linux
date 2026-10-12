@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::stream::table_row;
-use crate::{Config, Core, Error, Progress, Result, Stream, WINDOW_SLACK};
+use crate::{Config, Core, Progress, Result, Stream, WINDOW_SLACK};
 
 /// Takes input until it holds one packet's worth, then waits for a flush, which is how the
 /// reference behaves in steady state (spec §6). A packet is the low bytes of its first two
@@ -23,9 +23,9 @@ pub struct Fake {
 /// A stream over a [`Fake`] sized for `config`.
 ///
 /// # Errors
-/// `UnsupportedConfig` if there's no table row.
+/// As for [`table_row`].
 pub fn stream(config: Config, budget: usize) -> Result<Stream<Fake>> {
-    let row = table_row(config, budget).ok_or(Error::UnsupportedConfig)?;
+    let row = table_row(config, budget)?;
     let fake = Fake {
         capacity: row.interleaved_samples(config.sample_rate, config.channels.into()),
         buffered: 0,

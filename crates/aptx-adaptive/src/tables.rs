@@ -75,10 +75,13 @@ impl Row {
     }
 }
 
-/// Packet budget for a link MTU: room for the 8-byte header, clamped to 128..=2008 (§2).
+/// Packet budget for a link MTU: room for the 8-byte header, clamped to 128..=2008 (§2), then
+/// to the 1032 bytes the packet header can describe (`codec-core.md` §7.1).
 #[must_use]
 pub fn packet_budget(mtu: usize) -> usize {
-    mtu.saturating_sub(8).clamp(128, 2008)
+    mtu.saturating_sub(8)
+        .clamp(128, 2008)
+        .min(crate::MAX_PACKET)
 }
 
 /// Link state that picks the table index (§4.1, §4.2).
@@ -307,7 +310,7 @@ mod tests {
     fn budget_clamps() {
         assert_eq!(packet_budget(895), 887);
         assert_eq!(packet_budget(10), 128);
-        assert_eq!(packet_budget(4000), 2008);
+        assert_eq!(packet_budget(4000), 1032);
     }
 
     #[test]

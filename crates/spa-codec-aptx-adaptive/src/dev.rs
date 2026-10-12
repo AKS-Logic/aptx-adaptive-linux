@@ -212,6 +212,12 @@ impl Core for AnyCore {
             Self::Replay(c) => c.set_bitrate(bps),
         }
     }
+    fn dropped_blocks(&self) -> u64 {
+        match self {
+            Self::Encoder(c) => Core::dropped_blocks(c),
+            Self::Replay(c) => c.dropped_blocks(),
+        }
+    }
 }
 
 #[cfg(test)]

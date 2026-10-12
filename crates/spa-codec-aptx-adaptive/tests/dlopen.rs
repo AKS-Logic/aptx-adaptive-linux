@@ -279,7 +279,7 @@ fn enum_config_reports_overflow() {
 }
 
 #[test]
-fn init_succeeds_but_encode_is_unimplemented() {
+fn init_and_encode_a_real_packet() {
     let l = load();
     let c = l.codec;
     let mut config = PX7_S2E_CONFIG;
@@ -308,8 +308,10 @@ fn init_succeeds_but_encode_is_unimplemented() {
             &raw mut written,
             &raw mut flush,
         );
-        assert_eq!(res, -ENOTSUP);
-        assert_eq!(written, 0);
+        assert_eq!(res, block);
+        assert_eq!((written, flush), (656, 1));
+        // Swapped config 0 packet: 00 01 a1 .. becomes 01 00 .. a1 (0x80 on byte 1 if padded).
+        assert_eq!((out[20] & 0x7f, out[21], out[23]), (0x01, 0x00, 0xa1));
         assert_eq!(c.abr_process.unwrap()(data, 0), 0);
         let mut delay = 99;
         c.get_delay.unwrap()(data, &raw mut delay, ptr::null_mut());

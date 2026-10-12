@@ -16,3 +16,7 @@ module_name_repetitions = "allow"
 cast_possible_truncation = "allow"
 cast_possible_wrap = "allow"
 cast_sign_loss = "allow"
+
+# The DSP is too slow unoptimised for the long encoder tests; overflow checks stay on.
+[profile.dev.package.aptx-adaptive]
+opt-level = 2
