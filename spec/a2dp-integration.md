@@ -598,3 +598,15 @@ From analysing a newer-generation receiver of the same vendor's codec. That rece
 - **Fix to try:** the timestamp advances by the packet duration in µs (14000 per 672-sample packet at 48 kHz) from any start value. Possibly the 203 ms TTP offset (header bytes 0..1 × 8 µs) is added once to the start. UNCERTAIN which.
 - SSRC: the last byte is a mode/control byte, so `00 00 00 AE` is consistent. A constant value is fine.
 - Payload type: that receiver only accepts **0**. The earlier PT 0 live test kept the constant timestamp, so it didn't rule PT 0 out.
+
+## 7C. Packet layout reconsidered (2026-10-12)
+
+New analysis questions §7A/§7B. The best available evidence for an aptX Adaptive stream over ordinary Bluetooth from a vendor source is a **normal** RTP header followed by the 8-byte header, then the payload:
+
+- `80 60` (V=2, PT 96), sequence +1 per packet, timestamp = sample count (+672 per packet at 48 kHz), SSRC 0
+- then the 8-byte header (`1f 63 38 01 00 00 00 ae` for the Px7 case)
+- then the 16-bit byte-swapped codec packet. For a 656-byte packet the A2DP payload is 676 bytes in total.
+
+Also:
+- header byte 3 is a packet-type index into the packet-size list {348, 656, 140, 152, 560, 760, 960, 348, 980}. Our table cfg bytes are consistent with it (1 = 656).
+- the "header-after-RTP" layout was only ever tested in runs where the restart caused a disconnect chime, so it hasn't actually been ruled out.
