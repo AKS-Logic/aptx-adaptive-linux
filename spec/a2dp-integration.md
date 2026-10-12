@@ -741,3 +741,29 @@ A source always sends its own source-type bits (0x02), never the sink's. Source 
 - The R2.1 RSSI and latency-adjust fields are only read for R2.1 sinks.
 - TTP bytes: LL0 ms, LL1 ms, HQ in 2 ms units, TWS in 2 ms units.
 - The reference's sink-buffer minimum is 20 (the default).
+
+## 7K. Verified packet loop, mode switching and levels (2026-10-13)
+
+Checked against primary sources. This supersedes §5 and §8 where they differ.
+
+**Packet loop (§5).** The counters, the flush call, the deficit update and the 25 % drop above a deficit of 96 are confirmed (signed compare). Bitrate is set after **every** packet, so it's restored on the first packet whose deficit is ≤ 96. Corrections:
+- **LL never carries a deficit.** In LL, after a packet with a non-zero deficit, the reference makes a second flush call and zeroes the deficit. The bitrate drop therefore only ever happens in HQ.
+- **Order after each packet:** recompute the latency state, apply a pending level change, apply a pending mode change, then the bitrate step.
+- The 700-count LL latency-target adjustment counts **input blocks** (about 700 ms at 1 ms per block), not packets, and only runs in LL.
+
+**HQ↔LL switch (§8).**
+- Triggers as in §8. A refused LL request (dual mono, TWS, 96 kHz) is silently ignored. Requesting the opposite mode mid-switch reverses the switch.
+- The sequence, with packets flowing throughout:
+  1. a raised-cosine **fade-out over 4800 frames** (100 ms at 48 kHz);
+  2. **silence for 900 input blocks** (about 900 ms; 800 for a switch to LL on an R2.1 sink);
+  3. a raised-cosine **fade-in over 4800 frames**.
+
+  The curve is the same raised cosine (§7I) both ways. (This replaces "mute 900 then fade 4800" and §7I's switch-fade paragraph.)
+- The encoder is **reset in place**, not re-created, about 200 blocks into the silent phase. At the reset: level → 3, entering LL forces LL0, both loop counters → 0, and the LL latency target → its base. The packet's mode, period and cfg bytes change at that moment. The SSRC changes with the mode (§7H).
+
+**Latency state (LL0/LL1).** Re-evaluated after every packet. LL1 needs Wi-Fi idle, both scans off, a zero link field, level ≥ 5, RSSI above about −50 dBm, and the LL target at its base. Without sideband feedback (a host source has none) the defaults count as a busy link, so it **stays LL0**. For an R1 sink LL1 wouldn't change the table anyway.
+
+**Levels (§8.2).**
+- The RSSI caps apply in **HQ**, not LL: level ≤ 3 for dual mono or TWS; otherwise ≤ 3 when RSSI < −60 dBm and ≤ 4 when RSSI < −55 dBm. LL has no cap.
+- Level 1 is treated as 2. Level 0 is accepted but maps to an unused row, so a source should ignore it.
+- **The default level is 3 for HQ and LL**, and it's reset to 3 on every switch. R1 sink at level 3: HQ 364 kbps / 14 ms; LL 265 kbps / 10 ms at every level.
