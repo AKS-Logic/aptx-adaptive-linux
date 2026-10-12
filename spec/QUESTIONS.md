@@ -270,3 +270,9 @@ btmon, time from sending each media ACL packet to the controller's Number of Com
 - Drift log during a stuttering stream: host clock within ±4 ppm of CLOCK_MONOTONIC, "audio ahead" stayed at ±0.2 ms, backlog avg about 600 bytes (max 2004 after start-up; start burst up to 12 KB now absorbed by the 32 KiB buffer). So host-clock drift is ruled out. The +80 ppm in capture 2 was measured against the btmon/kernel capture timestamps, not a real clock error.
 - Stutter onset isn't consistent. After a reconnect it hasn't come back. That points away from steady drift and towards per-connection link conditions: the headset sharing radio time with a second (multipoint) connection, 2.4 GHz interference, sniff/role state, or the headset's buffer state after a particular start.
 - Not yet tested: whether the stutter only happens while the Px7 is also connected to the phone (multipoint).
+
+## stutter: parked (2026-10-13 08:29)
+
+- An all-cores CPU busy loop for 20 s doesn't reproduce it; the BT data loop runs SCHED_FIFO 83.
+- The user associates it with "CPU spikes" of unknown kind. Candidates: USB contention on the Dell dock (the RTL8922 Bluetooth sits behind it, with Ethernet, camera and audio), memory or IO pressure, multipoint.
+- Parked by the user. Revisit after parity work.
