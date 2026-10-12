@@ -13,3 +13,7 @@ Clean-room aptX Adaptive encoder in Rust, plus a PipeWire bluez5 codec plugin. S
 
 - tools come from mise: `mise install`, `mise run check`
 - `crates/aptx-adaptive`: safe Rust only. Bit-exact against the vectors.
+
+## scratch
+
+- temporary and working files go in `.scratch/` in the repo (gitignored), never `/tmp`. Never commit them.
