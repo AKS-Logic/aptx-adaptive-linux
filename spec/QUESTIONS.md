@@ -63,3 +63,7 @@ Conclusion: the chime doesn't separate layouts. It seems tied to the restart and
 - Media channel L2CAP MTU 895. Packets go out every 14 ms as 12 + 656 = 668 bytes, and the controller completes them.
 - On-air RTP header: `80 60 SS SS 1f 63 38 01 00 00 00 ae`, i.e. V=2, PT 96, the sequence number incrementing by 1, then the 8 header bytes verbatim. The payload is the reference packet byte-swapped in 16-bit units, exactly as intended.
 - The headset still plays silence. Signalling, transport and our own packetisation all behave as designed, so the problem is in the content the sink expects: the header values, the RTP mapping, or the bitstream/config. This needs the dirty side (receiver analysis) or a phone capture to settle.
+
+## todo once audio works
+
+- Make aptX Adaptive the default for aptX Adaptive sinks locally. A WirePlumber rule that sets the device's default profile to `a2dp-sink-aptx_adaptive`, installed by `scripts/install-plugin.sh`, is enough. Upstreaming is parked; the patch is on branch `upstream-adr` (PR #5, closed).
