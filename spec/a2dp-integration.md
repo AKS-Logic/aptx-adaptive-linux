@@ -623,3 +623,16 @@ Captured from a OnePlus 15 (Snapdragon) streaming aptX Adaptive to this machine,
 - **Payload:** the 16-bit byte-swapped codec packet, exactly as specified. The first bytes on air are `81 00 d0 a1 …`, which unswap to the codec's `00 81 a1 d0`.
 - **So the 8-byte header's fields map into RTP like this:** the TTP/period/cfg bytes aren't sent at all; the TTP clock replaces them in the timestamp field. Byte 7 (`ae`/`ad`) becomes the low byte of the SSRC, and bytes 4..6 (zero) its high bytes.
 - The phone switched between 14 ms and 12 ms packets during the stream, so its encoder changed table rows on the fly. Both are valid for an R1 sink.
+
+## 7E. Source type: the sink's timing mode (2026-10-13)
+
+Codec element byte 6 carries the sample rate in bits 3..7 and a **source type** in bits 0..2.
+
+- **Source type 0** puts a Qualcomm sink in a timing mode where the RTP timestamp is the absolute time-to-play on the Bluetooth link clock. Only a source whose controller writes link-clock timestamps can meet that. A Snapdragon phone with offload uses this mode, which is why its configuration has byte 6 = `0x10`.
+- **Source type 2 (bit 0x02 set)** tells the sink to time playback itself and use the RTP timestamp only relatively. A host-side (software) encoder must use this.
+- For the Px7 S2e at 48 kHz that makes byte 6 = **`0x12`**: `d7 00 00 00 ad 00 12 02 37 6a 00 af 64 4b 00 00 aa` + zeros.
+- Bit 0x01 is a sink-side flag. A source must not set it.
+- With source type 2, the SSRC's low byte may select the latency mode: `a1`/`a2` LL, `a3` HQ, `a4` TWS (UNCERTAIN; the HQ marker used so far is `ae`).
+- The RTP timestamp unit in this mode isn't known. Try µs (+14000 per 14 ms packet) first, then samples (+672).
+
+This supersedes the earlier recommendation of byte 6 = `0x10`, which is correct only for sources whose controller supplies link-clock timestamps.
