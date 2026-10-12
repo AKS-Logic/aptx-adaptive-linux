@@ -12,12 +12,15 @@ use crate::dev::{AnyCore, Options, Replay};
 /// How the 8-byte aptX Adaptive header goes on air (spec §7.2, `QUESTIONS.md`). Unconfirmed
 /// either way; needs a capture from an Android source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(clippy::enum_variant_names, reason = "they're all header placements")]
 pub enum Framing {
     /// The spec's hypothesis: header bytes 0..3 are the RTP timestamp and 4..7 the SSRC, most
     /// significant byte first. No payload prefix.
     HeaderInRtp,
     /// A normal RTP header (timestamp in samples), then the 8 bytes as a payload prefix.
     HeaderAfterRtp,
+    /// DEV ONLY (spec §7A.2 option b): like `HeaderInRtp` with each 4-byte half reversed.
+    HeaderInRtpSwapped,
 }
 
 /// The default; `APTX_ADAPTIVE_FRAMING` overrides it (see `dev`).
@@ -25,7 +28,7 @@ pub const FRAMING: Framing = Framing::HeaderInRtp;
 
 pub const RTP_HEADER_LEN: usize = 12;
 /// UNCERTAIN: the spec doesn't give one. aptX HD uses 96.
-const RTP_PAYLOAD_TYPE: u8 = 96;
+pub const RTP_PAYLOAD_TYPE: u8 = 96;
 const RTP_SSRC: u32 = 1;
 
 const BYTES_PER_SAMPLE: usize = 4;
@@ -66,6 +69,8 @@ pub struct EncodeResult {
 pub struct Session<C> {
     stream: Stream<C>,
     framing: Framing,
+    payload_type: u8,
+    swap: bool,
     mtu: usize,
     pcm: Vec<i32>,
 }
@@ -101,13 +106,16 @@ impl Session<AnyCore> {
                 AnyCore::Replay(replay)
             }
         };
-        Self::with_stream(Stream::with_core(core, config, row), opts.framing, mtu)
+        let mut s = Self::with_stream(Stream::with_core(core, config, row), opts.framing, mtu)?;
+        s.payload_type = opts.payload_type;
+        s.swap = opts.swap;
+        Ok(s)
     }
 }
 
 fn header_len(framing: Framing) -> usize {
     match framing {
-        Framing::HeaderInRtp => RTP_HEADER_LEN,
+        Framing::HeaderInRtp | Framing::HeaderInRtpSwapped => RTP_HEADER_LEN,
         Framing::HeaderAfterRtp => RTP_HEADER_LEN + HEADER_LEN,
     }
 }
@@ -134,6 +142,8 @@ impl<C: Core> Session<C> {
             pcm: vec![0; stream.samples_per_packet()],
             stream,
             framing,
+            payload_type: RTP_PAYLOAD_TYPE,
+            swap: true,
             mtu,
         })
     }
@@ -177,10 +187,15 @@ impl<C: Core> Session<C> {
         let h = dst.get_mut(..len).ok_or(SessionError::NoSpace)?;
         let aptx = self.stream.header();
         h[0] = 2 << 6;
-        h[1] = RTP_PAYLOAD_TYPE;
+        h[1] = self.payload_type;
         h[2..4].copy_from_slice(&seqnum.to_be_bytes());
         match self.framing {
             Framing::HeaderInRtp => h[4..12].copy_from_slice(&aptx),
+            Framing::HeaderInRtpSwapped => {
+                h[4..12].copy_from_slice(&aptx);
+                h[4..8].reverse();
+                h[8..12].reverse();
+            }
             Framing::HeaderAfterRtp => {
                 h[4..8].copy_from_slice(&timestamp.to_be_bytes());
                 h[8..12].copy_from_slice(&RTP_SSRC.to_be_bytes());
@@ -214,6 +229,12 @@ impl<C: Core> Session<C> {
             *s = (i32::from_ne_bytes(*b) << 8) >> 8;
         }
         let written = self.stream.push(&self.pcm, &mut dst[..room])?;
+        if let (Some(n), false) = (written, self.swap) {
+            // The stream always swaps; swapping again undoes it.
+            for p in dst[..n].as_chunks_mut::<2>().0 {
+                p.swap(0, 1);
+            }
+        }
         Ok(EncodeResult {
             consumed: block,
             written: written.unwrap_or(0),
@@ -269,6 +290,45 @@ mod tests {
                 0, 0, 0, 0xae, 0xff
             ]
         );
+    }
+
+    #[test]
+    fn header_in_rtp_swapped() {
+        let mut s = session(Framing::HeaderInRtpSwapped);
+        s.payload_type = 0;
+        let mut buf = [0xff; 64];
+        assert_eq!(s.start_encode(&mut buf, 0x1234, 0xdead_beef), Ok(12));
+        assert_eq!(
+            buf[..13],
+            [
+                0x80, 0, 0x12, 0x34, 0x01, 0x38, 0x63, 0x1f, 0xae, 0, 0, 0, 0xff
+            ]
+        );
+    }
+
+    #[test]
+    fn noswap_leaves_payload_as_encoded() {
+        let mut s = session(FRAMING);
+        s.swap = false;
+        let mut src = vec![0u8; s.block_size()];
+        src[..4].copy_from_slice(&5i32.to_ne_bytes());
+        src[4..8].copy_from_slice(&6i32.to_ne_bytes());
+        let mut dst = [0xffu8; 1000];
+        let r = s.encode(&src, &mut dst).unwrap();
+        assert_eq!(r.written, 656);
+        assert_eq!(dst[..3], [5, 6, 0]);
+        assert_eq!(dst[656], 0xff);
+    }
+
+    #[test]
+    fn open_applies_dev_options() {
+        let opts = Options {
+            payload_type: 0,
+            swap: false,
+            ..Options::default()
+        };
+        let s = Session::open(DecoderLevel::R1, MTU, &opts).unwrap();
+        assert_eq!((s.payload_type, s.swap), (0, false));
     }
 
     #[test]
@@ -376,6 +436,7 @@ mod tests {
             let opts = Options {
                 framing,
                 replay: Some(path.clone()),
+                ..Options::default()
             };
             let mut s = Session::open(DecoderLevel::R1, MTU, &opts).unwrap();
             let header = header_len(framing);
@@ -419,8 +480,8 @@ mod tests {
     #[test]
     fn replay_rejects_bad_files() {
         let opts = |p: &str| Options {
-            framing: FRAMING,
             replay: Some(vector(p)),
+            ..Options::default()
         };
         assert!(matches!(
             Session::open(DecoderLevel::R1, MTU, &opts("missing.bin")),
@@ -437,7 +498,7 @@ mod tests {
     fn open_without_replay_uses_encoder() {
         let opts = Options {
             framing: Framing::HeaderAfterRtp,
-            replay: None,
+            ..Options::default()
         };
         let mut s = Session::open(DecoderLevel::R1, MTU, &opts).unwrap();
         assert_eq!(s.start_encode(&mut [0; 64], 0, 0), Ok(20));

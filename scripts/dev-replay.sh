@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
 # DEV ONLY. Installs the plugin with the replay core: instead of encoding, it sends the
-# pre-encoded packets of tests/vectors/r2/sine1k.r1.bin (1 kHz sine, -6 dBFS, looping) with
-# the real caps, framing, RTP and timing. Lets us test negotiation and framing on a headset
-# before the codec core exists.
+# pre-encoded packets of tests/vectors/r2/<vector> (default sine1k.r1.bin: 1 kHz sine,
+# -6 dBFS, looping) with the real caps, framing, RTP and timing. Lets us test negotiation and
+# framing on a headset before the codec core exists.
 #
-#   scripts/dev-replay.sh [header-in-rtp|header-after-rtp]
+#   scripts/dev-replay.sh [header-in-rtp|header-after-rtp|header-in-rtp-swapped] [vector]
+#
+# A/B switches (spec §7A.3), passed through to the plugin if set:
+#   APTX_ADAPTIVE_PT=<0..127>   RTP payload type (default 96)
+#   APTX_ADAPTIVE_NOSWAP=1      don't 16-bit swap the payload
+# e.g. APTX_ADAPTIVE_PT=0 scripts/dev-replay.sh header-in-rtp sine1k.r2.bin
 #
 # Doesn't restart anything or touch the headset; it prints the commands for that.
 set -euo pipefail
 
 framing=${1:-header-in-rtp}
 case $framing in
-header-in-rtp | header-after-rtp) ;;
+header-in-rtp | header-after-rtp | header-in-rtp-swapped) ;;
 *)
-	echo "usage: $0 [header-in-rtp|header-after-rtp]" >&2
+	echo "usage: $0 [header-in-rtp|header-after-rtp|header-in-rtp-swapped] [vector]" >&2
 	exit 2
 	;;
 esac
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-vector=$repo/tests/vectors/r2/sine1k.r1.bin
+vector=$repo/tests/vectors/r2/${2:-sine1k.r1.bin}
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 dropin=$config_home/systemd/user/wireplumber.service.d/aptx-adaptive-dev-replay.conf
 
@@ -38,7 +43,14 @@ cat >"$dropin" <<EOF
 Environment="APTX_ADAPTIVE_REPLAY=$vector"
 Environment="APTX_ADAPTIVE_FRAMING=$framing"
 EOF
-echo "wrote $dropin (framing $framing)"
+extra=
+for var in APTX_ADAPTIVE_PT APTX_ADAPTIVE_NOSWAP; do
+	if [[ -n ${!var-} ]]; then
+		echo "Environment=\"$var=${!var}\"" >>"$dropin"
+		extra+=", $var=${!var}"
+	fi
+done
+echo "wrote $dropin (framing $framing, vector ${vector##*/}$extra)"
 if command -v systemctl >/dev/null; then
 	systemctl --user daemon-reload
 fi
@@ -68,6 +80,7 @@ systemctl --user daemon-reload
 systemctl --user restart wireplumber pipewire pipewire-pulse
 pactl set-card-profile "\$(pactl list cards short | awk '/bluez_card\./ {print \$2; exit}')" a2dp-sink
 
-# To try the other framing, re-run: $0 $([[ $framing == header-in-rtp ]] && echo header-after-rtp || echo header-in-rtp)
+# To try another framing, vector or switch, re-run e.g.
+#   APTX_ADAPTIVE_PT=0 $0 header-in-rtp-swapped sine1k.r2.bin
 # and redo (a)-(c).
 EOF

@@ -5,6 +5,9 @@
 //!   the real code path. For testing negotiation and framing on a headset before the codec
 //!   core exists.
 //! - `APTX_ADAPTIVE_FRAMING=header-in-rtp|header-after-rtp`: overrides [`session::FRAMING`].
+//!   With `dev-replay`, also `header-in-rtp-swapped` (spec §7A.2 option b).
+//! - `APTX_ADAPTIVE_PT=0..127`, only with `dev-replay`: the RTP payload type.
+//! - `APTX_ADAPTIVE_NOSWAP=1`, only with `dev-replay`: send the payload without the 16-bit swap.
 
 use std::ffi::OsString;
 use std::fs;
@@ -16,22 +19,39 @@ use crate::session::{self, Framing};
 
 pub const REPLAY_VAR: &str = "APTX_ADAPTIVE_REPLAY";
 pub const FRAMING_VAR: &str = "APTX_ADAPTIVE_FRAMING";
+pub const PT_VAR: &str = "APTX_ADAPTIVE_PT";
+pub const NOSWAP_VAR: &str = "APTX_ADAPTIVE_NOSWAP";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     pub framing: Framing,
     pub replay: Option<PathBuf>,
+    pub payload_type: u8,
+    pub swap: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            framing: session::FRAMING,
+            replay: None,
+            payload_type: session::RTP_PAYLOAD_TYPE,
+            swap: true,
+        }
+    }
 }
 
 impl Options {
     /// # Errors
     /// A message if a variable is set to something unusable.
     pub fn from_env(var: impl Fn(&str) -> Option<OsString>) -> Result<Self, String> {
+        let dev = cfg!(feature = "dev-replay");
         let framing = match var(FRAMING_VAR) {
             None => session::FRAMING,
             Some(v) => match v.to_str() {
                 Some("header-in-rtp") => Framing::HeaderInRtp,
                 Some("header-after-rtp") => Framing::HeaderAfterRtp,
+                Some("header-in-rtp-swapped") if dev => Framing::HeaderInRtpSwapped,
                 _ => {
                     return Err(format!(
                         "{FRAMING_VAR}={} is not header-in-rtp or header-after-rtp",
@@ -40,15 +60,28 @@ impl Options {
                 }
             },
         };
-        let replay = var(REPLAY_VAR).filter(|v| !v.is_empty()).map(PathBuf::from);
-        if cfg!(feature = "dev-replay") {
-            Ok(Self { framing, replay })
-        } else {
-            Ok(Self {
+        if !dev {
+            return Ok(Self {
                 framing,
-                replay: None,
-            })
+                ..Self::default()
+            });
         }
+        let replay = var(REPLAY_VAR).filter(|v| !v.is_empty()).map(PathBuf::from);
+        let payload_type = match var(PT_VAR) {
+            None => session::RTP_PAYLOAD_TYPE,
+            Some(v) => v
+                .to_str()
+                .and_then(|s| s.parse::<u8>().ok())
+                .filter(|pt| *pt <= 127)
+                .ok_or_else(|| format!("{PT_VAR}={} is not 0..127", v.display()))?,
+        };
+        let swap = var(NOSWAP_VAR).is_none_or(|v| v != "1");
+        Ok(Self {
+            framing,
+            replay,
+            payload_type,
+            swap,
+        })
     }
 
     /// What to log at init: nothing unless something differs from a normal build.
@@ -66,6 +99,12 @@ impl Options {
         }
         if self.framing != session::FRAMING {
             parts.push(format!("framing: {:?}", self.framing));
+        }
+        if self.payload_type != session::RTP_PAYLOAD_TYPE {
+            parts.push(format!("payload type: {}", self.payload_type));
+        }
+        if !self.swap {
+            parts.push("payload swap: off".to_owned());
         }
         (!parts.is_empty()).then(|| format!("aptx-adaptive: {}", parts.join("; ")))
     }
@@ -218,6 +257,38 @@ mod tests {
         let o = Options::from_env(&e).unwrap();
         assert_eq!(o.replay, Some(PathBuf::from("/x/y.bin")));
         assert!(o.describe(&e).unwrap().contains("REPLAY of /x/y.bin"));
+    }
+
+    #[cfg(feature = "dev-replay")]
+    #[test]
+    fn ab_switches_with_feature() {
+        let e = env(&[
+            (FRAMING_VAR, "header-in-rtp-swapped"),
+            (PT_VAR, "0"),
+            (NOSWAP_VAR, "1"),
+        ]);
+        let o = Options::from_env(&e).unwrap();
+        assert_eq!(o.framing, Framing::HeaderInRtpSwapped);
+        assert_eq!(o.payload_type, 0);
+        assert!(!o.swap);
+        assert_eq!(
+            o.describe(&e).as_deref(),
+            Some("aptx-adaptive: framing: HeaderInRtpSwapped; payload type: 0; payload swap: off")
+        );
+        let o = Options::from_env(env(&[(PT_VAR, "127"), (NOSWAP_VAR, "0")])).unwrap();
+        assert_eq!((o.payload_type, o.swap), (127, true));
+        assert!(Options::from_env(env(&[(PT_VAR, "128")])).is_err());
+        assert!(Options::from_env(env(&[(PT_VAR, "x")])).is_err());
+    }
+
+    #[cfg(not(feature = "dev-replay"))]
+    #[test]
+    fn ab_switches_ignored_without_feature() {
+        let e = env(&[(PT_VAR, "0"), (NOSWAP_VAR, "1")]);
+        let o = Options::from_env(&e).unwrap();
+        assert_eq!(o, Options::default());
+        assert_eq!(o.describe(&e), None);
+        assert!(Options::from_env(env(&[(FRAMING_VAR, "header-in-rtp-swapped")])).is_err());
     }
 
     #[cfg(not(feature = "dev-replay"))]
