@@ -29,6 +29,9 @@
 #   APTX_ADAPTIVE_TS=samples-per-packet|us|samples  RTP timestamp: samples per channel in the
 #                               packet, 0x000002a0 every packet (default, §7F), or a clock in
 #                               µs (+14000) or samples (+672)
+#   APTX_ADAPTIVE_TTP_ADJUST=off|fixed:<ms>|auto  §7F latency adjust in the timestamp's high
+#                               16 bits: 0 (default), a constant signed ms, or following the
+#                               measured drift (±1 ms per 10 s, max ±50; host fast → negative)
 # e.g. APTX_ADAPTIVE_PT=0 scripts/dev-replay.sh ttp-clock-offset sine1k.r2.bin
 #
 # Doesn't restart anything or touch the headset; it prints the commands for that.
@@ -74,7 +77,7 @@ else
 fi
 extra=
 for var in APTX_ADAPTIVE_PT APTX_ADAPTIVE_NOSWAP APTX_ADAPTIVE_SCMST APTX_ADAPTIVE_SCMST_BYTE \
-	APTX_ADAPTIVE_SOURCE_TYPE APTX_ADAPTIVE_SSRC APTX_ADAPTIVE_TS; do
+	APTX_ADAPTIVE_SOURCE_TYPE APTX_ADAPTIVE_SSRC APTX_ADAPTIVE_TS APTX_ADAPTIVE_TTP_ADJUST; do
 	if [[ -n ${!var-} ]]; then
 		echo "Environment=\"$var=${!var}\"" >>"$dropin"
 		extra+=", $var=${!var}"
@@ -114,5 +117,8 @@ pactl set-card-profile "\$(pactl list cards short | awk '/bluez_card\./ {print \
 # To try another framing, vector or switch, re-run e.g.
 #   APTX_ADAPTIVE_PT=0 $0 ttp-clock-offset sine1k.r1.bin
 #   APTX_ADAPTIVE_SOURCE_TYPE=0 APTX_ADAPTIVE_TS=samples $0 phone --no-replay
+#   APTX_ADAPTIVE_TTP_ADJUST=auto $0 phone --no-replay
+# The drift line (every 10 s while streaming) is in the wireplumber journal:
+#   journalctl --user -u wireplumber -f | grep 'aptx-adaptive: drift'
 # and redo (a)-(c).
 EOF

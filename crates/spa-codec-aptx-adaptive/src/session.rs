@@ -8,6 +8,7 @@ use aptx_adaptive::{
 use std::io::Write as _;
 
 use crate::dev::{AnyCore, Options, Replay};
+use crate::drift::{self, Drift, TtpAdjust};
 
 /// How a packet goes on air. `Phone` is the ground truth (spec §7D); the rest are older
 /// hypotheses, selectable only with `dev-replay`.
@@ -43,9 +44,6 @@ pub enum TsUnit {
 
 /// The default; `APTX_ADAPTIVE_TS` overrides it (see `dev`).
 pub const TS_UNIT: TsUnit = TsUnit::SamplesPerPacket;
-
-/// The §7F latency adjustment in ms, timestamp bits 16..31.
-const TS_ADJUST_MS: i16 = 0;
 
 /// The §7F SSRC for a profile: the whole 32-bit value selects the sink's latency mode.
 pub fn mode_ssrc(profile: Profile) -> u32 {
@@ -113,6 +111,10 @@ pub struct Session<C> {
     /// The RTP SSRC: [`mode_ssrc`] unless a dev setting replaces it.
     ssrc: Option<u32>,
     ts: TsUnit,
+    /// Drift instrumentation and the §7F latency adjustment (see `drift`).
+    drift: Drift,
+    /// Whether the drift line is logged.
+    drift_log: bool,
 }
 
 impl Session<Encoder> {
@@ -153,6 +155,8 @@ impl Session<AnyCore> {
         s.scmst = opts.scmst;
         s.ssrc = opts.ssrc;
         s.ts = opts.ts;
+        s.drift = Drift::new(config.sample_rate, opts.ttp_adjust);
+        s.drift_log = opts.drift_log;
         Ok(s)
     }
 }
@@ -185,6 +189,7 @@ impl<C: Core> Session<C> {
         if header_len(framing) + stream.row().packet_bytes > mtu {
             return Err(SessionError::NoSpace);
         }
+        let rate = stream.config().sample_rate;
         Ok(Self {
             pcm: vec![0; stream.samples_per_packet()],
             stream,
@@ -196,6 +201,8 @@ impl<C: Core> Session<C> {
             packets: 0,
             ssrc: None,
             ts: TS_UNIT,
+            drift: Drift::new(rate, TtpAdjust::Off),
+            drift_log: true,
         })
     }
 
@@ -220,7 +227,7 @@ impl<C: Core> Session<C> {
         let step = match self.ts {
             TsUnit::SamplesPerPacket => {
                 let frames = u16::try_from(self.packet_frames()).unwrap_or(u16::MAX);
-                return (u32::from(TS_ADJUST_MS.cast_unsigned()) << 16) | u32::from(frames);
+                return drift::ttp_timestamp(self.drift.adjust_ms(), frames);
             }
             TsUnit::Micros => self.packet_us(),
             TsUnit::Samples => self.packet_frames() as u32,
@@ -247,12 +254,13 @@ impl<C: Core> Session<C> {
     }
 
     /// The per-packet bitrate rule lives in the stream loop (spec §5 step 7). What a Linux
-    /// source should do with socket backlog is an open question, so this does nothing.
-    #[expect(
-        clippy::unused_self,
-        reason = "backlog-driven adaptation is an open spec question"
-    )]
-    pub fn abr_process(&mut self, _unsent: usize) {}
+    /// source should do with socket backlog is an open question, so it's only logged.
+    /// `media-sink.c` calls this right before each `send()`, which makes it the drift probe.
+    pub fn abr_process(&mut self, unsent: usize) {
+        let frames = self.packet_frames();
+        self.drift
+            .on_send_log(std::time::Instant::now(), unsent, frames, self.drift_log);
+    }
 
     /// Writes the RTP header (and the SCMS-T byte and the aptX header if they're a prefix) and
     /// returns its length.
@@ -458,6 +466,26 @@ mod tests {
             (p[12], p[13], p[14] & 0xf0, p[15]),
             (0x81, 0x00, 0xd0, 0xa1)
         );
+    }
+
+    /// The §7F adjust goes in the timestamp's high 16 bits: -3 → `ff fd 02 a0`.
+    #[test]
+    fn ttp_adjust_in_timestamp() {
+        let mut s = session(Framing::Phone);
+        s.drift = Drift::new(48_000, TtpAdjust::Fixed(-3));
+        for h in headers(&mut s, 2) {
+            assert_eq!(timestamp(&h) >> 16, 0xfffd);
+            assert_eq!(timestamp(&h) & 0xffff, 672);
+            assert_eq!(h[4..8], [0xff, 0xfd, 0x02, 0xa0]);
+        }
+        let opts = Options {
+            ttp_adjust: TtpAdjust::Fixed(7),
+            ..Options::default()
+        };
+        let mut s = Session::open(DecoderLevel::R1, MTU, &opts).unwrap();
+        let mut buf = [0u8; 64];
+        s.start_encode(&mut buf, 0, 0).unwrap();
+        assert_eq!(buf[4..8], [0, 7, 0x02, 0xa0]);
     }
 
     #[test]

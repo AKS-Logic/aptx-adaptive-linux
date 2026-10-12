@@ -21,6 +21,9 @@
 //!   timestamp. `samples-per-packet` is the default (§7F: `0x000002a0` on every 672-sample
 //!   packet); `us` and `samples` are clocks stepping by the packet duration in µs (+14000 per
 //!   packet) or in samples (+672).
+//! - `APTX_ADAPTIVE_DRIFT_LOG=0`, in every build: don't log the drift line (see `drift`).
+//! - `APTX_ADAPTIVE_TTP_ADJUST=off|fixed:<ms>|auto`, only with `dev-replay`: the §7F latency
+//!   adjustment in the timestamp's high 16 bits (default off = 0). See `drift`.
 
 use std::ffi::OsString;
 use std::fs;
@@ -29,6 +32,7 @@ use std::path::PathBuf;
 use aptx_adaptive::{Core, Encoder, Profile, Progress, Result as CoreResult, WINDOW_SLACK};
 
 use crate::caps::SOURCE_TYPE_HOST;
+use crate::drift::{DRIFT_LOG_VAR, TTP_ADJUST_VAR, TtpAdjust};
 use crate::session::{self, Framing, TS_UNIT, TsUnit};
 
 pub const REPLAY_VAR: &str = "APTX_ADAPTIVE_REPLAY";
@@ -60,6 +64,9 @@ pub struct Options {
     /// Replaces the whole RTP SSRC.
     pub ssrc: Option<u32>,
     pub ts: TsUnit,
+    pub ttp_adjust: TtpAdjust,
+    /// Log the drift line every 10 s. Not a dev switch: read in every build.
+    pub drift_log: bool,
 }
 
 /// `APTX_ADAPTIVE_SOURCE_TYPE`, for `select_config`: [`SOURCE_TYPE_HOST`] unless overridden in
@@ -100,6 +107,8 @@ impl Default for Options {
             source_type: SOURCE_TYPE_HOST,
             ssrc: None,
             ts: TS_UNIT,
+            ttp_adjust: TtpAdjust::Off,
+            drift_log: true,
         }
     }
 }
@@ -127,9 +136,11 @@ impl Options {
                 }
             },
         };
+        let drift_log = var(DRIFT_LOG_VAR).is_none_or(|v| v != "0");
         if !dev {
             return Ok(Self {
                 framing,
+                drift_log,
                 ..Self::default()
             });
         }
@@ -170,6 +181,10 @@ impl Options {
                 }
             },
         };
+        let ttp_adjust = var(TTP_ADJUST_VAR)
+            .map(|v| TtpAdjust::parse(&v))
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             framing,
             replay,
@@ -179,6 +194,8 @@ impl Options {
             source_type,
             ssrc,
             ts,
+            ttp_adjust,
+            drift_log,
         })
     }
 
@@ -215,6 +232,9 @@ impl Options {
         }
         if self.ts != TS_UNIT {
             parts.push(format!("timestamp: {:?}", self.ts));
+        }
+        if self.ttp_adjust != TtpAdjust::Off {
+            parts.push(format!("ttp adjust: {:?}", self.ttp_adjust));
         }
         (!parts.is_empty()).then(|| format!("aptx-adaptive: {}", parts.join("; ")))
     }
@@ -345,6 +365,20 @@ mod tests {
         let e = env(&[(REPLAY_VAR, ""), (FRAMING_VAR, "phone")]);
         let o = Options::from_env(&e).unwrap();
         assert_eq!(o.replay, None);
+        assert_eq!(o.describe(&e), None);
+    }
+
+    #[test]
+    fn drift_log_switch_in_every_build() {
+        assert!(Options::from_env(env(&[])).unwrap().drift_log);
+        assert!(
+            Options::from_env(env(&[(DRIFT_LOG_VAR, "1")]))
+                .unwrap()
+                .drift_log
+        );
+        let e = env(&[(DRIFT_LOG_VAR, "0")]);
+        let o = Options::from_env(&e).unwrap();
+        assert!(!o.drift_log);
         assert_eq!(o.describe(&e), None);
     }
 
@@ -495,6 +529,27 @@ mod tests {
         assert!(Options::from_env(env(&[(TS_VAR, "ms")])).is_err());
     }
 
+    #[cfg(feature = "dev-replay")]
+    #[test]
+    fn ttp_adjust_with_feature() {
+        assert_eq!(
+            Options::from_env(env(&[])).unwrap().ttp_adjust,
+            TtpAdjust::Off
+        );
+        let e = env(&[(TTP_ADJUST_VAR, "off")]);
+        assert_eq!(Options::from_env(&e).unwrap().describe(&e), None);
+        let e = env(&[(TTP_ADJUST_VAR, "fixed:-3")]);
+        let o = Options::from_env(&e).unwrap();
+        assert_eq!(o.ttp_adjust, TtpAdjust::Fixed(-3));
+        assert_eq!(
+            o.describe(&e).as_deref(),
+            Some("aptx-adaptive: ttp adjust: Fixed(-3)")
+        );
+        let o = Options::from_env(env(&[(TTP_ADJUST_VAR, "auto")])).unwrap();
+        assert_eq!(o.ttp_adjust, TtpAdjust::Auto);
+        assert!(Options::from_env(env(&[(TTP_ADJUST_VAR, "fixed")])).is_err());
+    }
+
     #[cfg(not(feature = "dev-replay"))]
     #[test]
     fn ab_switches_ignored_without_feature() {
@@ -505,6 +560,7 @@ mod tests {
             (SOURCE_TYPE_VAR, "0"),
             (SSRC_VAR, "0xa1"),
             (TS_VAR, "samples"),
+            (TTP_ADJUST_VAR, "fixed:5"),
         ]);
         let o = Options::from_env(&e).unwrap();
         assert_eq!(o, Options::default());

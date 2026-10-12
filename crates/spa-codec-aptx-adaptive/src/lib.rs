@@ -5,6 +5,7 @@
 
 mod caps;
 mod dev;
+mod drift;
 mod ffi;
 #[cfg(test)]
 mod fixtures;
@@ -59,7 +60,7 @@ static CODEC: SyncStatic<media_codec> = SyncStatic(media_codec {
     description: ids::CODEC_DESCRIPTION.as_ptr(),
     endpoint_name: ptr::null(),
     info: ptr::null(),
-    send_buf_size: 0,
+    send_buf_size: ids::SEND_BUF_SIZE,
     duplex_codec: ptr::null(),
     stream_pkt: false,
     get_bis_config: None,

@@ -182,6 +182,9 @@ fn codec_metadata() {
         assert_eq!(CStr::from_ptr(c.description), ids::CODEC_DESCRIPTION);
     }
     assert!(c.encode.is_some() && c.decode.is_none());
+    // A bigger socket buffer than media-sink's 4 × MTU default, so a start-up stall doesn't drop packets.
+    assert_eq!(c.send_buf_size, ids::SEND_BUF_SIZE);
+    assert!(c.abr_process.is_some());
 }
 
 #[test]
