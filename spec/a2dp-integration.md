@@ -708,3 +708,36 @@ The bitstream carries no sign of the fade and the first packet is an ordinary pa
 **HQ↔LL switch fade.** The profile-switch fade uses the same 4800-frame table read backwards (a fade-out), then the start-of-stream sequence above on the new encoder. Batch 2 may refine this.
 
 **End of stream.** The reference discards the final partial period and sends nothing special: no flush, no padding, no end marker. A source sends nothing at stop; AVDTP Suspend/Close ends the stream. Optionally, pad with zeros to the next period boundary plus the filterbank delay, so the last audio plays out. The library's flush call codes an even number of buffered blocks (≥ 2) into one full-size padded packet; an odd last block, or less than one block, is never coded; with nothing pending it emits nothing.
+
+## 7J. Verified caps, tables and MTU rules (2026-10-13)
+
+Checked against primary sources. This supersedes earlier statements where they differ.
+
+**LL with an R1 sink uses the HQ bitstream.** The reference creates the encoder in LL mode (profile 6, the low-power path) only for **R2** sinks. With an R1 sink (like the Px7) it creates an **HQ encoder (bitstream config 0)** and runs it on the **LL table row**: 265 kbps, 10 ms, 480 samples per channel, 348-byte packets, LL marking (SSRC per §7H). Bitstream config 1 is never produced for an R1 sink. (codec-core §1: config 1 is used only when the reference runs the low-power path, which an R1 sink never gets.)
+
+**What a source advertises (fill_caps), and byte 6.** The low three bits of byte 6 are independent flags:
+- 0x01: set by the **sink** only. A source must never set it.
+- 0x02: the sink times playback itself. A host encoder must set this.
+- 0x04: custom AVRCP commands supported.
+
+A source always sends its own source-type bits (0x02), never the sink's. Source type doesn't depend on the rate or on R1/R2. Advertising 0 would make any sink-initiated stream silent. The §1.5 recommendation of 0x10 is stale: use 0x12 at 48 kHz.
+
+**R2 sinks.** The source sends **its own** 18-byte block, not the sink's: TTP `50 64 64 64 ff ff`, extension version 1, setup preferences `02 03 03 03`. The features low byte is the AND of both sides' features. For **R1** sinks, the sink's body 8..25 is echoed back with zero-latency bytes replaced (§7G), and body 26..39 is zeroed.
+
+**Sample rate.** For R1 sinks the encoder always runs at **48 kHz**, whatever was negotiated. Rate bits as in §7H. Never send 0x40 for 44.1 kHz (sinks read it as 192 kHz).
+
+**Samples per packet** = period × rate. The table's samples column is only right at 48 kHz (96 kHz for the 96 kHz rows). For example, a 14 ms packet at 44.1 kHz is 617 samples per channel.
+
+**MTU rule** (corrects §4).
+- The encoder's MTU is already net of the 12-byte RTP header, so the packet budget = **L2CAP MTU − 20** (875 for the Px7's 895).
+- The cap only applies to **HQ** rows. When a row's packet is larger than the budget, the new bitrate = ⌊budget·8000 / period_ms⌋ − 25000, computed from the budget **before** rounding to a multiple of 4. The **period stays the same**.
+
+**Bitrate clamps** for set-bitrate in configs 0, 1 and 4: [100000·n, 300000·n] (n = channels), with a bit-pool cap of 210000·n for config 4. The 25 % deficit drop clamps at the floor: in stereo, 265000 → 200000, not 198750.
+
+**Tables.** All HQ and LL rows (indices 0–8, levels 1–7), packet sizes and cfg bytes are confirmed. The default level is 3. Level caps apply in HQ only. The cfg byte is a packet-size class, the same for R1 and R2. R2 detection: extension byte == 1. In LL the latency state starts at 0, and latency state 3 selects the same table as state 0.
+
+**Other.**
+- Channel config 3 (split TX) only happens at 96 kHz with an R2 sink that supports it.
+- The R2.1 RSSI and latency-adjust fields are only read for R2.1 sinks.
+- TTP bytes: LL0 ms, LL1 ms, HQ in 2 ms units, TWS in 2 ms units.
+- The reference's sink-buffer minimum is 20 (the default).
