@@ -18,6 +18,10 @@
 # A/B switches (spec §7A.3), passed through to the plugin if set:
 #   APTX_ADAPTIVE_PT=<0..127>   RTP payload type (default 96)
 #   APTX_ADAPTIVE_NOSWAP=1      don't 16-bit swap the payload
+#   APTX_ADAPTIVE_SCMST=1       put the 1-byte SCMS-T header (default 0x02, copy free) after
+#                               the RTP header. Only for a sink configured with SCMS-T, which
+#                               stock bluetoothd never does (see .scratch/scmst-test.sh)
+#   APTX_ADAPTIVE_SCMST_BYTE=0x00  the SCMS-T byte to send instead
 # e.g. APTX_ADAPTIVE_PT=0 scripts/dev-replay.sh ttp-clock-offset sine1k.r2.bin
 #
 # Doesn't restart anything or touch the headset; it prints the commands for that.
@@ -53,7 +57,7 @@ Environment="APTX_ADAPTIVE_REPLAY=$vector"
 Environment="APTX_ADAPTIVE_FRAMING=$framing"
 EOF
 extra=
-for var in APTX_ADAPTIVE_PT APTX_ADAPTIVE_NOSWAP; do
+for var in APTX_ADAPTIVE_PT APTX_ADAPTIVE_NOSWAP APTX_ADAPTIVE_SCMST APTX_ADAPTIVE_SCMST_BYTE; do
 	if [[ -n ${!var-} ]]; then
 		echo "Environment=\"$var=${!var}\"" >>"$dropin"
 		extra+=", $var=${!var}"

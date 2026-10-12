@@ -77,6 +77,9 @@ pub struct Session<C> {
     framing: Framing,
     payload_type: u8,
     swap: bool,
+    /// DEV ONLY: an SCMS-T content protection byte between the RTP header and the payload.
+    scmst: Option<u8>,
+    /// What's left of the MTU after the SCMS-T byte.
     mtu: usize,
     pcm: Vec<i32>,
     /// Packets sent so far; drives the TTP clock.
@@ -101,6 +104,7 @@ impl Session<AnyCore> {
     /// Whatever the encoder rejects, `NoSpace` if the MTU can't fit a packet, or `BadDevSetting` if the replay file can't be used (the reason
     /// goes to stderr).
     pub fn open(level: DecoderLevel, mtu: usize, opts: &Options) -> Result<Self, SessionError> {
+        let mtu = mtu.saturating_sub(usize::from(opts.scmst.is_some()));
         let config = config(level);
         let row = table_row(config, budget(opts.framing, mtu))?;
         let core = match &opts.replay {
@@ -117,6 +121,7 @@ impl Session<AnyCore> {
         let mut s = Self::with_stream(Stream::with_core(core, config, row), opts.framing, mtu)?;
         s.payload_type = opts.payload_type;
         s.swap = opts.swap;
+        s.scmst = opts.scmst;
         Ok(s)
     }
 }
@@ -155,6 +160,7 @@ impl<C: Core> Session<C> {
             framing,
             payload_type: RTP_PAYLOAD_TYPE,
             swap: true,
+            scmst: None,
             mtu,
             packets: 0,
         })
@@ -197,7 +203,8 @@ impl<C: Core> Session<C> {
     )]
     pub fn abr_process(&mut self, _unsent: usize) {}
 
-    /// Writes the RTP header (and the aptX header if it's a prefix) and returns its length.
+    /// Writes the RTP header (and the SCMS-T byte and the aptX header if they're a prefix) and
+    /// returns its length.
     ///
     /// # Errors
     /// `NoSpace` if `dst` can't hold the header.
@@ -208,7 +215,8 @@ impl<C: Core> Session<C> {
         timestamp: u32,
     ) -> Result<usize, SessionError> {
         let len = header_len(self.framing);
-        let h = dst.get_mut(..len).ok_or(SessionError::NoSpace)?;
+        let cp = usize::from(self.scmst.is_some());
+        let h = dst.get_mut(..len + cp).ok_or(SessionError::NoSpace)?;
         let aptx = self.stream.header();
         h[0] = 2 << 6;
         h[1] = self.payload_type;
@@ -232,10 +240,14 @@ impl<C: Core> Session<C> {
             Framing::HeaderAfterRtp => {
                 h[4..8].copy_from_slice(&timestamp.to_be_bytes());
                 h[8..12].copy_from_slice(&RTP_SSRC.to_be_bytes());
-                h[12..].copy_from_slice(&aptx);
+                h[12..len].copy_from_slice(&aptx);
             }
         }
-        Ok(len)
+        if let Some(b) = self.scmst {
+            h.copy_within(RTP_HEADER_LEN..len, RTP_HEADER_LEN + 1);
+            h[RTP_HEADER_LEN] = b;
+        }
+        Ok(len + cp)
     }
 
     /// Takes one block of interleaved native-endian `S24_32` PCM and writes a packet to `dst`
@@ -492,6 +504,59 @@ mod tests {
         };
         let s = Session::open(DecoderLevel::R1, MTU, &opts).unwrap();
         assert_eq!((s.payload_type, s.swap), (0, false));
+    }
+
+    /// The SCMS-T byte goes right after the RTP header and comes out of the MTU budget.
+    #[test]
+    fn scmst_byte_after_rtp_header() {
+        let path = vector("sine1k.r1.bin");
+        for (framing, header) in [(Framing::Phone, 12), (Framing::HeaderAfterRtp, 20)] {
+            let opts = Options {
+                framing,
+                replay: Some(path.clone()),
+                scmst: Some(0x02),
+                ..Options::default()
+            };
+            let mut s = Session::open(DecoderLevel::R1, MTU, &opts).unwrap();
+            let src = vec![0u8; s.block_size()];
+            let mut buf = vec![0xffu8; 2048];
+            let len = s.start_encode(&mut buf, 1, 0).unwrap();
+            assert_eq!(len, header + 1);
+            assert_eq!(buf[..2], [0x80, 0x60]);
+            assert_eq!(buf[12], 0x02);
+            if framing == Framing::HeaderAfterRtp {
+                assert_eq!(buf[13..21], [0x1f, 0x63, 0x38, 0x01, 0, 0, 0, 0xae]);
+            }
+            let r = s.encode(&src, &mut buf[len..]).unwrap();
+            assert_eq!(r.written, 656);
+            assert_eq!((buf[len], buf[len + 1], buf[len + 3]), (0x81, 0x00, 0xa1));
+            assert_eq!(
+                s.start_encode(&mut [0; 12], 0, 0),
+                Err(SessionError::NoSpace)
+            );
+        }
+        // At an MTU that just fits, the byte shrinks the packet.
+        let opts = |scmst| Options {
+            scmst,
+            ..Options::default()
+        };
+        let row = |o: &Options| {
+            Session::open(DecoderLevel::R1, 600, o)
+                .unwrap()
+                .stream
+                .row()
+                .packet_bytes
+        };
+        assert_eq!(row(&opts(None)), 588);
+        let smaller = row(&opts(Some(0)));
+        assert!(smaller < 588);
+        let mut s = Session::open(DecoderLevel::R1, 600, &opts(Some(0))).unwrap();
+        let src = vec![0u8; s.block_size()];
+        let mut buf = vec![0u8; 2048];
+        let len = s.start_encode(&mut buf, 0, 0).unwrap();
+        let r = s.encode(&src, &mut buf[len..]).unwrap();
+        assert_eq!(len + r.written, 13 + smaller);
+        assert!(len + r.written <= 600);
     }
 
     #[test]

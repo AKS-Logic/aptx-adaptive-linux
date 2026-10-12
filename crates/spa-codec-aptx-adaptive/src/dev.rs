@@ -9,6 +9,10 @@
 //!   and `header-in-rtp-swapped`.
 //! - `APTX_ADAPTIVE_PT=0..127`, only with `dev-replay`: the RTP payload type.
 //! - `APTX_ADAPTIVE_NOSWAP=1`, only with `dev-replay`: send the payload without the 16-bit swap.
+//! - `APTX_ADAPTIVE_SCMST=1`, only with `dev-replay`: put a 1-byte SCMS-T content protection
+//!   header right after the RTP header, for a sink configured with SCMS-T (needs a bluetoothd that
+//!   puts Content Protection in Set Configuration). The byte is [`SCMST_COPY_FREE`] unless
+//!   `APTX_ADAPTIVE_SCMST_BYTE=0x..` overrides it.
 
 use std::ffi::OsString;
 use std::fs;
@@ -22,6 +26,13 @@ pub const REPLAY_VAR: &str = "APTX_ADAPTIVE_REPLAY";
 pub const FRAMING_VAR: &str = "APTX_ADAPTIVE_FRAMING";
 pub const PT_VAR: &str = "APTX_ADAPTIVE_PT";
 pub const NOSWAP_VAR: &str = "APTX_ADAPTIVE_NOSWAP";
+pub const SCMST_VAR: &str = "APTX_ADAPTIVE_SCMST";
+pub const SCMST_BYTE_VAR: &str = "APTX_ADAPTIVE_SCMST_BYTE";
+
+/// The A2DP content protection header for SCMS-T: bit 0 is the L-bit, bit 1 the Cp-bit (Bluetooth
+/// Assigned Numbers, A/V content protection, note 3). Cp = 1, L = 0 is "copy freely", what
+/// Android sends when it doesn't restrict copying.
+pub const SCMST_COPY_FREE: u8 = 0x02;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
@@ -29,6 +40,8 @@ pub struct Options {
     pub replay: Option<PathBuf>,
     pub payload_type: u8,
     pub swap: bool,
+    /// The SCMS-T header byte to send after the RTP header, if any.
+    pub scmst: Option<u8>,
 }
 
 impl Default for Options {
@@ -38,6 +51,7 @@ impl Default for Options {
             replay: None,
             payload_type: session::RTP_PAYLOAD_TYPE,
             swap: true,
+            scmst: None,
         }
     }
 }
@@ -81,11 +95,23 @@ impl Options {
                 .ok_or_else(|| format!("{PT_VAR}={} is not 0..127", v.display()))?,
         };
         let swap = var(NOSWAP_VAR).is_none_or(|v| v != "1");
+        let scmst = match var(SCMST_VAR) {
+            Some(v) if v == "1" => Some(match var(SCMST_BYTE_VAR) {
+                None => SCMST_COPY_FREE,
+                Some(b) => b
+                    .to_str()
+                    .and_then(|s| s.strip_prefix("0x"))
+                    .and_then(|s| u8::from_str_radix(s, 16).ok())
+                    .ok_or_else(|| format!("{SCMST_BYTE_VAR}={} is not 0x00..0xff", b.display()))?,
+            }),
+            _ => None,
+        };
         Ok(Self {
             framing,
             replay,
             payload_type,
             swap,
+            scmst,
         })
     }
 
@@ -110,6 +136,9 @@ impl Options {
         }
         if !self.swap {
             parts.push("payload swap: off".to_owned());
+        }
+        if let Some(b) = self.scmst {
+            parts.push(format!("SCMS-T header: {b:#04x}"));
         }
         (!parts.is_empty()).then(|| format!("aptx-adaptive: {}", parts.join("; ")))
     }
@@ -301,10 +330,28 @@ mod tests {
         assert!(Options::from_env(env(&[(PT_VAR, "x")])).is_err());
     }
 
+    #[cfg(feature = "dev-replay")]
+    #[test]
+    fn scmst_with_feature() {
+        let e = env(&[(SCMST_VAR, "1")]);
+        let o = Options::from_env(&e).unwrap();
+        assert_eq!(o.scmst, Some(0x02));
+        assert_eq!(
+            o.describe(&e).as_deref(),
+            Some("aptx-adaptive: SCMS-T header: 0x02")
+        );
+        let o = Options::from_env(env(&[(SCMST_VAR, "1"), (SCMST_BYTE_VAR, "0x00")])).unwrap();
+        assert_eq!(o.scmst, Some(0));
+        let o = Options::from_env(env(&[(SCMST_VAR, "0"), (SCMST_BYTE_VAR, "0x01")])).unwrap();
+        assert_eq!(o.scmst, None);
+        assert!(Options::from_env(env(&[(SCMST_VAR, "1"), (SCMST_BYTE_VAR, "2")])).is_err());
+        assert!(Options::from_env(env(&[(SCMST_VAR, "1"), (SCMST_BYTE_VAR, "0x100")])).is_err());
+    }
+
     #[cfg(not(feature = "dev-replay"))]
     #[test]
     fn ab_switches_ignored_without_feature() {
-        let e = env(&[(PT_VAR, "0"), (NOSWAP_VAR, "1")]);
+        let e = env(&[(PT_VAR, "0"), (NOSWAP_VAR, "1"), (SCMST_VAR, "1")]);
         let o = Options::from_env(&e).unwrap();
         assert_eq!(o, Options::default());
         assert_eq!(o.describe(&e), None);
