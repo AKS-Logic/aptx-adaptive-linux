@@ -410,11 +410,13 @@ If the total exceeds Cap bytes, the first Cap bytes go into this packet and the 
 
 When Pd = 1, the single pad byte is 0x00.
 
-**Frames per packet (observed encoder policy).**
+**Frames per packet (encoder policy, see §8.0 and §8.1).**
 
 - Every frame except the packet's last has exactly 64 blocks.
-- The last frame has 8, 16, 32, 48 or 64 blocks.
+- The last frame has any even number of blocks from 2 to 64. Either the frame-size rule (§8.1) chose 8, 16, 32, 48 or 64 and closed the packet, or the period-end flush call coded a partial frame (for example 40 blocks at 364 kbps / 656 B, which is what every packet in `tests/vectors/r2/*.r1.bin` ends with).
 - A frame's bits may run past the packet end. The overflow is the next packet's continuation.
+
+The earlier statement that the last frame is always 8, 16, 32, 48 or 64 blocks was incomplete: that set only applies when the encoder closes the packet itself.
 
 A decoder cannot read the block count of the last frame directly. It is implied by where the data ends, or by the zero-allocation escape (§7.2). An encoder must therefore close each packet's last frame exactly where the payload ends (packet end or continuation end). The policy that picks the last frame's size from the remaining byte budget is described in §8. It is **not** needed for decodability.
 
@@ -491,45 +493,280 @@ The parameters by allocation:
 
 ---
 
-## 8. Encoder-side decisions (NOT bit-exact specified)
+## 8. Encoder-side decisions: frame sizing and bit allocation [VERIFIED]
 
-Two things are free encoder choices. A decoder needs no particular choice, so any choice gives a valid stream. Matching the reference byte for byte does require them. The vectors supply both as inputs.
+These are encoder choices; a decoder does not depend on them. Following this section exactly takes a model from raw PCM to packets that are byte-identical to the reference encoder, with no allocations or frame sizes supplied from outside.
 
-### 8.1 Frame size of the last frame in a packet — UNCERTAIN
+**Verification.** Every run below was byte-identical: 4,149 packets from the per-packet loop of `a2dp-integration.md` §5, plus 126 stage-vector packets driven as described in §8.7.
 
-1. Compute the bits still available in the packet. This uses the packet writer's remaining space, the bytes held back for continuation, and a padding history capped at 30.
-2. If nothing is left, use 8 blocks.
-3. Otherwise divide the available bits by an estimated bits-per-block and quantise the result:
+| config | runs |
+|---|---|
+| config 0 | `tests/vectors/r2/*.r1.bin` (noise, sine1k, silence; 364 kbps, 656 B). Five more HQ table rows on a mixed noise, tones and silence signal: 281k/864, 318k/768 and 427k/576 samples per packet at 656 B; 290k/960 and 430k/624 at 760 B. |
+| config 1 | five LL table rows, 214k to 320k, at 348 and 560 B |
+| config 3 | `tests/vectors/r2/*.r2.bin`, plus 420k/660 B and 500k/760 B at 48 kHz, and 420k/660 B and 570k/960 B at 96 kHz |
 
-   | estimate (blocks) | frame size |
-   |---|---|
-   | < 8 | 8 |
-   | 8–15 | 16 |
-   | 16–31 | 32 |
-   | 32–47 | 48 |
-   | ≥ 48 | 64 |
+Only the `tests/vectors/` runs are available on the clean side; the other table rows were checked by the spec side and have no vectors here.
 
-4. In constant-bitrate mode (UNCERTAIN: believed to be when the create flag is 0) a second estimate can lower it further. It is rounded down to an even number.
+Input was fed in 48-, 672- and 1000-frame chunks. The output does not depend on chunking.
 
-The full rate-control loop is not specified.
+**Tables:** `spec/tables/allocator.json`. It replaces the earlier informative `allocator_hints.json`; every value carried over is unchanged.
 
-### 8.2 Bit allocation — UNCERTAIN, informative only
+### 8.0 Why packets end "64 + 64 + 40"
 
-This is the reference structure as understood, not verified:
+The encoder does not decide the size of a packet's last frame on its own; the wrapper's **period** does. At 364 kbps / 656 B the wrapper supplies 672 samples per channel per packet, which is 168 four-sample blocks.
 
-1. **Bit pool.** A pool of bits per block is derived from the bitrate. It is capped by a per-band maximum table chosen by bitrate (the `max_bits_*` tables in `spec/tables/allocator_hints.json`). For example, config 3 at 48k above about 520 kbps allows 16 bits per band, while about 420 kbps caps at 9.
-2. **Scale factors.** Per band, the scale factor is roughly `ceil(log2(max |x| over the frame))` in the 24-bit domain.
-3. **Bit need.** `need = ⌈(sf − offset[band]) / 2⌉`, using the `offset_*` tables; a zero sf gives −5.
-4. **Water-fill.** A water-filling search finds the threshold that uses up the pool.
-5. **Distribution.** Allocations of 0 and ≥ 2 are handed out (never 1), with a special path for digital silence.
+1. The frame-size rule (§8.1) asks for 64-block frames. The encoder codes 64, then another 64.
+2. The third 64-block frame is only 40 blocks full when the period's input runs out.
+3. The wrapper then makes the flush call (no input). The flush codes the **incomplete** frame with however many blocks it holds (40) and closes the packet.
 
-A clean-room encoder can use any allocator that:
+So the last frame of a packet is one of two things:
 
-- keeps each allocation in {0, 2..16};
-- respects the per-band maxima;
-- fits the packet byte budget.
+- a frame sized by §8.1 (8, 16, 32, 48 or 64 blocks), which closes the packet itself; or
+- whatever even number of blocks has been analysed when the flush arrives.
 
-Silence in the reference gives allocations of 4/4/4/3 (config 0) or all 0 (config 3).
+Any even count from 2 to 64 can therefore appear (§7.1). Analysis only ever takes an even number of blocks from the input (§8.1 step 2), so a flush never finds an odd block; any leftover input stays unconsumed and is passed again in the next call.
+
+### 8.1 Encoder state machine (standard A2DP packet format, create flag = 1)
+
+This describes the encoder with the create flag of `a2dp-integration.md` §3.1 set to 1, which is the only value the reference wrapper uses.
+
+**State.**
+
+| item | meaning | initial value |
+|---|---|---|
+| carry | bytes that overflowed the previous packet | none |
+| `pad_hist` | smoothed padding, in bytes | 0 |
+| `pad1`, `pad2` | padding byte counts of the last and second-last packets | 0, 0 |
+| `ov_hist` | smoothed carry-over, in bytes | 0 |
+| `ov_prev` | the previous packet's carry length | 0 |
+| `P_est` | bit pool per block from the most recent allocation (§8.2) | the pool computed at create time from the configured bitrate |
+| `nominal` | the bitrate set at create time or by the set-bitrate operation | the create bitrate |
+| `target` | the rate-controlled bitrate (§8.1a) | `nominal` |
+| `A`, `Ap`, `Bq`, `Bp` | rate-check filter state (§8.1a) | all equal to `nominal` |
+| current frame | blocks analysed but not yet coded | none |
+| current packet | the open packet's bit writer, or none | none |
+
+**Encode call with input.** Repeat these steps:
+
+1. Evaluate the frame-size rule (below) to get a requested block count `req` and a `close` flag. This is re-evaluated on **every** iteration, including when a frame is already partly analysed.
+2. Analyse whole blocks into the current frame until it holds `req` blocks, taking only an even number of blocks from the available input. A block is S stereo sample frames, S = 4 or 8. If the input runs out first, return the number of samples consumed and no packet.
+3. Code the frame (§8.2 to §8.6, then §5, §6 and §7). If no packet is open, open one first:
+   1. Update the carry history: `ov_hist = (410·(ov_hist + ov_prev) + 205·len(carry)) >> 10`, then `ov_prev = len(carry)`.
+   2. Start the payload with the continuation field and the carried bytes (§7.1).
+   3. **After** the first frame of the new packet is coded, update the padding history: `pad2 = pad1`, `pad1 = padding of the packet just finished`, then `pad_hist = (410·(pad_hist + pad2) + 205·pad1) >> 10`. The ordering matters: the frame-size rule for that first frame still sees the old `pad_hist`, while the new `ov_hist` is already in place.
+4. If `close` is set, or `floor(bits_written / 8) ≥ Lp − 3`, close the packet (§7.1 padding and carry split), run the rate check (§8.1a), and return the packet.
+
+**Flush call (no input).** Code the current partial frame if it holds any blocks, then close the packet, run the rate check (§8.1a), and return the packet.
+
+**Frame-size rule.** All quantities are in bytes, signed.
+
+1. Work out the space left and the amount to hold back:
+   - If no packet is open: `space = Lp − 3 − len(carry)` and `hold = len(carry) + ov_hist`. The carry is deliberately counted **twice**; that is what the reference does.
+   - If a packet is open: `space = Lp − 3 − floor(bits_written / 8)` and `hold = ov_hist`. Here bits_written includes the continuation field and the carried bytes.
+2. `v = space − hold + min(pad_hist, 30)`.
+3. If `v < 0`, the result is 8 blocks, close.
+4. Otherwise let `x = 8·v`. If `target > nominal`, let `k = floor(nominal / (target − nominal))`, and if `k ≠ 0` add `floor(x / k)` to x.
+5. `n = floor(x / P_est)`, and the result is:
+
+   | n | blocks | close the packet? |
+   |---|---|---|
+   | ≥ 64 | 64 | no, keep it open |
+   | ≤ 7 | 8 | yes |
+   | 8 to 15 | 16 | yes |
+   | 16 to 31 | 32 | yes |
+   | 32 to 47 | 48 | yes |
+   | 48 to 63 | 64 | yes |
+
+**UNCERTAIN**, never active in the verified runs: with the create flag set to 0, a constant-bitrate clamp further limits the frame size. The reference wrapper always uses flag 1.
+
+#### 8.1a Rate check
+
+This runs once after every packet is closed (by the frame-size rule, by a full payload, or by a flush). Inputs:
+
+- `W = floor(bits_written / 8) + 3 − carry_in`, where `carry_in` is the number of carried bytes this packet **started** with;
+- `pad`, this packet's padding bytes;
+- `nb`, the number of blocks coded into this packet.
+
+All arithmetic here is unsigned 32-bit, and `>>` is a logical shift.
+
+1. `q = floor(2·fs / (S·nb))`, then `pps = (q & 1) + (q >> 1)`. This is the packet rate per second, rounded.
+2. `A_new = (410·(Ap + A) + 1640·(W + pad)·pps) >> 10`, then `Ap = A` and `A = A_new`.
+3. `B_new = (410·(Bp + Bq) + 1640·W·pps) >> 10`, then `Bp = Bq` and `Bq = B_new`.
+4. Choose `m`: if `A_new > nominal`, `m = A_new`; otherwise `m = max(A_new, B_new)`.
+5. `v = nominal − m + target`.
+6. Set `target`:
+   - if `nominal > v`: `target = nominal`;
+   - otherwise, for config 3: `target = min(v, (5·nominal) >> 2)`;
+   - otherwise (configs 0 and 1): `target = v`.
+
+`target` feeds the frame-size rule (above), the bit pool (§8.2) and the max-bits table choice (§8.3). `nominal` only feeds the frame-size rule and the clamps.
+
+**Set-bitrate operation** (the wrapper calls it after every packet, `a2dp-integration.md` §5 step 7):
+
+1. Clamp the requested bitrate b to the range derived at create time:
+   - configs 0 and 1: [100000·nch, 300000·nch];
+   - config 3: [90000, 500000·nch].
+2. Set `nominal = target = b` and `A = Ap = Bq = Bp = b`.
+
+This resets the filter. Under the wrapper loop, therefore, the rate check only acts within one packet, and it changes the next packet's sizing only when the set-bitrate operation is not called in between.
+
+The stage vectors (encoder called once per packet with all remaining input, no flush, no set-bitrate call) need §8.1a to reproduce. The `tests/vectors/r2` runs do not.
+
+**Wrapper loop.** This is the per-packet loop of `a2dp-integration.md` §5, restated in terms of the calls above. P is the number of samples per channel per packet.
+
+1. Call encode with all buffered input.
+2. If the period (P plus the deficit) has not been reached and no packet came out, wait for more input.
+3. Otherwise:
+   - if no packet came out, make the flush call;
+   - add P minus the samples consumed to the deficit;
+   - call set-bitrate with `table_bitrate − floor(table_bitrate / 4)` if the deficit is above 96 interleaved samples (48 sample frames), otherwise with the table bitrate.
+
+### 8.2 Bit pool per block
+
+Clamp the current **target** bitrate R (bit/s for the whole stream, §8.1a):
+
+| config | clamp range |
+|---|---|
+| configs 0 and 1 | [100000·nch, 350000·nch] |
+| config 3 | [90000, 550000·nch] |
+| config 4 (UNCERTAIN) | [100000·nch, 210000·nch] |
+
+Here nch is the channel count of the group (2 for stereo). The lower clamp for config 3 is not scaled by nch. Note that this clamp is wider than the set-bitrate clamp of §8.1a, so it only matters when `target` has risen above `nominal`.
+
+The pool, in bits per block for both channels together, is
+
+`P = floor(R / fs)·S + floor((R mod fs)·S / fs)`.
+
+Examples: config 0 at 364 kbps / 48 kHz gives 30; config 1 at 265 kbps gives 22; config 3 at 420 kbps gives 70.
+
+**Alternate flag.** Config 3 with a 2-channel group and R ≤ 179999 sets an "alternate" flag; any other case clears it. The flag only changes the digital-black step (§8.6 step 5) and makes the 96 kHz allocator unusable. Such bitrates are below every wrapper table row, so this path is **UNCERTAIN** and not covered.
+
+### 8.3 Max-bits table
+
+Let `r` be the clamped target R of §8.2 (not the nominal rate), or 2R for mono. The tables are the `max_bits_*` entries of `spec/tables/allocator.json`; each has 2·S entries, channel 0 bands then channel 1 bands. The result is the per-band ceiling `maxb[i]`.
+
+**S = 4 (configs 0 and 1):**
+
+| r | table |
+|---|---|
+| ≤ 319999 | `max_bits_4band_320` |
+| ≤ 369999 | `max_bits_4band_370` |
+| otherwise | `max_bits_4band_max` |
+
+`max_bits_4band_250` is present in the reference but never selected. Because the largest 4-band ceiling is 9, configs 0 and 1 never allocate more than 9 bits, so the reduced allocation in §7.2 is at most 8.
+
+**S = 8 at 44.1 / 48 kHz:**
+
+| r | table |
+|---|---|
+| ≤ 249999 | `max_bits_8band_250` |
+| ≤ 319999 | `max_bits_8band_320` |
+| ≤ 369999 | `max_bits_8band_370` |
+| ≤ 419999 | `max_bits_8band_420` |
+| ≤ 519999 | `max_bits_8band_520` |
+| otherwise | `max_bits_8band_max` |
+
+**S = 8 at 88.2 / 96 kHz:**
+
+| r | table |
+|---|---|
+| ≤ 419999 | `max_bits_8band_96k_420` |
+| ≤ 499999 | `max_bits_8band_96k_500` |
+| ≤ 599999 | `max_bits_8band_96k_600` |
+| ≤ 649999 | `max_bits_8band_96k_650` |
+| otherwise | `max_bits_8band_96k_max` |
+
+**Tonal override.** If the tonal flag (§8.4) is set, config 3 uses `max_bits_8band_max` at 44.1 / 48 kHz and `max_bits_8band_96k_max` at 88.2 / 96 kHz, whatever the rate. This override table is also the `maxb` used by §8.5 and §8.6.
+
+### 8.4 Scale factors, tonal flag and bit need
+
+Everything here is per frame, over all of the frame's blocks. Band index i runs over channel 0 bands 0..S−1, then channel 1 bands.
+
+**Scale factor** `sf[i]`:
+
+1. For every subband value x of band i in the frame (the filterbank output, §3), take `a = |x|` as an unsigned 32-bit value, so |−2^31| = 2^31.
+2. Compute `j = min((a·2^24 + 2^31) >> 32, 2^31 − 1)`, using 64-bit arithmetic. This is `a/256`, rounded.
+3. Start with `lim = 2` and `c = 0`. While `j > lim`, double `lim` and add 1 to `c`.
+4. `sf[i]` is the largest c over all values in the band. It is 0 for a band of zeros or of very small values.
+
+**Tonal flag** (S = 8 only; it is always clear when S = 4):
+
+1. For each channel, let `mx` and `mn` be the largest and smallest sf among that channel's bands.
+2. The flag is set if, for either channel, `mx − mn > 10` and at least 6 of its 8 bands have `sf < mx − 10`.
+
+(The reference's rule is phrased as "more than 4 low bands sets the flag unless more than 2 bands are high"; with 8 bands it reduces to the rule above.)
+
+**Offset table.** Let `rate_idx` be 0, 1, 2, 3 or 4 for fs ≤ 16000, ≤ 32000, ≤ 44100, ≤ 48000, or higher. The table depends on the create-parameter channel config (`a2dp-integration.md` §3.1). Normal stereo is channel config 4, and it uses the **dual-mono** tables.
+
+| S | channel config | table (`spec/tables/allocator.json`) | row start |
+|---|---|---|---|
+| 4 | 2 | `offset_4band_stereo` | 8·rate_idx |
+| 4 | anything else | `offset_4band_dual_mono` | 8·rate_idx |
+| 8 | 2 | `offset_8band_stereo` | 16·rate_idx |
+| 8 | anything else, tonal flag set | `offset_8band_dual_mono_tone` | 16·rate_idx |
+| 8 | anything else, tonal flag clear | `offset_8band_dual_mono` | 16·rate_idx |
+
+Let `off[i]` be the table entry at row start + i.
+
+**Bit need:**
+
+- If `sf[i] = 0`, `need[i] = −5`.
+- Otherwise let `d = sf[i] − off[i]`. If d > 0, `need[i] = (d + 1) >> 1`; otherwise `need[i] = d`.
+- Let `M = max(0, largest need[i])`.
+
+### 8.5 Water level ("bit slice")
+
+Inputs: the pool P (§8.2), `need[]` and `maxb[]`. Start with `L = M + 1`, `acc = 0` and `prev = 0`.
+
+- If `M ≤ −12`, the slice is `L − 1` when P = 0, otherwise `L`. (With M clamped at 0 above, this branch cannot be taken; it is kept for completeness.)
+- Otherwise repeat:
+  1. Let `cnt` be the number of bands with `need[i] > L` and `maxb[i] + L − 1 > need[i]`, plus 2 for each band with `need[i] = L`.
+  2. Add `prev` to `acc`.
+  3. Stop if `cnt + acc ≥ P`, or if `L ≤ −10`.
+  4. Otherwise set `prev = cnt`, subtract 1 from L, and repeat.
+- After the loop, add `cnt` to `acc`. The slice is `sl = L − 1` if `acc ≠ P`, or `sl = L − 2` if `acc = P`.
+
+### 8.6 Distribution
+
+The output `out[i]` is the frame's allocation B[i] (§5, §7).
+
+**1. Start.** Set every `out[i] = 0`, then `out[0] = 2` and, for 2 channels, `out[S] = 2`. Set `tot = 0`. Then for each band i in index order:
+
+- if `need[i] ≥ sl + 2`, set `out[i] = min(need[i] − sl, maxb[i])`;
+- set `out[i] = max(out[i], minb[i])`, where `minb` is all zeros for music;
+- add `out[i]` to `tot`.
+
+**2. First fill** (only if `tot < P`). For band k = 0..S−1, and within that for each channel in order (so channel 0 band k, then channel 1 band k):
+
+- if `out > 1` and `maxb > out`, add 1 to `out` and to `tot`;
+- otherwise, if `need = sl + 1`, `P > tot + 1` and `maxb > 0`, set `out = 2` and add 2 to `tot`. This can lower an existing value of `out` without adjusting `tot` for the old value; that is faithful to the reference.
+- Stop as soon as `tot ≥ P`.
+
+**3. Second fill** (only if still `tot < P`). Visit i = 0, 1, …, 2S−1, 0, 1, … for at most 32 visits in total:
+
+- if `out[i] > 1` and `maxb[i] > out[i]`, add 1 to `out[i]` and to `tot`;
+- otherwise, if `out[i] = 0` and `maxb[i] > 0`, set `out[i] = 2` and add 2 to `tot`;
+- stop as soon as `tot ≥ P`.
+
+**4. Trim** (only if `tot > P`). For i = 2S−1 down to 0: if `out[i] > 2`, subtract 1 from `out[i]` and from `tot`. Stop as soon as `tot ≤ P`. A single pass only.
+
+**5. Digital black** (config 3 only):
+
+1. Let `s0` and `s1` be the sums of `out[i]` over the channel 0 and channel 1 bands whose `sf[i] ≠ 0`.
+2. Set `out[i] = 0` wherever `sf[i] = 0`. If `s0 + s1 = 0`, stop here (the frame is all zero, which uses the zero-allocation escape of §7.2).
+3. With the alternate flag (§8.2) clear: if `s1 = 0`, set `out[S] = 2`; if `s0 = 0`, set `out[0] = 2`. Add these to the total.
+4. **UNCERTAIN** (derived but never triggered in testing): if the total is now between 1 and 6, spend `7 − total` extra bits, first on bands with `out > 0`, raising each towards its `maxb`, then on all bands in index order. A band that would end on 1 is raised to 2, which costs one more bit.
+
+`out[i]` is never 1. (The configs 0/1 codebook substitution in §7.4 is a bitstream detail and does not change the allocation.)
+
+As a cross-check, these rules give silence allocations of 4/4/4/3 per channel on config 0 at 364 kbps (pool 30, slice −8, then the first fill) and all zero on config 3, matching what was observed.
+
+### 8.7 Notes for implementers
+
+- A frame's allocation uses only that frame's subband samples: the filterbank output for all of its blocks, computed before quantisation.
+- `P_est` in the frame-size rule is the pool from the **previous** allocation (initially the create-time pool), so a bitrate change reaches frame sizing one frame late.
+- Stage-vector `packets.bin` streams totalling 126 packets were also reproduced from raw PCM, driving the encoder with all remaining input per call, no flush and no set-bitrate call; this exercises the rate check (§8.1a). The spec side reports five stage runs, but `tests/vectors/stages/` has six; see QUESTIONS.md "from codec-core allocator" item 1.
+- With §8 implemented, the `frames.json` allocations and block counts in the stage vectors become a check on the allocator rather than a required input.
 
 ---
 
@@ -544,7 +781,7 @@ Silence in the reference gives allocations of 4/4/4/3 (config 0) or all 0 (confi
 | codewords | ✔ | ✔ | ✔ | ✔ |
 | packet header, continuation, padding | ✔ | ✔ | ✔ | ✔ |
 | end to end, given allocations and frame sizes | ✔ (48k, 44.1k) | ✔ | ✔ (48k, 44.1k) | ✔ (96k, 88.2k) |
-| bit allocation / frame-size policy | ✘ | ✘ | ✘ | ✘ |
+| bit allocation, frame sizing and rate check, raw PCM → packets (§8) | ✔ (r2 R1 vectors + 5 table rows) | ✔ (5 LL table rows) | ✔ (r2 R2 vectors + 2 rows) | ✔ (2 rows) |
 
 Out of scope / not done:
 
@@ -554,4 +791,4 @@ Out of scope / not done:
 - joint stereo
 - metadata chunks
 - the voice / true-wireless packet formats
-- end-of-stream flush behaviour
+- end-of-stream flush behaviour (the per-packet flush call of §8.1 is covered; a final drain at stream end is not)

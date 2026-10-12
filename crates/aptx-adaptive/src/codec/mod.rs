@@ -44,7 +44,7 @@ struct Descriptor {
     /// Zero taps per band, 0 = predictor off (§6), at 44.1/48 and 88.2/96 kHz.
     taps: [&'static [usize]; 2],
     /// (above kbps, caps) from the highest threshold down, then the floor, at 44.1/48 and
-    /// 88.2/96 kHz (`allocator_hints.json`, informative).
+    /// 88.2/96 kHz (`spec/tables/allocator.json`, §8.3).
     max_bits: [&'static [(u32, &'static [u8])]; 2],
 }
 
