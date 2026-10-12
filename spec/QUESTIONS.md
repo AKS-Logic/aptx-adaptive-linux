@@ -33,3 +33,13 @@
 - header-in-rtp (8 header bytes as RTP timestamp + SSRC, payload type 96): headset stays connected, no disconnect sound, **silence**
 - header-after-rtp (12-byte RTP header, then the 8 header bytes): headset plays its **disconnect sound** and stays silent, though the BT link stays up
 - conclusion: the transport layout is probably header-in-rtp, but the sink isn't decoding the payload. Open: whether the 16-bit swap direction is right, the TTP/header values, a start-of-stream sync or resync requirement, and payload type.
+
+## from codec-core
+
+1. Config 4 (R2 low latency): the 128-tap prototype in `tables/filterbank_8band_prototype_128.json` and its predictor mode are unverified. Not needed for the Px7 S2e, but needed for R2 LL sinks. (§1, §3.2)
+2. Config 0 with the low-power create option set would use 12-tap coefficients with a 16-long delay line and different read positions. Can this happen via the normal wrapper, and if so what are the exact read positions? (§3.1)
+3. 4-band allocation header bit 4 ("create-parameter channel config equals 2"): never observed. What channel config sets it, and does it change anything else in the stream? (§7.2)
+4. Last-frame size policy (§8.1): how is the bits-per-block estimate computed, what exactly is the "padding history capped at 30", and what is the second constant-bitrate estimate? Is constant-bitrate mode really tied to the create flag being 0?
+5. Bit allocator (§8.2): unverified. Exact bit-pool formula from bitrate, bitrate thresholds for picking the `max_bits_*` table, scale-factor definition, and the digital-silence path (which gives 4/4/4/3 on config 0). Needed only to match the reference byte for byte without supplied allocations.
+6. End-of-stream flush: how is the final partial frame/packet closed? (§9)
+7. Mono, joint stereo and metadata chunks are not covered; is any of these ever negotiated with an R1 sink?

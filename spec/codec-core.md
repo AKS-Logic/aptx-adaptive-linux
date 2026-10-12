@@ -1,0 +1,557 @@
+# aptX Adaptive R1/R2 core encoder: bitstream and signal path
+
+Status: clean-side spec, 2026-10-12.
+
+- **Verification:** every stage marked **[VERIFIED]** was modelled independently and compared bit for bit against the reference encoder, using intermediate values captured between stages.
+- **Test vectors:** `tests/vectors/stages/` (see its README).
+- **Tables:** `spec/tables/*.json`. Each file has a `note` field describing its format.
+- **Companion spec:** `a2dp-integration.md` covers the wrapper, the A2DP config, packet timing, the 16-bit byte swap and the 8-byte header. This document starts where that one stops: PCM samples go into the encoder, raw packets come out.
+
+Notation and arithmetic conventions are in §0. Anything not confirmed by execution is marked **UNCERTAIN**.
+
+---
+
+## 0. Conventions
+
+- Integers are two's complement.
+- `lo32(v)`: wrap v to signed 32 bits. `lo64(v)`: wrap to signed 64 bits.
+- `sat32(v)`, `sat24(v)`: clamp to [−2^31, 2^31−1] and [−2^23, 2^23−1]. `sat64` likewise for 64 bits.
+- `a ⊕ b = sat32(a+b)` and `a ⊖ b = sat32(a−b)` (saturating 32-bit add and subtract).
+- `>>` is an arithmetic right shift unless stated otherwise.
+- **`R64(v)`** ("round high word"): `sat32( (sat64(v) + 2^31) >> 32 )`, where v is a 64-bit value.
+- **`CR(v, n)`** (convergent rounding by 2^n, round half to even): `t = ((v >> (n−1)) + 1) >> 1`. If `v mod 2^n == 2^(n−1)` exactly (an exact half), clear bit 0 of t. CR23 means n = 23.
+- **`CR1(v)`, `CR8(v)`:** the same convergent rounding by 2 and by 256, applied to a 32-bit value. The result is 32-bit.
+- **`RND1(v)`** = `(v + 1) >> 1` (round half up), on a 32-bit value.
+- `sext24(v)`: keep the low 24 bits of v and sign-extend them.
+- Wherever a 64-bit rounded result is later used as 32 bits, take `lo32` first and saturate after. In normal operation values are always in range.
+
+Bit writing is MSB first. A field "v in n bits" puts bit n−1 of v first. Bytes are filled from bit 7 down to bit 0.
+
+---
+
+## 1. Configurations and what the Px7 S2e gets
+
+The encoder supports four music configurations, numbered 0, 1, 3 and 4 (config 2 is speech and out of scope). A config is chosen from the A2DP profile (HQ / LL) and the sink's decoder compatibility level (R1 or R2, `a2dp-integration.md` §1.3). "Frame type" is the value the encoder writes in packet byte 1 (§7.1).
+
+| profile | decoder level | sample rate | config | frame type | filterbank | subbands/ch | samples/block | predictor mode |
+|---|---|---|---|---|---|---|---|---|
+| HQ (profile 0, 3 or 5) | R1 | 44.1/48k | **config 0** | 1 | 4-band tree QMF, 16 taps (§3.1) | 4 | 4 | normal (§6) |
+| LL (profile 1 always; profile 2/6 with R1) | R1 | 44.1/48k | **config 1** | 2 | 4-band tree QMF, 12 taps | 4 | 4 | low-power (§6.3) |
+| HQ | R2 | 44.1/48k | **config 3** | 3 | 8-band cosine-modulated, 256-tap prototype (§3.2) | 8 | 8 | normal |
+| HQ | any | 88.2/96k | **config 3** | 3 | same as above | 8 | 8 | normal, some bands predictor off |
+| LL (profile 2/6) | R2 | 44.1/48k | config 4 | 4 | cosine-modulated, 128-tap prototype (UNCERTAIN, not verified) | 8 | 8 | UNCERTAIN |
+
+The companion spec establishes that the **Px7 S2e is an R1 sink**. That means:
+
+- **config 0** for HQ — verified bit-exact end to end.
+- **config 1** for low latency — verified bit-exact end to end.
+
+Config 3 (R2 sinks) is also verified, at 48 kHz and 96 kHz. Config 4 is not covered.
+
+**How the config is selected:**
+
+1. Two decoder compatibility words `D0, D1` are turned into capability masks: `C0 = ((2·D0) & 0xE) | 1` and `C1 = (2·D1) & 0xE`. An R1 sink gives masks (1, 0); an R2 sink gives (7, 6).
+2. HQ tries the candidate indices [2, 0] in that order. LL tries [3, 1].
+3. On the first pass, the first index whose bit is set in `C0 & C1` wins. If none matches, a second pass uses `C0` alone.
+4. Index 0 → config 0, index 1 → config 1, index 2 → config 3, index 3 → config 4.
+5. HQ at 88.2/96 kHz goes straight to config 3. Profile 1 goes straight to config 1. Profile 4 is the speech configuration (config 2), which is out of scope.
+
+Encoder state is per channel. Stereo is coded as two independent channels in the same frame; joint stereo was never seen enabled. Wherever "band index i" ranges over a block, the order is: channel 0, bands 0..S−1, then channel 1, bands 0..S−1. S is the number of subbands per channel.
+
+Input samples are int32. The wrapper supplies 24-bit audio right-justified (its Q31 sample shifted right by 8). The encoder takes whatever int32 it is given; both 24-bit and full-scale 32-bit inputs were verified.
+
+A **block** is one subband sample per band per channel, so 2·S values. It consumes S input samples per channel. A **frame** is a run of blocks (64 or fewer) that share one bit allocation.
+
+---
+
+## 2. Per-block processing order
+
+For every block, for each channel independently:
+
+1. **Analysis.** Run the filterbank on S new input samples to get S subband values `x[i]` (§3).
+2. **Quantise.** For each band, quantise `x[i]` against the prediction `p[i]` left by the previous block, using the frame's allocation `B[i]`. This gives the code `q[i]` and the reconstructed difference `r[i]` (§5).
+3. **Dither.** In normal mode only, update the dither seed and the dither values for the next block (§5.5).
+4. **Predict.** Run each band's predictor on `r[i]`, which produces `p[i]` for the next block (§6).
+
+The codes `q` of all blocks in the frame, plus the frame's allocation, are then entropy-coded into packets (§7).
+
+**[VERIFIED]** on these runs, with reference-supplied allocations and frame sizes; every code, reconstruction, prediction and packet byte was identical:
+
+- config 0 at 48 and 44.1 kHz: 24-bit sine, 24-bit noise, full-scale 32-bit noise, silence, impulse; bitrates 364/427 kbps
+- config 1 at 48 kHz
+- config 3 at 44.1, 48, 88.2 and 96 kHz
+
+---
+
+## 3. Analysis filterbanks
+
+### 3.1 Four-band tree QMF (configs 0 and 1) [VERIFIED]
+
+This is the same tree structure as aptX classic. Two-band stages are cascaded: one outer stage, then two inner stages.
+
+- **Coefficients:** `spec/tables/filterbank_4band_tree.json`. Config 0 uses `outer_16` and `inner_16` (n = 16 taps). Config 1 uses `outer_12` and `inner_12` (n = 12).
+- **State:** each 2-band stage keeps two delay lines, A and B, each holding the last n samples. All state starts at zero.
+
+**A 2-band stage** takes two inputs (a, b):
+
+1. Push a into delay line A and b into delay line B.
+2. `P = Σ_{k=0}^{n−1} c[k] · A(age k)`. Age 0 is the sample just pushed.
+3. `Q = Σ_{k=0}^{n−1} c[k] · B(age n−1−k)`. Note the reversed order: c[n−1] multiplies the newest sample of B.
+4. Both sums are exact (64-bit or wider).
+5. `p = R(P)` and `q = R(Q)`, where `R(v) = sat24( lo32(CR23(v)) )`: convergent rounding by 2^23, then a 24-bit clamp.
+6. The outputs are **sum** = `sat24(p + q)` and **diff** = `sat24(q − p)`.
+
+**Per channel and per block**, with input samples s0..s3 in time order:
+
+1. Outer stage on (s0, s1) gives (sum0, diff0). Outer stage again on (s2, s3) gives (sum1, diff1). The same outer-stage state is used both times, sequentially.
+2. Inner-low stage on (sum0, sum1) gives (band0, band1) = (sum, diff).
+3. Inner-high stage on (diff0, diff1) gives (band3, band2) = (sum, diff).
+4. The quantiser input is `x[band] = band_value << 8`, a plain 32-bit shift.
+
+**UNCERTAIN:** config 0 created with its low-power option set would use the 12-tap coefficients, a 16-long delay line and different read positions. The normal wrapper never sets this option.
+
+### 3.2 Eight-band cosine-modulated filterbank (config 3) [VERIFIED]
+
+- **Tables:** prototype `spec/tables/filterbank_8band_prototype_256.json` (256 int32 values `P[0..255]`). Modulation constants `spec/tables/filterbank_8band_modulation.json`.
+- **State:** the last 256 input samples of the channel, all zero at start.
+
+**Per block** (8 new samples per channel):
+
+**1. Push the samples.** Push the 8 samples in time order. `h(m)` is the sample of age m (m = 0 is the newest).
+
+**2. Polyphase.** For i = 0..15:
+
+- `acc = −Σ_{k=0}^{15} P[i+16k] · h(i+16k)`. Accumulate in 64 bits with wraparound.
+- `u[i] = R64( lo64(acc · 64) )`.
+
+**3. Cosine-modulation front end.** There are four groups. Each group g has fields `(a, b, c, d, od, Kd, os, Ks)`; in the JSON these are `u_add = [a, b]`, `u_sub = [c, d]`, `diff_out = od`, `diff_const = Kd`, `sum_out = os`, `sum_const = Ks`. For each group:
+
+- `A = u[a] ⊕ u[b]`
+- `C = u[c] ⊖ u[d]`
+- `S = A ⊕ C`
+- `D = A ⊖ C`
+- `o[od] = R64( sat64(2 · D · Kd) )`
+- `o[os] = R64( sat64(2 · S · Ks) )`
+
+The constants are **unsigned** 32-bit values: the product is the signed sample times the unsigned constant, exact in 64 bits.
+
+**4. 8-point DCT.** Apply this to `o[0..7]`, in place.
+
+Define `M(v, K) = R64( lo64(2 · v · K) )`, with signed 32-bit constants (also in the JSON as `dct.c1..c7`):
+
+| constant | value |
+|---|---|
+| K1 | dct.c1 |
+| K2 | dct.c2 |
+| K3 | dct.c3 |
+| K4 | dct.c4 |
+| K5 | dct.c5 |
+| K6 | dct.c6 |
+| K7 | dct.c7 |
+
+With inputs x0..x7 = o[0..7]:
+
+| step | formula |
+|---|---|
+| sums | `s04 = x0⊕x4`, `s26 = x2⊕x6`, `s15 = x1⊕x5`, `s37 = x3⊕x7` |
+| odd products | `A = M(x0⊖x4, K1)`, `B = M(x1⊖x5, K2)`, `C = M(x3⊖x7, K3)`, `D = M(x2⊖x6, K4)` |
+| partial sums | `AD = A⊕D`, `BC = B⊕C`, `S0 = s04⊕s26`, `S1 = s15⊕s37` |
+| y0 | `S0 ⊕ S1` |
+| y1 | `AD ⊕ BC` |
+| y2 | `G ⊕ H`, where `G = M(s04⊖s26, K5)` and `H = M(s15⊖s37, K6)` |
+| y4 | `M(S0⊖S1, K7)` |
+| y3 | `EF ⊕ (EF ⊖ y1)`, where `E = M(A⊖D, K5)`, `F = M(B⊖C, K6)`, `EF = E⊕F` |
+| y5 | `I ⊕ (I ⊖ y3)`, where `I = M(AD⊖BC, K7)` |
+| y6 | `L ⊕ (L ⊖ y2)`, where `L = M(G⊖H, K7)` |
+| y7 | `T ⊕ (T ⊖ y5)`, where `J = M(E⊖F, K7)` and `T = J ⊕ (J ⊖ EF)` |
+
+Then `o[k] = y_k`.
+
+**5. Post-processing.**
+
+- `o[0] = R64( lo64(o[0] · 2^31) )`, which is effectively a rounded halving.
+- Then for k = 1..7 in order: `o[k] = o[k] ⊖ o[k−1]`. Each step uses the already-updated `o[k−1]`.
+
+**6. Output.** Subband k (k = 0 is the lowest band) is `x[k] = o[k]`, already in the 32-bit quantiser domain.
+
+The filterbank adds no extra delay or latency compensation. The encoder reports latency 0.
+
+---
+
+## 4. Quantiser input
+
+For each band, the quantiser sees:
+
+- `x`: a 32-bit subband value;
+- `p`: the 24-bit-domain prediction from the previous block's predictor. It is 0 for the first block and for bands whose predictor is disabled.
+
+The difference is formed as `d = x ⊖ lo32(p · 256)`.
+
+---
+
+## 5. Non-uniform adaptive quantiser [VERIFIED]
+
+**Tables:** `spec/tables/quantiser.json`. For each table size Bt = 2..9 there are:
+
+- `T` (`threshold`): thresholds;
+- `Dt` (`dither`): dither;
+- `Inc` (`logdelta_incr`): log-delta increments.
+
+All three have 2^(Bt−1)+2 entries. The JSON also holds `log_table` (32 entries).
+
+**State.**
+
+- Per band: `step` (initially 8), `ld` (log-delta, initially 244), `dith` (initially 0).
+- Per channel: `seed` (initially 0).
+
+**Modes.**
+
+- **Normal** mode applies to configs 0 and 3.
+- **Low-power** mode applies to config 1. It drops dither and changes the threshold (§5.2) and the reconstruction (§5.3).
+
+For each band, the frame allocation `B ∈ {0, 2..16}` is used. 1 never occurs.
+
+### 5.1 Zero allocation
+
+If `B = 0`:
+
+- `q = 0` and `r = 0`;
+- `step = 8` and `ld = 244`;
+- the low-power carry (§5.2) is not touched.
+
+### 5.2 Code decision
+
+**Setup.**
+
+- `Bt = min(B, 9)` and `E = max(B − 9, 0)`.
+- Use the tables `T`, `Dt`, `Inc` for Bt.
+- `a = lo32(|d|)` (the absolute value of −2^31 stays −2^31), and `A = a · 2^11`. All products in this section are 64-bit.
+
+**1. Coarse binary search.**
+
+- Start with `idx = 0`.
+- For `h = 2^(Bt−2), 2^(Bt−3), …, 1`: if `A − T[idx+h] · step ≥ 0`, add h to idx.
+- Then set `L = T[idx]`, `H = T[idx+1]`, `dL = Dt[idx]`, `dH = Dt[idx+1]`, `code = idx`, `R = 0`.
+
+**2. Extension, only if E > 0.**
+
+Repeat E times:
+
+1. Remember `(Lp, Hp) = (L, H)`.
+2. `M = L + ((H − L) >> 1)`.
+3. If `A − M · step < 0`: `code = 2·code`, `R = 2·R`, `H = M`.
+4. Otherwise: `code = 2·code + 1`, `R = 2·R + 1`, `L = M`.
+
+Afterwards:
+
+- Restore `(L, H) = (Lp, Hp)`, i.e. the interval *before* the last split.
+- `dH = dH − ( lo32( lo32(mask · (−1 − R)) · (dH − dL) ) >> E )`, where `mask = 2^E − 1`.
+
+**3. Decision threshold v.**
+
+In **normal** mode, with `δ = dith`:
+
+1. `g = sat24(dL − dH)`
+2. `e = sat24(lo32(CR23(δ · δ)))`
+3. `off = sat24(lo32(CR23((2^21 − e) · g)))`
+4. `thr = sat24(off + H + L)`
+5. `V = thr · 2^23 + (d ≥ 0 ? δ·(H−L) : −δ·(H−L))`
+6. `v = sat24(lo32(CR23(V)))`
+
+In **low-power** mode:
+
+- `v = sat24(carry + H + L)`.
+- `carry` is the `ld` most recently produced in this block, by any band of either channel, in processing order. It is 0 at the start of each block.
+
+**4. Final code.**
+
+1. If `a · 2^12 − v · step < 0`, decrement `code` by 1.
+2. If `d < 0`, set `code = ~code` (that is, −code−1).
+3. The result is `q`.
+
+### 5.3 Reconstruction
+
+1. `c = q >> E` (arithmetic shift).
+2. `j = c + 1` if c ≥ 0, otherwise `j = −c`.
+3. `ρ = T[j]`.
+4. If E > 0:
+   - `σ = −1` if q < 0, otherwise 0
+   - `m9 = mask & (σ XOR q)`
+   - `m6 = mask & ~m9`
+   - `ρ = ρ − ( lo32((T[j] − T[j−1]) · m6) >> E )`
+5. If c < 0, negate ρ.
+6. Normal mode with B ≤ 9 only: `ρ = sat24(lo32(CR23(Dt[j] · δ + ρ · 2^23)))`.
+7. `r = sat24( lo32( (step · ρ) >> 19 ) )`.
+
+**Low-power quirk:** only bands 0..S−2 compute a new r. The top band (band S−1 = band 3 in config 1) keeps the r it had in the previous block. That value is 0 if the band had B = 0 at any point, since §5.1 writes r = 0.
+
+### 5.4 Step adaptation (all modes)
+
+1. `ld = clamp( sat24(lo32(CR23(8350720 · ld + Inc[j] · 2^23))), 0, 6399 − 256·B )`. Here j is the index from §5.3, Inc is read as int16, and B is the full allocation, not Bt.
+2. `step = log_table[(ld >> 3) & 31] >> (24 − B − (ld >> 8))`.
+
+### 5.5 Dither generation (normal mode only)
+
+This runs after all bands of a channel are coded in the block. q0 and q1 are that channel's band-0 and band-1 codes.
+
+1. `seed = lo32( (((4·q0) & 12) | (q1 & 3)) · 256 + 16·seed )`
+2. `P = (seed >> 8) · 10368886` (exact signed 64-bit). `Pl = P mod 2^32`.
+3. `V = ((Pl >> 22) & 3) | ( ((⌊(P mod 2^64) / 2^24⌋ + Pl) & 0x3FFFFF) << 2 )`
+4. For band k of this channel: `dith = sext24( (V << s_k) mod 2^24 )`. Here `s_k = 2k` for 8 bands and `s_k = 5k` for 4 bands.
+
+These dither values apply to the **next** block.
+
+---
+
+## 6. Sign-sign LMS predictor [VERIFIED]
+
+There is one predictor per band, per channel. It is a pole-zero (two poles, N zeros) adaptive predictor with sign-sign updates.
+
+**Zero (FIR) tap counts N** (`spec/tables/predictor_taps.json`):
+
+- configs 0 and 1: `predictor_taps.4band` per channel.
+- config 3 at 44.1/48k: `predictor_taps.8band_48k`.
+- config 3 at 88.2/96k: `predictor_taps.8band_96k`. The predictor for some bands is disabled: its output is 0 and its state is never touched.
+
+**State per band** (all at reset):
+
+| variable | meaning | initial value |
+|---|---|---|
+| `s0`, `s1` | sign history | 1, 1 |
+| `a1`, `a2` | pole coefficients | 0, 0 |
+| `b[0..N−1]` | zero coefficients | 0 |
+| history | last N inputs | 0 |
+| `y1` | previous pole input | 0 |
+| `z` | previous zero-predictor output | 0 |
+| `pr` | prediction | 0 |
+
+### 6.1 Per sample
+
+The input is `x = r`, the quantiser reconstruction (§5.3).
+
+**1. Sign and pole adaptation.**
+
+- `t = z + x`, using the previous `z`.
+- Choose the sign terms:
+  - t < 0: `cur = −1`, `p1 = −s0`, `p2 = −s1`.
+  - t > 0: `cur = 1`, `p1 = s0`, `p2 = s1`.
+  - t = 0: `cur = 1`, `p1 = 0`, `p2 = 0`.
+- Then `s1 = s0` and `s0 = cur`.
+- Update the poles. All of the following are 32-bit operations, using the **old** a1 and a2:
+  - `w = CR8(255 · a1 + 12582912 · p1)`
+  - `k = clamp(CR1(−p1 · a1), −2^20, 2^20)`
+  - `a2' = clamp( CR8( ((16 · (k + p2 · 2^19)) & ~0xFF) + 254 · a2 ), −3145728, 3145728 )`
+  - `a1' = clamp(w, a2' − 3932160, 3932160 − a2')`
+  - Store a1', a2'.
+
+**2. Pole part.**
+
+- `y = sat24(pr + x)`, using the previous `pr`.
+- `pole = lo32( (y1 · a2 + a1 · y) >> 21 )`, using the new a1 and a2.
+- Then `y1 = y`.
+
+**3. Zero coefficient update.**
+
+- `e = 0` if x = 0, otherwise `e = sign(x) · 2^23`.
+- Let `hist[k]` be the input of age k+1, for k = 0..N−1. `hist[0]` is the previous input.
+- For each k: `term = −e` if `hist[k] < 0`, otherwise `e`.
+- Then `b[k] = sext24( b[k] + CR8(lo32(term − b[k])) )`.
+
+**4. Zero prediction.**
+
+- `acc = b[0]·x + Σ_{k=1}^{N−1} b[k] · hist[k−1]`, exact in 64 bits.
+- So each updated coefficient k multiplies the sample one step *newer* than the one that gave its update sign.
+- `z = sat24( lo32(acc >> 22) )`.
+
+**5. Prediction.**
+
+- `pr = sat24( z + sat24(RND1(pole)) )`.
+- Push x into the history.
+
+**6. Output.** `pr` is the `p` used by the quantiser in the next block (§4).
+
+### 6.2 Normal mode
+
+All enabled bands of both channels run every block.
+
+### 6.3 Low-power mode (config 1)
+
+The arithmetic is the same, but **only channel 0, bands 0..3** run. Every channel-1 band's prediction is always 0 and its state never changes. This was confirmed against the reference, even though it looks like an implementation quirk.
+
+---
+
+## 7. Bitstream: packets, frames, allocation and codewords [VERIFIED]
+
+The encoder emits fixed-size packets of `Lp` bytes. Lp is set by the wrapper, must be a multiple of 4, and in practice is 328 to 880. There is one container per packet.
+
+### 7.1 Packet layout
+
+| byte | content |
+|---|---|
+| 0 | 0x00 |
+| 1 | frame type (config 0 → 1, config 1 → 2, config 3 → 3, config 4 → 4), OR 0x80 if the packet ends with padding |
+| 2 | Lp/4 − 3 (for example 656 → 0xA1, 660 → 0xA2, 328 → 0x4F) |
+| 3 … Lp−1 | payload: `Cap = Lp − 3` bytes |
+
+The payload is one MSB-first bit sequence:
+
+1. **Continuation.** Let C be the number of bytes carried over from the previous packet (0 for the first packet). Write C as Exp-Golomb order 0: with `v = C + 1` and `L = bitlength(v)`, write L−1 zero bits, then v in L bits. C = 0 is the single bit `1`. Then write the C carried bytes, 8 bits each, unchanged.
+2. **Frames.** One or more frames follow, each written directly after the previous one with no alignment. For each frame:
+   - the bit allocation. The first frame in the packet uses absolute coding with a 4-bit header (§7.2). Later frames in the same packet use differential coding against the previous frame (§7.3).
+   - the frame's codewords (§7.4).
+3. **End.** Zero-pad the last partial byte.
+
+If the total exceeds Cap bytes, the first Cap bytes go into this packet and the remaining bytes are the next packet's continuation.
+
+**Padding.** If the payload is shorter than Cap, the remaining `Pd = Cap − len` bytes are filled as follows, and byte 1 gets bit 0x80:
+
+- the first pad byte is 0x80, the rest are 0x00;
+- then, with `t = Pd − 1`, the last `⌊t/255⌋` pad bytes are 0xFF, and the byte just before them is `t mod 255`.
+
+When Pd = 1, the single pad byte is 0x00.
+
+**Frames per packet (observed encoder policy).**
+
+- Every frame except the packet's last has exactly 64 blocks.
+- The last frame has 8, 16, 32, 48 or 64 blocks.
+- A frame's bits may run past the packet end. The overflow is the next packet's continuation.
+
+A decoder cannot read the block count of the last frame directly. It is implied by where the data ends, or by the zero-allocation escape (§7.2). An encoder must therefore close each packet's last frame exactly where the payload ends (packet end or continuation end). The policy that picks the last frame's size from the remaining byte budget is described in §8. It is **not** needed for decodability.
+
+### 7.2 Absolute allocation (first frame of each packet)
+
+**Reduced allocation.** `ρ(B) = B − 1` if B > 1, otherwise B. So 0 → 0, 2 → 1, 3 → 2, …, 16 → 15.
+
+**4-bit header**, written first:
+
+| config | header value |
+|---|---|
+| config 3 / config 4 | sample-rate code (44.1k → 0, 48k → 2, 88.2k → 4, 96k → 6), plus 8 if the stream has 2 channels |
+| config 0 / config 1 | (48k ? 2 : 0), plus 1 for low-power (config 1), plus 4 if the create-parameter channel config equals 2 (UNCERTAIN: never seen; stereo is 4), plus 8 if 2 channels |
+
+Observed headers: 0xA for configs 0 and 3 at 48 kHz stereo; 0xB for config 1.
+
+**Band pairs.** The bands are taken in pairs (band 2m, band 2m+1) over the ordered list ch0 bands, then ch1 bands. Tables are in `spec/tables/alloc_absolute_huffman.json` (`table_a`, `table_b`; the per-pair choice is in `pair_table_8band` / `pair_table_4band`).
+
+**Configs 3 / 4.** For each pair m, with α = ρ(B[2m]) and β = ρ(B[2m+1]):
+
+1. Map each value to a nibble: the value itself if ≤ 7, otherwise 8.
+2. Symbol = `(nibble_α << 4) | nibble_β`. Write its Huffman code from table A or table B per `pair_table_8band`.
+3. Escapes: for each of α, β in that order whose value is > 7, append `value − 8` in 3 bits. All escape bits of the pair come together after the code, α's first.
+
+After all pairs, if every B in the frame is 0, write `(frame_blocks − 1)` in 8 bits.
+
+**Configs 0 / 1.** For each pair m:
+
+- Symbol = `(α << 4) | β`, with no escapes.
+- Tables alternate A, B, A, B for pairs 0..3 (ch0 bands 0/1, ch0 2/3, ch1 0/1, ch1 2/3).
+- There is no zero-allocation escape.
+
+### 7.3 Differential allocation (later frames in the same packet)
+
+Tables: `spec/tables/alloc_diff_huffman.json`. Per band i, in list order:
+
+- `v = ρ(B_new[i])`
+- `pv = ρ(B_prev[i])`, from the immediately preceding frame
+- table = `tables[table_index[pv]]`
+
+**Configs 3 / 4:**
+
+1. `(lo, hi) = range[pv]`.
+2. `cl = min(max(v, lo), hi)`.
+3. Write `table[(cl − pv) & 15]`.
+4. Then:
+   - if v ≤ lo, write `lo − v` in 3 bits;
+   - else if v ≥ hi, write `v − hi` in 3 bits.
+
+After all bands, if every B is 0, write `(frame_blocks − 1)` in 8 bits.
+
+**Configs 0 / 1:** write `table[(v − pv) & 15]`. There is no clamping and no escape.
+
+### 7.4 Codewords
+
+Tables: `spec/tables/codeword_huffman.json`, with one entry per allocation 0..16.
+
+Blocks are taken in pairs (block 2n, block 2n+1) in time order; frames always have an even block count. For each pair, for each band i in list order with B[i] ≠ 0:
+
+1. Let `q0`, `q1` be the codes of that band in the two blocks.
+2. `Bc = B[i]`. **Configs 0 / 1 exception:** if `B[i] = 2` and i is the top band of its channel (i mod 4 = 3), use the entry for allocation 1 instead.
+3. From the entry for Bc, take `(table, pair_shift, raw_lsbs, msb_mask)`.
+4. `h0 = (q0 >> raw_lsbs) & msb_mask` and `h1 = (q1 >> raw_lsbs) & msb_mask`.
+5. Write the Huffman code for symbol `(h0 << pair_shift) | h1`.
+6. If `raw_lsbs > 0`, write the low raw_lsbs bits of q0, then the low raw_lsbs bits of q1.
+
+The parameters by allocation:
+
+| allocation | pair_shift | msb_mask | symbols | raw_lsbs |
+|---|---|---|---|---|
+| (see `codeword_huffman.entries`) |
+| (see `codeword_huffman.entries`) |
+| (see `codeword_huffman.entries`) |
+
+---
+
+## 8. Encoder-side decisions (NOT bit-exact specified)
+
+Two things are free encoder choices. A decoder needs no particular choice, so any choice gives a valid stream. Matching the reference byte for byte does require them. The vectors supply both as inputs.
+
+### 8.1 Frame size of the last frame in a packet — UNCERTAIN
+
+1. Compute the bits still available in the packet. This uses the packet writer's remaining space, the bytes held back for continuation, and a padding history capped at 30.
+2. If nothing is left, use 8 blocks.
+3. Otherwise divide the available bits by an estimated bits-per-block and quantise the result:
+
+   | estimate (blocks) | frame size |
+   |---|---|
+   | < 8 | 8 |
+   | 8–15 | 16 |
+   | 16–31 | 32 |
+   | 32–47 | 48 |
+   | ≥ 48 | 64 |
+
+4. In constant-bitrate mode (UNCERTAIN: believed to be when the create flag is 0) a second estimate can lower it further. It is rounded down to an even number.
+
+The full rate-control loop is not specified.
+
+### 8.2 Bit allocation — UNCERTAIN, informative only
+
+This is the reference structure as understood, not verified:
+
+1. **Bit pool.** A pool of bits per block is derived from the bitrate. It is capped by a per-band maximum table chosen by bitrate (the `max_bits_*` tables in `spec/tables/allocator_hints.json`). For example, config 3 at 48k above about 520 kbps allows 16 bits per band, while about 420 kbps caps at 9.
+2. **Scale factors.** Per band, the scale factor is roughly `ceil(log2(max |x| over the frame))` in the 24-bit domain.
+3. **Bit need.** `need = ⌈(sf − offset[band]) / 2⌉`, using the `offset_*` tables; a zero sf gives −5.
+4. **Water-fill.** A water-filling search finds the threshold that uses up the pool.
+5. **Distribution.** Allocations of 0 and ≥ 2 are handed out (never 1), with a special path for digital silence.
+
+A clean-room encoder can use any allocator that:
+
+- keeps each allocation in {0, 2..16};
+- respects the per-band maxima;
+- fits the packet byte budget.
+
+Silence in the reference gives allocations of 4/4/4/3 (config 0) or all 0 (config 3).
+
+---
+
+## 9. What is verified
+
+| stage | config 0 | config 1 | config 3 (48k) | config 3 (96k) |
+|---|---|---|---|---|
+| filterbank | ✔ | ✔ | ✔ | ✔ |
+| quantiser + dither | ✔ | ✔ (no dither) | ✔ (incl. 10–16 bit bands) | ✔ |
+| predictor | ✔ | ✔ (ch0 only) | ✔ | ✔ (some bands off) |
+| allocation coding, absolute + diff | ✔ | ✔ | ✔ (incl. escapes, zero escape) | ✔ |
+| codewords | ✔ | ✔ | ✔ | ✔ |
+| packet header, continuation, padding | ✔ | ✔ | ✔ | ✔ |
+| end to end, given allocations and frame sizes | ✔ (48k, 44.1k) | ✔ | ✔ (48k, 44.1k) | ✔ (96k, 88.2k) |
+| bit allocation / frame-size policy | ✘ | ✘ | ✘ | ✘ |
+
+Out of scope / not done:
+
+- config 4 (R2 low latency)
+- config 2 (speech)
+- mono
+- joint stereo
+- metadata chunks
+- the voice / true-wireless packet formats
+- end-of-stream flush behaviour
