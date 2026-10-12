@@ -154,3 +154,10 @@ Exported with the OnePlus log tool (`*#800#` → Bluetooth → transmission). Th
 - At Start the phone sends its controller a vendor command (OCF 0x000a, 66 bytes) with the codec config. That's offload only, and goes to its own chip, not the headset.
 
 Leading hypothesis: the Px7's aptX Adaptive SEP only reports Delay Reporting to some sources. Possibly it depends on the AVDTP version we advertise in SDP, or on something else in the source's identity or the request. Either way, the phone configures Delay Reporting and we don't. Next: find why the Px7 omits Delay Reporting for us (compare our SDP A2DP source record and AVDTP version with the phone's), and test forcing Delay Reporting into our SetConfiguration with the patched bluetoothd.
+
+## A2DP version: the headset gates Delay Reporting on it (2026-10-13)
+
+- BlueZ's A2DP source SDP record says A2DP **1.4**. The phone's says **1.3**. The Px7 reads this before AVDTP Discover.
+- With bluetoothd patched to advertise 1.3: the headset now includes **Delay Reporting on every SEP** (it had omitted it from all of them for us). Our SetConfiguration now includes Delay Reporting, the headset sends a Delay Report after Open, and the AVDTP sequence matches the phone's.
+- The A2DP 1.3 run streamed 1498 packets (real encoder, phone framing, every 14 ms) after Start was accepted: **still silent.** The headset played its chime when the profile switched (Close of the aptX HD stream at SEID 7, then reconfigure to SEID 9).
+- So A2DP 1.3 fixes the capability difference but not the silence on its own. Still to check from source-diff.md: AVRCP play status ("playing" after Start) with absolute volume, and configuring aptX Adaptive first instead of switching from aptX HD.
