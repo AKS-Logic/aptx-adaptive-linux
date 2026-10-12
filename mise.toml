@@ -1,0 +1,9 @@
+[tools]
+rust = { version = "1.99.0", components = "rustfmt,clippy" }
+lefthook = "2.2.1"
+
+[tasks.check]
+run = ["cargo fmt --all --check", "cargo clippy --workspace --all-targets -- -D warnings", "cargo test --workspace"]
+
+[tasks.install-plugin]
+run = "./scripts/install-plugin.sh"
