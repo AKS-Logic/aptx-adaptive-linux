@@ -239,3 +239,10 @@ btmon, time from sending each media ACL packet to the controller's Number of Com
 - btmon: 71.2 packets/s, 5 missing in 25 s, controller completion median 20 ms / p90 31 ms (same as aptX HD). The user hears it as smooth, quality comparable to aptX HD.
 - **Works with stock BlueZ 5.87 (A2DP 1.4 advertised).** The A2DP 1.3 patch isn't needed: it only made the sink offer Delay Reporting. The silence was entirely the source type.
 - Remaining: the HQ/LL mode switch, automatic codec selection, the encoder delay (`get_delay`), and keeping aptX HD from being set up first on connect (codec switch chime).
+
+## stutter report (2026-10-13 ~08:00)
+
+- The user reported stutter that came and went ("started fine, got worse, sometimes gets a bit better") and later cleared up, possibly system load.
+- A btmon capture during it shows our side as perfect: 71.4 packets/s, no sequence gaps, completion median 20 ms / p90 31 ms, 0 ppm drift of send times against the 14 ms audio clock.
+- Hypothesis to guard against anyway: clock drift between the host's audio clock and the sink's. With source type 2 the sink advances TTP purely by the sample count (§7F), with only a ±0.5 % rate trim. A sustained source/sink rate mismatch moves the sink's latency towards its min/max window and triggers TTP resets, which are audible glitches. The phone's packets show small adjustments (12/14 ms steps, ±1 µs jitter).
+- Planned mitigation: drive the timestamp's high 16 bits (signed TTP adjust, ms) from a slow estimate of host/sink drift, e.g. from socket backlog (`abr_process` unsent bytes) and/or the sink's Delay Reports, keeping the sink's latency centred. Needs a spec answer: units and safe range of the TTP adjust, and whether changing it causes a reset (the dirty-side note says each change calls "source changed", which re-sets the target latency; check whether that glitches).
