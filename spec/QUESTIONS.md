@@ -117,3 +117,16 @@ Conclusion: the chime doesn't separate layouts. It seems tied to the restart and
 - AVDTP SetConfiguration, Open and Start were accepted. 25 s of playback after a 30 s settle.
 - The headset played its **chime** during playback. The capture shows **no** link drop, no AVDTP Suspend/Abort/Close from the headset, no L2CAP disconnect, and no ACL data from the headset at all during playback: it stayed completely silent on the link. So the chime is the headset's own audio prompt, not a disconnect. It may be the "connected"/codec prompt, or a decoder error prompt.
 - Headset remote features (from the reconnect): page 0 `ff fe 8f fe db ff 5b 87`, page 1 `03`, max page 2. BlueZ never sends Read Remote Version Information, so the remote LMP version and manufacturer still need `hcitool info` (not installed) or a raw HCI command.
+
+## live test round 6: replaying the phone's own packets (2026-10-13)
+
+- Replayed the 2609 codec packets captured from the OnePlus 15, in exactly the phone's on-air layout (§7D, 668-byte packets, `80 60`, µs TTP timestamp, SSRC `00 00 00 ae`), every 14 ms, to the Px7 S2e: **silence**. btmon confirms 548+ packets went out after AVDTP Start was accepted.
+- So the on-air bytes are not the problem: a stream the phone itself produced is silent when it comes from this host.
+- The headset closed the stream itself during one run (AVDTP Close from the sink, then "Remote User Terminated Connection"). The "disconnect chime" happens around reconnects, before any audio.
+
+### new lead: SCMS-T content protection
+
+- The Px7 S2e's aptX Adaptive endpoint (SEID 9) advertises **Content Protection: SCMS-T** in Get All Capabilities.
+- Our SetConfiguration only includes Media Transport + Media Codec. It never configures content protection, so no SCMS-T header byte goes in the media payload.
+- An earlier capture also suggested the offload start config carries an SCMS-T flag. If the sink needs SCMS-T configured, each media packet then carries a 1-byte content-protection header (between the RTP header and the codec payload) and the sink may mute without it.
+- To test: add Content Protection SCMS-T (type 0x0002) to SetConfiguration, and prepend the SCMS-T byte (0x00 = copy allowed) to every payload.
