@@ -13,3 +13,6 @@ aptx-adaptive = { path = "../aptx-adaptive" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+libloading = "0.9.0"
