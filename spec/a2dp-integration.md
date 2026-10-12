@@ -685,3 +685,26 @@ Checked against primary sources. This supersedes earlier statements where they d
 **Target latency** comes from the bytes the source writes in SetConfiguration (body 8..11), not from the sink's caps. Headphone ranges are LL0 55–200 ms, LL1 75–230 ms, HQ 200–500 ms, TWS 200–500 ms. Out-of-range values become the minimum. The Px7 config we send (`37 6a 64 af`) decodes as LL0 55, LL1 106, HQ 200, TWS 350 ms. A host source should consider **LL0 ≥ 80 ms** (`0x50`) to absorb host and link jitter. Body bytes 12..13 aren't read.
 
 **Unverified.** Packet sizing and sample counts at 44.1 kHz; the rule for choosing TWS; the exact LL0/LL1 switching policy; whether payloads larger than 668 bytes are accepted with source type 2.
+
+## 7I. Encoder delay, start and end of stream (verified 2026-10-13)
+
+**Encoder delay** (filterbank, encode plus a matched decode), measured with impulses. It doesn't depend on position, bitrate or packet size:
+
+| config | rate | delay |
+|---|---|---|
+| 0 (HQ, R1) | 48 kHz | 90 samples (1.875 ms) = 2 × (3 × 16 − 3) |
+| 1 (LL, R1) | 48 kHz | 66 samples (1.375 ms) = 2 × (3 × 12 − 3) |
+| 3 (HQ, R2) | 48 kHz | 255 samples (5.3 ms) = 256 − 1 |
+| 3 (HQ, R2) | 96 kHz | 255 samples (2.66 ms) |
+
+Packet buffering adds up to one period (672 frames for HQ 48 kHz, 480 for LL, 1152 at 96 kHz). The reference reports 0 to its audio framework. A source may report the filterbank delay, plus one period if it counts the packet wait as encoder delay. (Correction to codec-core §3.2: "latency 0" is what gets reported, not the real delay.)
+
+**Start of stream (reference behaviour, optional for a source).** Whenever the encoder is created or reconfigured, including on an HQ↔LL switch:
+1. **Hard mute** for 20 ms: 20 input calls of 1 ms each are encoded as zeros.
+2. **Raised-cosine fade-in** over 4800 frames: gain = 0.5·(1 − cos(π·(j+1)/4801)) for frame j = 0…4799. Same gain on both channels, each product truncated toward zero. That's 100 ms at 48 kHz and 50 ms at 96 kHz.
+
+The bitstream carries no sign of the fade and the first packet is an ordinary packet, so a source can skip both. The "CVR mute ramp" mentioned earlier isn't part of start-up: it's the stereo↔mono ramp.
+
+**HQ↔LL switch fade.** The profile-switch fade uses the same 4800-frame table read backwards (a fade-out), then the start-of-stream sequence above on the new encoder. Batch 2 may refine this.
+
+**End of stream.** The reference discards the final partial period and sends nothing special: no flush, no padding, no end marker. A source sends nothing at stop; AVDTP Suspend/Close ends the stream. Optionally, pad with zeros to the next period boundary plus the filterbank delay, so the last audio plays out. The library's flush call codes an even number of buffered blocks (≥ 2) into one full-size padded packet; an odd last block, or less than one block, is never coded; with nothing pending it emits nothing.
