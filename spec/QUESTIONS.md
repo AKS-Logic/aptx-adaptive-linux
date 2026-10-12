@@ -43,3 +43,16 @@
 5. Bit allocator (§8.2): unverified. Exact bit-pool formula from bitrate, bitrate thresholds for picking the `max_bits_*` table, scale-factor definition, and the digital-silence path (which gives 4/4/4/3 on config 0). Needed only to match the reference byte for byte without supplied allocations.
 6. End-of-stream flush: how is the final partial frame/packet closed? (§9)
 7. Mono, joint stereo and metadata chunks are not covered; is any of these ever negotiated with an R1 sink?
+
+## live test round 2 (2026-10-12, §7A.3 variants, sine1k vectors)
+
+Each variant was installed, wireplumber/pipewire restarted, the headset reconnected, then 12 s streamed.
+
+- PT 0, header-in-rtp: chime
+- PT 96, header option b (halves reversed): chime
+- PT 96, header-in-rtp, R2 bitstream: chime
+- PT 96, header-in-rtp, no payload swap: chime
+- control, PT 96, header-in-rtp, R1 bitstream (the round 1 layout): chime this time; round 1 was silent with no chime
+- second stream on the same connection, no restart: silence, no chime
+
+Conclusion: the chime doesn't separate layouts. It seems tied to the restart and reconnect, not to the packet bytes, so none of the variants can be ruled in or out yet. We need ground truth: a capture of what a phone sends, a btmon capture of what we send, or a reference decoder to check our bytes against.
