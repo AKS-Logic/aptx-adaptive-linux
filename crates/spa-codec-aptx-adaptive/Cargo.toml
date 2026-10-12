@@ -15,4 +15,5 @@ aptx-adaptive = { path = "../aptx-adaptive" }
 workspace = true
 
 [dev-dependencies]
+aptx-adaptive = { path = "../aptx-adaptive", features = ["fake"] }
 libloading = "0.9.0"

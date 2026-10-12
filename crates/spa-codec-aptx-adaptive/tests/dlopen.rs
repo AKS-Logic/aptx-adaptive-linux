@@ -6,6 +6,8 @@
 )]
 #[path = "../src/ffi.rs"]
 mod ffi;
+#[path = "../src/fixtures.rs"]
+mod fixtures;
 #[path = "../src/ids.rs"]
 mod ids;
 
@@ -23,11 +25,12 @@ use ffi::{
     media_codec_audio_info, spa_audio_info, spa_bluez5_codec_a2dp, spa_handle, spa_handle_factory,
     spa_pod, spa_pod_builder,
 };
-use ids::VENDOR_HEADER;
+use fixtures::{PX7_S2E, PX7_S2E_CONFIG};
+use ids::{CAPS_LEN, VENDOR_HEADER};
 
 const MTU: usize = 895;
-/// Matches the placeholder encoder: 128 frames of stereo `S24_32`.
-const BLOCK_SIZE: c_int = 128 * 2 * 4;
+/// One 14 ms HQ packet of stereo `S24_32` (spec `a2dp-integration.md` §4.1).
+const BLOCK_SIZE: c_int = 672 * 2 * 4;
 
 type EnumFn = unsafe extern "C" fn(*mut *const spa_handle_factory, *mut u32) -> c_int;
 
@@ -188,12 +191,15 @@ fn caps_round_trip() {
     let mut caps = [0u8; A2DP_MAX_CAPS_SIZE];
     // SAFETY: caps is A2DP_MAX_CAPS_SIZE.
     let n = unsafe { c.fill_caps.unwrap()(c, 0, ptr::null(), caps.as_mut_ptr()) };
-    assert_eq!(caps[..n as usize], VENDOR_HEADER);
+    assert_eq!(n as usize, CAPS_LEN);
+    assert_eq!(caps[..6], VENDOR_HEADER);
 
-    let remote = [&VENDOR_HEADER[..], &[0x55, 0xAA]].concat();
-    let (n, config) = select(c, &remote);
-    assert_eq!(n as usize, remote.len());
-    assert_eq!(config, remote);
+    let (n, config) = select(c, &PX7_S2E);
+    assert_eq!(n as usize, PX7_S2E.len());
+    assert_eq!(config, PX7_S2E_CONFIG);
+
+    let (n, _) = select(c, &[&VENDOR_HEADER[..], &[0x55, 0xAA]].concat());
+    assert_eq!(n, -EINVAL);
 
     let (n, _) = select(c, &[0x4F, 0, 0, 0, 0x01, 0, 0]);
     assert_eq!(n, -ENOTSUP);
@@ -225,8 +231,8 @@ fn enum_config(
         c.enum_config.unwrap()(
             c,
             0,
-            VENDOR_HEADER.as_ptr().cast(),
-            VENDOR_HEADER.len(),
+            PX7_S2E_CONFIG.as_ptr().cast(),
+            PX7_S2E_CONFIG.len(),
             SPA_PARAM_ENUM_FORMAT,
             idx,
             b,
@@ -276,7 +282,7 @@ fn enum_config_reports_overflow() {
 fn init_succeeds_but_encode_is_unimplemented() {
     let l = load();
     let c = l.codec;
-    let mut config = VENDOR_HEADER;
+    let mut config = PX7_S2E_CONFIG;
     let info = validated_info(c, &config);
     let data = init(c, &mut config, &info);
     assert!(!data.is_null());
@@ -288,6 +294,7 @@ fn init_succeeds_but_encode_is_unimplemented() {
         let mut out = [0u8; 1024];
         let hdr = c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), 1, 0);
         assert_eq!(hdr, 12);
+        assert_eq!(out[4..12], [0x1f, 0x63, 0x38, 0x01, 0, 0, 0, 0xae]);
         let pcm = vec![0u8; block as usize];
         let (mut written, mut flush) = (0usize, 0);
         let res = c.encode.unwrap()(
@@ -301,7 +308,7 @@ fn init_succeeds_but_encode_is_unimplemented() {
         );
         assert_eq!(res, -ENOTSUP);
         assert_eq!(written, 0);
-        assert_eq!(c.abr_process.unwrap()(data, 0), -ENOTSUP);
+        assert_eq!(c.abr_process.unwrap()(data, 0), 0);
         let mut delay = 99;
         c.get_delay.unwrap()(data, &raw mut delay, ptr::null_mut());
         assert_eq!(delay, 0);
@@ -313,7 +320,7 @@ fn init_succeeds_but_encode_is_unimplemented() {
 fn init_returns_null_and_sets_errno_on_rejected_stream() {
     let l = load();
     let c = l.codec;
-    let mut config = VENDOR_HEADER;
+    let mut config = PX7_S2E_CONFIG;
     let mut info = validated_info(c, &config);
     info.raw.rate = 44_100;
     let data = init(c, &mut config, &info);

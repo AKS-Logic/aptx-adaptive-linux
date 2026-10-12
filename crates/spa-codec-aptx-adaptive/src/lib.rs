@@ -5,6 +5,8 @@
 
 mod caps;
 mod ffi;
+#[cfg(test)]
+mod fixtures;
 mod ids;
 mod pod;
 mod session;
@@ -99,7 +101,6 @@ fn caps_err(e: caps::CapsError) -> c_int {
 
 fn session_err(e: SessionError) -> c_int {
     match e {
-        SessionError::Invalid => -EINVAL,
         SessionError::NoSpace => -ENOSPC,
         SessionError::Unsupported => -ENOTSUP,
     }
@@ -212,17 +213,16 @@ unsafe extern "C" fn codec_enum_config(
     let Some(caps) = (unsafe { bytes(caps, caps_size) }) else {
         return -EINVAL;
     };
-    let format = match caps::validate_config(caps) {
-        Ok(f) => f,
-        Err(e) => return caps_err(e),
-    };
+    if let Err(e) = caps::validate_config(caps) {
+        return caps_err(e);
+    }
     if idx > 0 {
         return 0;
     }
     if builder.is_null() || param.is_null() {
         return -EINVAL;
     }
-    let pod = pod::raw_audio_format(id, &format);
+    let pod = pod::raw_audio_format(id, &caps::STREAM);
     // SAFETY: builder checked non-null and owned by the caller for this call.
     match unsafe { builder_append(builder, &pod) } {
         Ok(p) => {
@@ -266,9 +266,9 @@ unsafe extern "C" fn codec_validate_config(
         return -EINVAL;
     }
     match caps::validate_config(caps) {
-        Ok(f) => {
+        Ok(_) => {
             // SAFETY: info checked non-null and points at a struct spa_audio_info.
-            unsafe { info.write(audio_info(&f)) };
+            unsafe { info.write(audio_info(&caps::STREAM)) };
             0
         }
         Err(e) => caps_err(e),
@@ -296,8 +296,8 @@ unsafe extern "C" fn codec_init(
             rate: info.raw.rate,
             channels: info.raw.channels,
         };
-        let format = caps::check_stream(config, &stream).map_err(caps_err)?;
-        Session::new(&format, mtu).map_err(|e| session_err(e.into()))
+        let level = caps::check_stream(config, &stream).map_err(caps_err)?;
+        Session::new(level, mtu).map_err(session_err)
     })();
     match res {
         Ok(s) => Box::into_raw(Box::new(s)).cast(),
@@ -334,10 +334,8 @@ unsafe extern "C" fn codec_get_interval(data: *mut c_void) -> u64 {
 
 unsafe extern "C" fn codec_abr_process(data: *mut c_void, unsent: usize) -> c_int {
     // SAFETY: PipeWire passes the pointer from init.
-    match unsafe { session(data) }.abr_process(unsent) {
-        Ok(()) => 0,
-        Err(e) => session_err(e),
-    }
+    unsafe { session(data) }.abr_process(unsent);
+    0
 }
 
 unsafe extern "C" fn codec_start_encode(

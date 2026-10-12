@@ -1,52 +1,42 @@
-//! One encoding stream: packetisation around a [`PacketEncoder`]. Safe Rust, no FFI.
+//! One encoding stream: RTP framing around an [`aptx_adaptive::Stream`]. Safe Rust, no FFI.
 
-use aptx_adaptive::{Config, Encoder, Error};
+use aptx_adaptive::{
+    Config, Core, DecoderLevel, Encoder, Error, HEADER_LEN, Profile, Stream, packet_budget,
+};
 
-use crate::pod::RawFormat;
+/// How the 8-byte aptX Adaptive header goes on air (spec §7.2, `QUESTIONS.md`). Unconfirmed
+/// either way; needs a capture from an Android source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Framing {
+    /// The spec's hypothesis: header bytes 0..3 are the RTP timestamp and 4..7 the SSRC, most
+    /// significant byte first. No payload prefix.
+    HeaderInRtp,
+    /// A normal RTP header (timestamp in samples), then the 8 bytes as a payload prefix.
+    #[cfg_attr(not(test), expect(dead_code, reason = "selected by editing FRAMING"))]
+    HeaderAfterRtp,
+}
 
-/// UNCERTAIN: whether aptX Adaptive media packets start with an RTP header. aptX HD and
-/// LDAC use one, classic aptX doesn't. Flip once the spec says.
-pub const USE_RTP: bool = true;
+pub const FRAMING: Framing = Framing::HeaderInRtp;
+
 pub const RTP_HEADER_LEN: usize = 12;
+/// UNCERTAIN: the spec doesn't give one. aptX HD uses 96.
 const RTP_PAYLOAD_TYPE: u8 = 96;
 const RTP_SSRC: u32 = 1;
 
 const BYTES_PER_SAMPLE: usize = 4;
 
-/// The boundary between the PipeWire glue and the codec proper.
-pub trait PacketEncoder {
-    fn channels(&self) -> usize;
-    /// PCM frames consumed per packet.
-    fn samples_per_packet(&self) -> usize;
-    fn encode_packet(&mut self, pcm: &[i32], out: &mut [u8]) -> Result<usize, Error>;
-    fn delay_samples(&self) -> u32;
-    /// Bitrate adaptation, given the bytes still queued in the socket.
-    ///
-    /// # Errors
-    /// `Unimplemented` until the spec defines it.
-    fn abr_process(&mut self, _unsent: usize) -> Result<(), Error> {
-        Err(Error::Unimplemented)
-    }
-}
-
-impl PacketEncoder for Encoder {
-    fn channels(&self) -> usize {
-        usize::from(self.config().channels)
-    }
-    fn samples_per_packet(&self) -> usize {
-        Encoder::samples_per_packet(self)
-    }
-    fn encode_packet(&mut self, pcm: &[i32], out: &mut [u8]) -> Result<usize, Error> {
-        Encoder::encode_packet(self, pcm, out)
-    }
-    fn delay_samples(&self) -> u32 {
-        Encoder::delay_samples(self)
+/// A fixed HQ level-3 stream at 48 kHz stereo (spec §8.4).
+fn config(level: DecoderLevel) -> Config {
+    Config {
+        profile: Profile::Hq,
+        sample_rate: 48_000,
+        channels: 2,
+        level,
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionError {
-    Invalid,
     NoSpace,
     Unsupported,
 }
@@ -54,8 +44,7 @@ pub enum SessionError {
 impl From<Error> for SessionError {
     fn from(e: Error) -> Self {
         match e {
-            Error::OutputTooSmall => Self::NoSpace,
-            Error::InputLength { .. } => Self::Invalid,
+            Error::OutputTooSmall | Error::WindowSize => Self::NoSpace,
             Error::UnsupportedConfig | Error::Unimplemented => Self::Unsupported,
         }
     }
@@ -67,90 +56,112 @@ pub struct EncodeResult {
     pub flush: bool,
 }
 
-pub struct Session<E> {
-    encoder: E,
-    rate: u32,
+pub struct Session<C> {
+    stream: Stream<C>,
+    framing: Framing,
     mtu: usize,
-    header_len: usize,
     pcm: Vec<i32>,
 }
 
 impl Session<Encoder> {
     /// # Errors
-    /// Whatever the encoder rejects.
-    pub fn new(format: &RawFormat, mtu: usize) -> Result<Self, Error> {
-        let channels =
-            u8::try_from(format.positions.len()).map_err(|_| Error::UnsupportedConfig)?;
-        let encoder = Encoder::new(Config {
-            sample_rate: format.rate,
-            channels,
-        })?;
-        Ok(Self::with_encoder(encoder, format.rate, mtu))
+    /// Whatever the encoder rejects, or `NoSpace` if the MTU can't fit a packet.
+    pub fn new(level: DecoderLevel, mtu: usize) -> Result<Self, SessionError> {
+        let stream = Stream::new(config(level), budget(FRAMING, mtu))?;
+        Self::with_stream(stream, FRAMING, mtu)
     }
 }
 
-impl<E: PacketEncoder> Session<E> {
-    pub fn with_encoder(encoder: E, rate: u32, mtu: usize) -> Self {
-        let pcm = vec![0; encoder.samples_per_packet() * encoder.channels()];
-        Self {
-            encoder,
-            rate,
-            mtu,
-            header_len: 0,
-            pcm,
+fn header_len(framing: Framing) -> usize {
+    match framing {
+        Framing::HeaderInRtp => RTP_HEADER_LEN,
+        Framing::HeaderAfterRtp => RTP_HEADER_LEN + HEADER_LEN,
+    }
+}
+
+/// The spec's MTU − 8 budget assumes only the 8-byte header precedes the packet, so take off
+/// whatever extra our RTP framing adds.
+fn budget(framing: Framing, mtu: usize) -> usize {
+    packet_budget(mtu.saturating_sub(header_len(framing) - HEADER_LEN))
+}
+
+impl<C: Core> Session<C> {
+    /// # Errors
+    /// `NoSpace` if a packet and its headers don't fit in the MTU. The packet budget never goes
+    /// below 128 bytes, so a small enough MTU can't be met.
+    pub fn with_stream(
+        stream: Stream<C>,
+        framing: Framing,
+        mtu: usize,
+    ) -> Result<Self, SessionError> {
+        if header_len(framing) + stream.row().packet_bytes > mtu {
+            return Err(SessionError::NoSpace);
         }
+        Ok(Self {
+            pcm: vec![0; stream.samples_per_packet()],
+            stream,
+            framing,
+            mtu,
+        })
     }
 
+    /// One packet's worth of interleaved `S24_32` PCM.
     pub fn block_size(&self) -> usize {
         self.pcm.len() * BYTES_PER_SAMPLE
     }
 
     pub fn interval_ns(&self) -> u64 {
-        self.encoder.samples_per_packet() as u64 * 1_000_000_000 / u64::from(self.rate)
+        u64::from(self.stream.row().period_ms) * 1_000_000
     }
 
+    #[expect(
+        clippy::unused_self,
+        reason = "the encoder delay isn't in the spec yet"
+    )]
     pub fn delay_samples(&self) -> u32 {
-        self.encoder.delay_samples()
+        0
     }
 
-    /// # Errors
-    /// Whatever the encoder reports, `Unsupported` while it has no bitrate adaptation.
-    pub fn abr_process(&mut self, unsent: usize) -> Result<(), SessionError> {
-        Ok(self.encoder.abr_process(unsent)?)
-    }
+    /// The per-packet bitrate rule lives in the stream loop (spec §5 step 7). What a Linux
+    /// source should do with socket backlog is an open question, so this does nothing.
+    #[expect(
+        clippy::unused_self,
+        reason = "backlog-driven adaptation is an open spec question"
+    )]
+    pub fn abr_process(&mut self, _unsent: usize) {}
 
-    /// Writes the packet header and returns its length.
+    /// Writes the RTP header (and the aptX header if it's a prefix) and returns its length.
     ///
     /// # Errors
-    /// `NoSpace` if `dst` can't hold the header plus some payload.
+    /// `NoSpace` if `dst` can't hold the header.
     pub fn start_encode(
         &mut self,
         dst: &mut [u8],
         seqnum: u16,
         timestamp: u32,
     ) -> Result<usize, SessionError> {
-        self.header_len = 0;
-        if !USE_RTP {
-            return Ok(0);
-        }
-        if dst.len() <= RTP_HEADER_LEN {
-            return Err(SessionError::NoSpace);
-        }
-        let h = &mut dst[..RTP_HEADER_LEN];
+        let len = header_len(self.framing);
+        let h = dst.get_mut(..len).ok_or(SessionError::NoSpace)?;
+        let aptx = self.stream.header();
         h[0] = 2 << 6;
         h[1] = RTP_PAYLOAD_TYPE;
         h[2..4].copy_from_slice(&seqnum.to_be_bytes());
-        h[4..8].copy_from_slice(&timestamp.to_be_bytes());
-        h[8..12].copy_from_slice(&RTP_SSRC.to_be_bytes());
-        self.header_len = RTP_HEADER_LEN;
-        Ok(RTP_HEADER_LEN)
+        match self.framing {
+            Framing::HeaderInRtp => h[4..12].copy_from_slice(&aptx),
+            Framing::HeaderAfterRtp => {
+                h[4..8].copy_from_slice(&timestamp.to_be_bytes());
+                h[8..12].copy_from_slice(&RTP_SSRC.to_be_bytes());
+                h[12..].copy_from_slice(&aptx);
+            }
+        }
+        Ok(len)
     }
 
-    /// Encodes one block of interleaved native-endian 32-bit PCM into `dst`. One encoder
-    /// packet per A2DP packet for now, so every successful call asks for a flush.
+    /// Takes one block of interleaved native-endian `S24_32` PCM and writes a packet to `dst`
+    /// when the loop produces one. Each packet is its own A2DP packet.
     ///
     /// # Errors
-    /// Encoder failures, or `NoSpace` if the MTU leaves no room for payload.
+    /// Encoder failures, or `NoSpace` if `dst` can't hold a packet.
     pub fn encode(&mut self, src: &[u8], dst: &mut [u8]) -> Result<EncodeResult, SessionError> {
         let block = self.block_size();
         if src.len() < block {
@@ -162,127 +173,174 @@ impl<E: PacketEncoder> Session<E> {
         }
         let room = self
             .mtu
-            .checked_sub(self.header_len)
-            .ok_or(SessionError::NoSpace)?
+            .saturating_sub(header_len(self.framing))
             .min(dst.len());
-        if room == 0 {
-            return Err(SessionError::NoSpace);
-        }
         let (samples, _) = src[..block].as_chunks::<4>();
         for (s, b) in self.pcm.iter_mut().zip(samples) {
-            *s = i32::from_ne_bytes(*b);
+            // S24_32 leaves the top byte unspecified; the encoder wants it sign-extended.
+            *s = (i32::from_ne_bytes(*b) << 8) >> 8;
         }
-        let written = self.encoder.encode_packet(&self.pcm, &mut dst[..room])?;
+        let written = self.stream.push(&self.pcm, &mut dst[..room])?;
         Ok(EncodeResult {
             consumed: block,
-            written,
-            flush: true,
+            written: written.unwrap_or(0),
+            flush: written.is_some(),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use aptx_adaptive::fake::{self, Fake};
+
     use super::*;
 
-    /// Test double: writes the first sample's low byte once per channel.
-    struct Stub;
+    const MTU: usize = 895;
 
-    impl PacketEncoder for Stub {
-        fn channels(&self) -> usize {
-            2
-        }
-        fn samples_per_packet(&self) -> usize {
-            4
-        }
-        fn encode_packet(&mut self, pcm: &[i32], out: &mut [u8]) -> Result<usize, Error> {
-            if out.len() < 2 {
-                return Err(Error::OutputTooSmall);
-            }
-            out[0] = pcm[0] as u8;
-            out[1] = pcm[1] as u8;
-            Ok(2)
-        }
-        fn delay_samples(&self) -> u32 {
-            7
-        }
+    fn session(framing: Framing) -> Session<Fake> {
+        session_with(framing, MTU, budget(framing, MTU))
+    }
+
+    fn session_with(framing: Framing, mtu: usize, budget: usize) -> Session<Fake> {
+        let stream = fake::stream(config(DecoderLevel::R1), budget).unwrap();
+        Session::with_stream(stream, framing, mtu).unwrap()
     }
 
     #[test]
-    fn rtp_header() {
-        let mut s = Session::with_encoder(Stub, 48_000, 100);
+    fn default_is_header_in_rtp() {
+        assert_eq!(FRAMING, Framing::HeaderInRtp);
+    }
+
+    #[test]
+    fn header_in_rtp() {
+        let mut s = session(Framing::HeaderInRtp);
         let mut buf = [0xff; 64];
+        assert_eq!(s.start_encode(&mut buf, 0x1234, 0xdead_beef), Ok(12));
         assert_eq!(
-            s.start_encode(&mut buf, 0x1234, 0xdead_beef),
-            Ok(RTP_HEADER_LEN)
-        );
-        assert_eq!(
-            buf[..12],
-            [0x80, 96, 0x12, 0x34, 0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 1]
+            buf[..13],
+            [
+                0x80, 96, 0x12, 0x34, 0x1f, 0x63, 0x38, 0x01, 0, 0, 0, 0xae, 0xff
+            ]
         );
     }
 
     #[test]
-    fn encodes_one_block_and_flushes() {
-        let mut s = Session::with_encoder(Stub, 48_000, 100);
-        assert_eq!(s.block_size(), 32);
-        let mut src = vec![0u8; 40];
+    fn header_after_rtp() {
+        let mut s = session(Framing::HeaderAfterRtp);
+        let mut buf = [0xff; 64];
+        assert_eq!(s.start_encode(&mut buf, 0x1234, 0xdead_beef), Ok(20));
+        assert_eq!(
+            buf[..21],
+            [
+                0x80, 96, 0x12, 0x34, 0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 1, 0x1f, 0x63, 0x38, 0x01,
+                0, 0, 0, 0xae, 0xff
+            ]
+        );
+    }
+
+    #[test]
+    fn start_encode_needs_room() {
+        let mut s = session(Framing::HeaderAfterRtp);
+        assert_eq!(
+            s.start_encode(&mut [0; 19], 0, 0),
+            Err(SessionError::NoSpace)
+        );
+    }
+
+    #[test]
+    fn timing() {
+        let s = session(FRAMING);
+        assert_eq!(s.block_size(), 1344 * 4);
+        assert_eq!(s.interval_ns(), 14_000_000);
+        assert_eq!(s.delay_samples(), 0);
+    }
+
+    #[test]
+    fn one_block_one_swapped_packet() {
+        let mut s = session(FRAMING);
+        let mut src = vec![0u8; s.block_size() + 8];
         src[..4].copy_from_slice(&5i32.to_ne_bytes());
-        src[4..8].copy_from_slice(&6i32.to_ne_bytes());
-        let mut dst = [0u8; 64];
+        src[4..8].copy_from_slice(&0x00ff_ff06_i32.to_ne_bytes());
+        let mut dst = [0xffu8; 1000];
         let r = s.encode(&src, &mut dst).unwrap();
-        assert_eq!((r.consumed, r.written, r.flush), (32, 2, true));
-        assert_eq!(dst[..2], [5, 6]);
+        assert_eq!((r.consumed, r.written, r.flush), (5376, 656, true));
+        assert_eq!(dst[..3], [6, 5, 0]);
+        assert_eq!(dst[656], 0xff);
     }
 
     #[test]
     fn short_input_consumes_nothing() {
-        let mut s = Session::with_encoder(Stub, 48_000, 100);
-        let r = s.encode(&[0; 8], &mut [0; 64]).unwrap();
+        let mut s = session(FRAMING);
+        let r = s.encode(&[0; 8], &mut [0; 1000]).unwrap();
         assert_eq!((r.consumed, r.flush), (0, false));
     }
 
     #[test]
-    fn payload_limited_by_mtu() {
-        let mut s = Session::with_encoder(Stub, 48_000, RTP_HEADER_LEN + 1);
-        s.start_encode(&mut [0; 64], 0, 0).unwrap();
-        assert_eq!(
-            s.encode(&[0; 32], &mut [0; 64]).err(),
-            Some(SessionError::NoSpace)
-        );
-    }
-
-    #[test]
-    fn interval_and_delay() {
-        let s = Session::with_encoder(Stub, 48_000, 100);
-        assert_eq!(s.interval_ns(), 83_333);
-        assert_eq!(s.delay_samples(), 7);
-    }
-
-    #[test]
-    fn abr_unsupported_by_default() {
-        let mut s = Session::with_encoder(Stub, 48_000, 100);
-        assert_eq!(s.abr_process(0), Err(SessionError::Unsupported));
-    }
-
-    #[test]
-    fn rejects_unsupported_rate() {
-        let format = RawFormat {
-            rate: 44_100,
-            ..crate::caps::STREAM
-        };
+    fn mtu_too_small_fails_at_init() {
+        let stream = fake::stream(config(DecoderLevel::R1), 2008).unwrap();
         assert!(matches!(
-            Session::new(&format, 800),
-            Err(Error::UnsupportedConfig)
+            Session::with_stream(stream, FRAMING, 600),
+            Err(SessionError::NoSpace)
         ));
+        // The budget floor is 128 bytes, which a tiny MTU can't hold.
+        assert!(matches!(
+            Session::new(DecoderLevel::R1, 100),
+            Err(SessionError::NoSpace)
+        ));
+        assert!(Session::new(DecoderLevel::R1, 140).is_ok());
+    }
+
+    /// 1 s through the codec the way `media-sink.c` drives it: `start_encode` into a fresh
+    /// buffer, `encode` whole blocks until `need_flush`, send, repeat.
+    #[test]
+    fn one_second_like_media_sink() {
+        for framing in [Framing::HeaderInRtp, Framing::HeaderAfterRtp] {
+            let mut s = session(framing);
+            let header = header_len(framing);
+            let frames = 48_000;
+            let pcm: Vec<u8> = (0..frames * 2)
+                .flat_map(|i: i32| (i / 2).to_ne_bytes())
+                .collect();
+            let block = s.block_size();
+            let mut buffer = vec![0u8; 8192];
+            let mut sent = Vec::new();
+            let mut used = s.start_encode(&mut buffer, 0, 0).unwrap();
+            for (seq, src) in pcm.chunks_exact(block).enumerate() {
+                let r = s.encode(src, &mut buffer[used..]).unwrap();
+                assert_eq!(r.consumed, block);
+                used += r.written;
+                if r.flush {
+                    sent.push(buffer[..used].to_vec());
+                    used = s.start_encode(&mut buffer, seq as u16 + 1, 0).unwrap();
+                }
+            }
+            assert_eq!(sent.len(), 71);
+            for (i, p) in sent.iter().enumerate() {
+                assert_eq!(p.len(), header + 656);
+                assert_eq!(p[2..4], (i as u16).to_be_bytes());
+                assert!(p.len() <= MTU);
+                // The fake writes the low byte of each packet's first sample pair, swapped.
+                let first = (i * 672) as u8;
+                assert_eq!(p[header..header + 2], [first, first]);
+            }
+        }
+    }
+
+    #[test]
+    fn small_mtu_shrinks_packets() {
+        assert_eq!(budget(Framing::HeaderInRtp, 600), 588);
+        assert_eq!(budget(Framing::HeaderAfterRtp, 600), 580);
+        let s = Session::new(DecoderLevel::R1, 600).unwrap();
+        assert_eq!(s.stream.row().packet_bytes, 588);
     }
 
     #[test]
     fn real_encoder_is_unimplemented() {
-        let mut s = Session::new(&crate::caps::STREAM, 800).unwrap();
+        let mut s = Session::new(DecoderLevel::R1, MTU).unwrap();
+        assert_eq!(s.stream.row().packet_bytes, 656);
         let src = vec![0u8; s.block_size()];
         assert_eq!(
-            s.encode(&src, &mut [0; 800]).err(),
+            s.encode(&src, &mut [0; 1000]).err(),
             Some(SessionError::Unsupported)
         );
     }

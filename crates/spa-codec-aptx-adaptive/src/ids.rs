@@ -16,3 +16,6 @@ pub const VENDOR_HEADER: [u8; 6] = {
     let c = CODEC_ID.to_le_bytes();
     [v[0], v[1], v[2], v[3], c[0], c[1]]
 };
+
+/// LOSC 42 minus the media and codec type bytes.
+pub const CAPS_LEN: usize = 40;
