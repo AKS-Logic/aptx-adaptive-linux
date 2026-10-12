@@ -166,3 +166,12 @@ Leading hypothesis: the Px7's aptX Adaptive SEP only reports Delay Reporting to 
 
 - A2DP 1.3 + aptX Adaptive configured directly (only SBC + aptx_adaptive offered, no aptX HD first) + mpris-proxy with mpv playing a 1 kHz tone + absolute volume (SetAbsoluteVolume sent): **still silent**. AVRCP play status was still reported as PAUSED during the stream. Delay Reporting was configured.
 - **User observation:** with a Qualcomm-based USB aptX Adaptive dongle, the Px7 S2e **never worked at 48 kHz**; the dongle had to be forced to **96 kHz**. If that's a property of the headset rather than the dongle, our 48 kHz R1 stream may be exactly the case the headset doesn't play. But the phone plays at 48 kHz (its SetConfiguration says 48k), so it may be the dongle's own behaviour. To check: whether the Px7 advertises 96k at all (caps byte 6 = 0x19, while 96k is 0xA0 per the public header, so probably not), and what bit 0x01 of byte 6 means.
+
+## final software-side test (2026-10-13): everything combined, still silent
+
+- Patched bluetoothd advertising A2DP 1.3 (the headset then offers Delay Reporting; our SetConfiguration includes it; the headset sends a Delay Report).
+- The phone's link settings applied on the connection before Start: Write Link Policy 0 (no sniff, no role switch) and Flow Specification (outgoing, guaranteed), both successful.
+- The phone's own captured aptX Adaptive packets (2609 packets, about 36 s) replayed in the phone's exact on-air layout, 14 ms pacing; 3208 packets went out after Start was accepted.
+- The Px7 S2e stayed connected and silent. It played its disconnect chime right after connecting, before any audio.
+
+Conclusion: every AVDTP, SDP, AVRCP, L2CAP, HCI link-policy and media-byte difference we could find between the working phone and this host has now been matched. What's left is the controller (Realtek RTL8922 vs Qualcomm), below what the host can control. Next: test with a Qualcomm-based HCI controller (e.g. QCNFA765/WCN6855 or QCA6174A M.2 card in an M.2-to-USB adapter), keeping A2DP 1.3.
