@@ -648,3 +648,14 @@ With source type 2 (§7E), the sink reads the RTP header like this:
 - **Payload:** one codec packet per RTP packet, directly after the 12-byte header.
 
 UNCERTAIN: an older generation of the sink reads the timestamp as plain µs. Test results so far fit the newer reading above.
+
+## 7G. Target latency with source type 2: don't send 0 (2026-10-13)
+
+Correction to §7F: "Out-of-range values become the minimum, so the Px7's HQ byte `0x00` gives 200 ms" is **wrong**. With source type 2 the sink uses config byte 10 (TTP HQ, in 2 ms units) as its **target latency**, and `0x00` gives a **0 ms** target.
+
+- Evidence: in every source-type-2 capture the Px7's Delay Report is 200 ms before Start and **0.0 ms** about 0.7 s after Start. The Delay Report carries the sink's active target.
+- With a 0 ms target, the sink's only headroom is whatever the stream start accidentally gives it. Its rate trim slowly removes that headroom, and once it falls below the link's arrival jitter (30–45 ms), late-packet resets start: an audible stutter after roughly 80–110 s, worse under link or host jitter.
+- **Fix:** with source type 2, set TTP HQ (body byte 10) to `0x64` (100 × 2 ms = **200 ms**). For the Px7 the config becomes `d7 00 00 00 ad 00 12 02 37 6a 64 af 64 4b 00 00 aa` + zeros. Check: the Delay Report after Start should read 200.0 ms.
+- More generally, for source type 2 don't echo a zero latency byte from the sink's caps: replace a 0 with a sensible default (HQ 200 ms, `0x64`). Bytes 8/9 are LL in ms (the Px7's `37` = 55 ms is non-zero, so fine). Bytes 12/13 are TWS in 2 ms units.
+- Drift: with a proper target the sink corrects source/sink clock drift itself. A rate trim driven by early/late arrival against TTP, up to ±0.5 %, settles in about 50 s. A source shouldn't try to correct drift: keep the timestamp's high word (TTP adjust) at 0. Changing it doesn't reset playback, but it changes the target and makes the sink speed up or slow down.
+- Avoid a hole or burst at stream start if possible. It doesn't break anything with a proper target, but it costs headroom.
