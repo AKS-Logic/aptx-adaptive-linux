@@ -200,3 +200,19 @@ The user notes this chime isn't normal headset behaviour. What the captures show
 ## BREAKTHROUGH (2026-10-13 07:32): source type 2 → audible output
 
 With SetConfiguration byte 6 = `0x12` (source type 2, spec §7E), A2DP 1.3, phone framing (µs timestamps, SSRC `00 00 00 ae`), and the real encoder on a 1 kHz tone, the Px7 S2e **produced sound**: "crackly morse code". The headset now decodes our stream; what remains is timing or quality. Next: SSRC (`a3`), timestamp unit (samples), and packet pacing (the drops after packet 25).
+
+### follow-up: why it's crackly (2026-10-13)
+
+btmon, time from sending each media ACL packet to the controller's Number of Completed Packets:
+
+| run | source type | completion latency median / p90 |
+|---|---|---|
+| a13b, fin2 (before §7E) | 0 | 20 / 30 ms (normal; the headset silently ignored the audio) |
+| st2 (first source-type-2 run, µs timestamps) | 2 | **310 / 430 ms** |
+| ts-samples (sample-count timestamps) | 2 | 42 / 79 ms |
+| aptX HD baseline, same session | n/a | 22 / 33 ms, clean audio |
+
+- With source type 2 the headset **accepts and decodes** the stream, but it takes the media far more slowly than it arrives. The controller's buffers (8 ACL buffers) fill up, so PipeWire's socket backs up and drops packets (sequence gaps; 511 of an expected 1596 packets went out in 22 s). That gives the crackling, the slow start and the slow stop.
+- With µs timestamps it was far worse than with sample-count timestamps. So the sink uses the timestamp to pace itself: a timestamp that runs too fast or too slow makes the sink hold back or drain slowly, which stalls the link at the baseband level.
+- With samples (+672 per 14 ms packet), the stall shrinks but doesn't go away. Candidates: the expected timestamp clock rate is something else (e.g. 1/90 kHz or 1/32 kHz units?); the SSRC should be `a3` in this mode instead of `ae`; or the TTP bytes in our config are too small for a non-Q2Q source.
+- Next: try SSRC `a3`, then the timestamp at other rates; watch the completion latency in btmon. Target: about 20 ms like aptX HD.
