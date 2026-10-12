@@ -4,13 +4,14 @@
 # -6 dBFS, looping) with the real caps, framing, RTP and timing. Lets us test negotiation and
 # framing on a headset before the codec core exists.
 #
-#   scripts/dev-replay.sh [ttp-clock|ttp-clock-offset|header-in-rtp|header-after-rtp|header-in-rtp-swapped] [vector]
+#   scripts/dev-replay.sh [header-after-rtp|ttp-clock|ttp-clock-offset|header-in-rtp|header-in-rtp-swapped] [vector]
 #
-# Framings (default ttp-clock):
+# Framings (default header-after-rtp):
+#   header-after-rtp       spec §7C: normal RTP header (PT 96, timestamp = sample count, +672
+#                          per packet; SSRC 0), then the 8-byte header, then the payload
 #   ttp-clock              RTP timestamp = µs clock from 0, +14000 per packet; SSRC 00 00 00 AE (spec §7B)
 #   ttp-clock-offset       same, clock starts at the TTP offset (203000 µs on the Px7)
 #   header-in-rtp          old: constant timestamp 1F 63 38 01, SSRC 00 00 00 AE
-#   header-after-rtp       normal RTP header, 8-byte header as a payload prefix
 #   header-in-rtp-swapped  header-in-rtp with each 4-byte half reversed (§7A.2 option b)
 #
 # A/B switches (spec §7A.3), passed through to the plugin if set:
@@ -21,11 +22,11 @@
 # Doesn't restart anything or touch the headset; it prints the commands for that.
 set -euo pipefail
 
-framing=${1:-ttp-clock}
+framing=${1:-header-after-rtp}
 case $framing in
 ttp-clock | ttp-clock-offset | header-in-rtp | header-after-rtp | header-in-rtp-swapped) ;;
 *)
-	echo "usage: $0 [ttp-clock|ttp-clock-offset|header-in-rtp|header-after-rtp|header-in-rtp-swapped] [vector]" >&2
+	echo "usage: $0 [header-after-rtp|ttp-clock|ttp-clock-offset|header-in-rtp|header-in-rtp-swapped] [vector]" >&2
 	exit 2
 	;;
 esac

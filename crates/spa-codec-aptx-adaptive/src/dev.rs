@@ -5,7 +5,7 @@
 //!   the real code path. For testing negotiation and framing on a headset before the codec
 //!   core exists.
 //! - `APTX_ADAPTIVE_FRAMING=ttp-clock|ttp-clock-offset|header-in-rtp|header-after-rtp`:
-//!   overrides [`session::FRAMING`] (`ttp-clock`).
+//!   overrides [`session::FRAMING`] (`header-after-rtp`).
 //!   With `dev-replay`, also `header-in-rtp-swapped` (spec §7A.2 option b).
 //! - `APTX_ADAPTIVE_PT=0..127`, only with `dev-replay`: the RTP payload type.
 //! - `APTX_ADAPTIVE_NOSWAP=1`, only with `dev-replay`: send the payload without the 16-bit swap.
@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(o.framing, session::FRAMING);
         assert_eq!(o.replay, None);
         assert_eq!(o.describe(&e), None);
-        let e = env(&[(REPLAY_VAR, ""), (FRAMING_VAR, "ttp-clock")]);
+        let e = env(&[(REPLAY_VAR, ""), (FRAMING_VAR, "header-after-rtp")]);
         let o = Options::from_env(&e).unwrap();
         assert_eq!(o.replay, None);
         assert_eq!(o.describe(&e), None);
@@ -243,17 +243,18 @@ mod tests {
 
     #[test]
     fn parses_framing() {
-        let e = env(&[(FRAMING_VAR, "header-after-rtp")]);
+        let e = env(&[(FRAMING_VAR, "ttp-clock")]);
         let o = Options::from_env(&e).unwrap();
-        assert_eq!(o.framing, Framing::HeaderAfterRtp);
+        assert_eq!(o.framing, Framing::TtpClock);
         assert_eq!(
             o.describe(&e).as_deref(),
-            Some("aptx-adaptive: framing: HeaderAfterRtp")
+            Some("aptx-adaptive: framing: TtpClock")
         );
         assert!(Options::from_env(env(&[(FRAMING_VAR, "bogus")])).is_err());
         for (name, framing) in [
             ("ttp-clock-offset", Framing::TtpClockOffset),
             ("header-in-rtp", Framing::HeaderInRtp),
+            ("header-after-rtp", Framing::HeaderAfterRtp),
         ] {
             let o = Options::from_env(env(&[(FRAMING_VAR, name)])).unwrap();
             assert_eq!(o.framing, framing);

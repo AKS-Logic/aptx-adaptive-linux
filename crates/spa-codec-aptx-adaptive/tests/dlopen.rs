@@ -293,17 +293,18 @@ fn init_succeeds_but_encode_is_unimplemented() {
         assert_eq!(block, BLOCK_SIZE);
         let mut out = [0u8; 1024];
         let hdr = c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), 1, 0);
-        assert_eq!(hdr, 12);
-        // ttp-clock: the first packet's timestamp is 0, SSRC is header bytes 4..7.
-        assert_eq!(out[4..12], [0, 0, 0, 0, 0, 0, 0, 0xae]);
+        assert_eq!(hdr, 20);
+        // header-after-rtp (spec §7C): timestamp 0 as passed, SSRC 0, then the 8-byte header.
+        assert_eq!(out[4..12], [0; 8]);
+        assert_eq!(out[12..20], [0x1f, 0x63, 0x38, 0x01, 0, 0, 0, 0xae]);
         let pcm = vec![0u8; block as usize];
         let (mut written, mut flush) = (0usize, 0);
         let res = c.encode.unwrap()(
             data,
             pcm.as_ptr().cast(),
             pcm.len(),
-            out.as_mut_ptr().add(12).cast(),
-            out.len() - 12,
+            out.as_mut_ptr().add(20).cast(),
+            out.len() - 20,
             &raw mut written,
             &raw mut flush,
         );

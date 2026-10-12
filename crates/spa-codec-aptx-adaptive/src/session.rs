@@ -21,19 +21,20 @@ pub enum Framing {
     /// Header bytes 0..3 are the RTP timestamp (constant) and 4..7 the SSRC, most significant
     /// byte first. No payload prefix.
     HeaderInRtp,
-    /// A normal RTP header (timestamp in samples), then the 8 bytes as a payload prefix.
+    /// Spec §7C: a normal RTP header (timestamp = sample count, as `media-sink.c` passes it;
+    /// SSRC 0), then the 8 bytes as a payload prefix, then the swapped packet.
     HeaderAfterRtp,
     /// DEV ONLY (spec §7A.2 option b): like `HeaderInRtp` with each 4-byte half reversed.
     HeaderInRtpSwapped,
 }
 
 /// The default; `APTX_ADAPTIVE_FRAMING` overrides it (see `dev`).
-pub const FRAMING: Framing = Framing::TtpClock;
+pub const FRAMING: Framing = Framing::HeaderAfterRtp;
 
 pub const RTP_HEADER_LEN: usize = 12;
 /// UNCERTAIN: the spec doesn't give one. aptX HD uses 96.
 pub const RTP_PAYLOAD_TYPE: u8 = 96;
-const RTP_SSRC: u32 = 1;
+const RTP_SSRC: u32 = 0;
 
 const BYTES_PER_SAMPLE: usize = 4;
 
@@ -295,8 +296,8 @@ mod tests {
     }
 
     #[test]
-    fn default_is_ttp_clock() {
-        assert_eq!(FRAMING, Framing::TtpClock);
+    fn default_is_header_after_rtp() {
+        assert_eq!(FRAMING, Framing::HeaderAfterRtp);
     }
 
     /// Sends `n` packets and returns their RTP headers.
@@ -379,10 +380,30 @@ mod tests {
         assert_eq!(
             buf[..21],
             [
-                0x80, 96, 0x12, 0x34, 0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 1, 0x1f, 0x63, 0x38, 0x01,
+                0x80, 96, 0x12, 0x34, 0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0x1f, 0x63, 0x38, 0x01,
                 0, 0, 0, 0xae, 0xff
             ]
         );
+    }
+
+    /// Spec §7C, driven like `media-sink.c`: the timestamp is the sample count so far.
+    #[test]
+    fn header_after_rtp_counts_samples() {
+        let mut s = session(Framing::HeaderAfterRtp);
+        let src = vec![0u8; s.block_size()];
+        let mut buf = vec![0u8; 2048];
+        let mut sample_count = 0u32;
+        for i in 0..4u16 {
+            let len = s.start_encode(&mut buf, i, sample_count).unwrap();
+            assert_eq!(len, 20);
+            assert_eq!(buf[..4], [0x80, 96, 0, i as u8]);
+            assert_eq!(buf[4..8], (u32::from(i) * 672).to_be_bytes());
+            assert_eq!(buf[8..12], [0, 0, 0, 0]);
+            assert_eq!(buf[12..20], [0x1f, 0x63, 0x38, 0x01, 0, 0, 0, 0xae]);
+            let r = s.encode(&src, &mut buf[len..]).unwrap();
+            assert_eq!(len + r.written, 676);
+            sample_count += (r.consumed / BYTES_PER_SAMPLE / 2) as u32;
+        }
     }
 
     #[test]
@@ -473,7 +494,7 @@ mod tests {
             Session::new(DecoderLevel::R1, 100),
             Err(SessionError::NoSpace)
         ));
-        assert!(Session::new(DecoderLevel::R1, 140).is_ok());
+        assert!(Session::new(DecoderLevel::R1, 148).is_ok());
     }
 
     /// 1 s through the codec the way `media-sink.c` drives it: `start_encode` into a fresh
@@ -620,7 +641,7 @@ mod tests {
         assert_eq!(budget(Framing::TtpClock, 600), 588);
         assert_eq!(budget(Framing::HeaderAfterRtp, 600), 580);
         let s = Session::new(DecoderLevel::R1, 600).unwrap();
-        assert_eq!(s.stream.row().packet_bytes, 588);
+        assert_eq!(s.stream.row().packet_bytes, 580);
     }
 
     #[test]
