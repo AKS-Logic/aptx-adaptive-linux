@@ -110,3 +110,10 @@ Conclusion: the chime doesn't separate layouts. It seems tied to the restart and
 2. §8.1, n = 48..63: answered. 64 blocks, keep the packet open; the table had a typo. Spec fixed.
 4. Carry bound: answered, see §8.8. The reference has no limit and drops nothing. Don't drop frames; pick the bitrate from the packet size instead.
 5. Packet too small: answered, see §8.8. The encoder is never told the packet size at create; per call it rejects windows ≤ 11 bytes or > 2016 bytes.
+
+## live test round 5 (2026-10-13, best-evidenced layout, with btmon)
+
+- Layout on air (confirmed in the capture): `80 60 <seq> <ts +672/packet> 00 00 00 00 | 1f 63 38 01 00 00 00 ae | 656-byte swapped packet`, 676 bytes every 14 ms. Real encoder output (silence input) from the merged encoder, not the replay vector.
+- AVDTP SetConfiguration, Open and Start were accepted. 25 s of playback after a 30 s settle.
+- The headset played its **chime** during playback. The capture shows **no** link drop, no AVDTP Suspend/Abort/Close from the headset, no L2CAP disconnect, and no ACL data from the headset at all during playback: it stayed completely silent on the link. So the chime is the headset's own audio prompt, not a disconnect. It may be the "connected"/codec prompt, or a decoder error prompt.
+- Headset remote features (from the reconnect): page 0 `ff fe 8f fe db ff 5b 87`, page 1 `03`, max page 2. BlueZ never sends Read Remote Version Information, so the remote LMP version and manufacturer still need `hcitool info` (not installed) or a raw HCI command.
