@@ -216,3 +216,13 @@ btmon, time from sending each media ACL packet to the controller's Number of Com
 - With µs timestamps it was far worse than with sample-count timestamps. So the sink uses the timestamp to pace itself: a timestamp that runs too fast or too slow makes the sink hold back or drain slowly, which stalls the link at the baseband level.
 - With samples (+672 per 14 ms packet), the stall shrinks but doesn't go away. Candidates: the expected timestamp clock rate is something else (e.g. 1/90 kHz or 1/32 kHz units?); the SSRC should be `a3` in this mode instead of `ae`; or the TTP bytes in our config are too small for a non-Q2Q source.
 - Next: try SSRC `a3`, then the timestamp at other rates; watch the completion latency in btmon. Target: about 20 ms like aptX HD.
+
+### SSRC a3 + sample timestamps (2026-10-13, round 2 of source type 2)
+
+- Still crackly. The user heard a short stretch where it kept up, at very low quality.
+- Our host sent only about 23 packets/s instead of 71.4 (14 ms period). PipeWire drops packets when `send()` returns EAGAIN, so 2 of every 3 periods are skipped. The cause is the slow media completion at the controller: median 78 ms, p90 267 ms in the last session, against about 20 ms for aptX HD and for our earlier (ignored) source-type-0 streams.
+- The headset also set up an eSCO link at one point. HFP was active in this session: 2543 SCO frames, all before the final AVDTP Start. Not a factor in the final session.
+- So the headset is consuming aptX Adaptive at roughly a third of real time. Plausible causes, to test next:
+  1. **The sink paces its intake from the RTP timestamp, in units we don't match.** µs made it much worse (310 ms completion); samples (+672 per packet) is better but not right. Next candidates: 1/90 kHz? `ms·4`? Timestamps in the encoder's sample rate but per channel times 2 (+1344)?
+  2. **Packet size / bitrate:** the sink may expect a packet rate matching its own table for source type 2 (maybe a different period, e.g. 20 ms at 279 kbps).
+  3. **TTP bytes:** the config echoes the sink's `37 6a 00 af 64 4b`. For a non-Q2Q source the public defaults are `50 64 64 64 ff ff`; a TTP of 0x00 for HQ low may make the sink underrun and back-pressure.
