@@ -142,3 +142,15 @@ The HCI snoop file in the bugreport was empty (16 bytes): the vendor snoop logge
 - Offload parameters for this sink: sample rate 48k, 24-bit, sink buffering min/max 20/100 ms for LL, HQ and TWS, TTP bytes `37 6a 00 af 64 4b` (the sink's own), encoder "Mode" 4266 (0x10AA), "mode 4096" (0x1000) sent to the controller as aptX Adaptive mode, input mode 0, R2.1 supported true.
 - Interop: the phone checks `OplusAvrcpUseA2dpOnly` against the Px7 (no match).
 - "Don't use RTP header: false", so RTP is used.
+
+## phone to real Px7 S2e: real HCI log via the OnePlus log tool (2026-10-13)
+
+Exported with the OnePlus log tool (`*#800#` → Bluetooth → transmission). The A2DP media itself is offloaded and isn't in the log, but the whole setup is:
+
+- **Get All Capabilities for SEID 9 (aptX Adaptive), as the Px7 answers the phone:** Media Transport, Media Codec `19 0a 37 6a 00 af 64 4b 00 00 aa…`, Content Protection SCMS-T, **and Delay Reporting**. When BlueZ on our host asks, the Px7 answers with **no Delay Reporting**. So the headset advertises differently to us.
+- **The phone's SetConfiguration to SEID 9:** Media Transport + Media Codec `10 02 37 6a 00 af 64 4b 00 00 aa` + zeros (identical to ours) + **Delay Reporting**. No content protection.
+- After Open, the Px7 sends a Delay Report of 200 ms.
+- Media L2CAP channel: the phone asks for MTU 1024 and the Px7 for MTU 895, with flush timeout 65535 both ways. The phone then sends HCI Flow Specification (outgoing, guaranteed) and Sniff Subrating.
+- At Start the phone sends its controller a vendor command (OCF 0x000a, 66 bytes) with the codec config. That's offload only, and goes to its own chip, not the headset.
+
+Leading hypothesis: the Px7's aptX Adaptive SEP only reports Delay Reporting to some sources. Possibly it depends on the AVDTP version we advertise in SDP, or on something else in the source's identity or the request. Either way, the phone configures Delay Reporting and we don't. Next: find why the Px7 omits Delay Reporting for us (compare our SDP A2DP source record and AVDTP version with the phone's), and test forcing Delay Reporting into our SetConfiguration with the patched bluetoothd.
