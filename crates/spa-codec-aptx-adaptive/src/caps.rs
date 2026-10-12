@@ -36,6 +36,11 @@ const R1_DATA_END: usize = 17;
 /// End of the R2 extension block, including its end marker.
 const R2_DATA_END: usize = 26;
 
+/// With source type 2 the sink takes its target latency from these bytes, and a 0 means a 0 ms
+/// target (§7G), so a 0 in the sink's caps is replaced: LL0 80 ms, LL1 100 ms (ms), HQ 200 ms,
+/// TWS 200 ms (2 ms units).
+const TARGET_LATENCY_DEFAULTS: [(usize, u8); 4] = [(8, 0x50), (9, 0x64), (10, 0x64), (12, 0x64)];
+
 /// What a source with an R1-only encoder sends from body 8 on (§1.4).
 const R1_DEFAULT_DATA: [u8; 9] = [0x50, 0x64, 0x64, 0x64, 0xff, 0xff, 0x00, 0x00, 0xaa];
 
@@ -120,7 +125,8 @@ pub fn fill_caps() -> Vec<u8> {
 }
 
 /// Picks 48 kHz and one 2-channel mode, puts `source_type` (normally [`SOURCE_TYPE_HOST`]) in
-/// byte 6 bits 0..2 (§7E), and echoes the sink's own aptx data (§1.4, §1.5). The result is as
+/// byte 6 bits 0..2 (§7E), and echoes the sink's own aptx data (§1.4, §1.5), except that with
+/// [`SOURCE_TYPE_HOST`] a zero target latency byte gets a default (§7G). The result is as
 /// long as `caps`, with any bytes past [`CAPS_LEN`] zeroed, because PipeWire only offers the
 /// codec when the lengths match.
 ///
@@ -135,8 +141,16 @@ pub fn select_config(bytes: &[u8], source_type: u8) -> Result<Vec<u8>, CapsError
         .into_iter()
         .find(|m| caps.channel_modes() & m != 0)
         .ok_or(CapsError::Unsupported)?;
-    let rate = RATE_48K | (source_type & SOURCE_TYPE_MASK);
-    Ok(element(bytes.len(), rate, mode, caps.aptx_data()))
+    let source_type = source_type & SOURCE_TYPE_MASK;
+    let mut config = element(bytes.len(), RATE_48K | source_type, mode, caps.aptx_data());
+    if source_type == SOURCE_TYPE_HOST {
+        for (i, default) in TARGET_LATENCY_DEFAULTS {
+            if config[i] == 0 {
+                config[i] = default;
+            }
+        }
+    }
+    Ok(config)
 }
 
 /// Checks a configuration and gives the decoder level the encoder needs.
@@ -325,6 +339,27 @@ mod tests {
         let mut caps = PX7_S2E;
         caps[RATES] = 0x17;
         assert_eq!(select_config(&caps, 2).unwrap()[RATES], 0x12);
+    }
+
+    /// §7G: with source type 2 a zero latency byte gets a default; others are echoed.
+    #[test]
+    fn select_config_replaces_zero_latency() {
+        let config = select_config_host(&PX7_S2E).unwrap();
+        assert_eq!(config[8..14], [0x37, 0x6a, 0x64, 0xaf, 0x64, 0x4b]);
+        let mut caps = PX7_S2E;
+        caps[8..14].copy_from_slice(&[0, 0, 0, 0x11, 0, 0x22]);
+        let config = select_config_host(&caps).unwrap();
+        assert_eq!(config[8..14], [0x50, 0x64, 0x64, 0x11, 0x64, 0x22]);
+        let mut r2 = r2_caps(0x0F00_0003);
+        r2[10] = 0;
+        assert_eq!(select_config_host(&r2).unwrap()[10], 0x64);
+    }
+
+    /// Source type 0 echoes the sink's bytes, zeros included.
+    #[test]
+    fn select_config_source_type_0_echoes_zero_latency() {
+        let config = select_config(&PX7_S2E, 0).unwrap();
+        assert_eq!(config[8..17], PX7_S2E[8..17]);
     }
 
     #[test]

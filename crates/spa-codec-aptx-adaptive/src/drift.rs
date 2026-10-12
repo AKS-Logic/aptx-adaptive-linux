@@ -9,9 +9,11 @@
 //! `APTX_ADAPTIVE_DRIFT_LOG=0` silences it). The sink's Delay Report isn't visible to a
 //! `media_codec` (only `media-sink.c` sees the transport), so it isn't used.
 //!
-//! The timestamp's high 16 bits are a signed latency adjustment in ms (§7F). What the sink does
-//! when it changes isn't known yet, so the adjust is [`TtpAdjust::Off`] unless a `dev-replay`
-//! build sets `APTX_ADAPTIVE_TTP_ADJUST=off|fixed:<ms>|auto`.
+//! The timestamp's high 16 bits are a signed latency adjustment in ms (§7F). Per §7G a source
+//! shouldn't correct drift: with a proper target latency the sink does it itself, and a non-zero
+//! adjust changes the target and makes the sink speed up or slow down. So the adjust is
+//! [`TtpAdjust::Off`] (0) unless a `dev-replay` build sets
+//! `APTX_ADAPTIVE_TTP_ADJUST=off|fixed:<ms>|auto`.
 
 use std::ffi::OsStr;
 use std::fmt::{self, Write as _};
@@ -36,7 +38,7 @@ pub fn ttp_timestamp(adjust_ms: i16, frames: u16) -> u32 {
 /// What goes in the timestamp's high 16 bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TtpAdjust {
-    /// 0, the default.
+    /// 0, the default. Keep it: a source shouldn't correct drift (§7G).
     #[default]
     Off,
     /// DEV ONLY. A constant, in signed ms.
