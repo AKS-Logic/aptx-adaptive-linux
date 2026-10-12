@@ -659,3 +659,29 @@ Correction to §7F: "Out-of-range values become the minimum, so the Px7's HQ byt
 - More generally, for source type 2 don't echo a zero latency byte from the sink's caps: replace a 0 with a sensible default (HQ 200 ms, `0x64`). Bytes 8/9 are LL in ms (the Px7's `37` = 55 ms is non-zero, so fine). Bytes 12/13 are TWS in 2 ms units.
 - Drift: with a proper target the sink corrects source/sink clock drift itself. A rate trim driven by early/late arrival against TTP, up to ±0.5 %, settles in about 50 s. A source shouldn't try to correct drift: keep the timestamp's high word (TTP adjust) at 0. Changing it doesn't reset playback, but it changes the target and makes the sink speed up or slow down.
 - Avoid a hole or burst at stream start if possible. It doesn't break anything with a proper target, but it costs headroom.
+
+## 7H. Verified rules per profile and rate (2026-10-13)
+
+Checked against primary sources. This supersedes earlier statements where they differ.
+
+**Sample-rate bits (byte 6, bits 3..7).** 0x08 = 44.1 kHz, 0x10 = 48 kHz, 0x20 = 96 kHz, 0x40 = 192 kHz. (0x80 is a variant used only by newer sinks.) The "0x40 = 44.1 kHz" and "0xA0 = 96 kHz" readings in §1.2 are wrong for this sink family. With source type 2, byte 6 is therefore **44.1 kHz → `0x0A`, 48 kHz → `0x12`, 96 kHz → `0x22`**.
+
+**§7E corrections.** The SSRC is matched as a whole 32-bit value (not its low byte), and the timestamp rules are as in §7F, not "used relatively". `0xAE`/`0xAD` aren't valid SSRCs with source type 2.
+
+**Timestamp low 16 bits** = samples per channel in that packet, counted at the negotiated rate. **Never 0**: a zero makes the sink read the field as a time value instead. Examples:
+
+| profile / row | period | low 16 bits |
+|---|---|---|
+| HQ 48 kHz | 14 ms (672) | `0x02A0` |
+| LL 48 kHz | 10 ms (480) | `0x01E0` |
+| LL 48 kHz | 8 ms (384) | `0x0180` |
+| HQ 96 kHz | 15 ms (1440) | `0x05A0` |
+| HQ 96 kHz | 40 ms (3840) | `0x0F00` |
+
+**SSRC.** `0x000000A3` HQ, `0x000000A1` LL0, `0x000000A2` LL1, `0x000000A4` TWS. LL0 is the sink's "2.4 GHz Wi-Fi off" latency and LL1 is "2.4 GHz Wi-Fi on". The SSRC **must change** exactly when the encoder switches between HQ and LL. Each change costs one audible re-anchor in the sink; that's expected. Keeping the old SSRC leaves the sink at the old target latency.
+
+**TTP adjust (high 16 bits).** A signed value in ms, absolute: target = SSRC latency + adjust. Changing it doesn't reset playback: the sink slides to the new target using its ±0.5 % rate trim. **A source should send 0.** The sink corrects drift itself, so a source-side drift loop duplicates that work.
+
+**Target latency** comes from the bytes the source writes in SetConfiguration (body 8..11), not from the sink's caps. Headphone ranges are LL0 55–200 ms, LL1 75–230 ms, HQ 200–500 ms, TWS 200–500 ms. Out-of-range values become the minimum. The Px7 config we send (`37 6a 64 af`) decodes as LL0 55, LL1 106, HQ 200, TWS 350 ms. A host source should consider **LL0 ≥ 80 ms** (`0x50`) to absorb host and link jitter. Body bytes 12..13 aren't read.
+
+**Unverified.** Packet sizing and sample counts at 44.1 kHz; the rule for choosing TWS; the exact LL0/LL1 switching policy; whether payloads larger than 668 bytes are accepted with source type 2.
