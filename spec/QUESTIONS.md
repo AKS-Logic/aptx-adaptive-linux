@@ -246,3 +246,12 @@ btmon, time from sending each media ACL packet to the controller's Number of Com
 - A btmon capture during it shows our side as perfect: 71.4 packets/s, no sequence gaps, completion median 20 ms / p90 31 ms, 0 ppm drift of send times against the 14 ms audio clock.
 - Hypothesis to guard against anyway: clock drift between the host's audio clock and the sink's. With source type 2 the sink advances TTP purely by the sample count (§7F), with only a ±0.5 % rate trim. A sustained source/sink rate mismatch moves the sink's latency towards its min/max window and triggers TTP resets, which are audible glitches. The phone's packets show small adjustments (12/14 ms steps, ±1 µs jitter).
 - Planned mitigation: drive the timestamp's high 16 bits (signed TTP adjust, ms) from a slow estimate of host/sink drift, e.g. from socket backlog (`abr_process` unsent bytes) and/or the sink's Delay Reports, keeping the sink's latency centred. Needs a spec answer: units and safe range of the TTP adjust, and whether changing it causes a reset (the dirty-side note says each change calls "source changed", which re-sets the target latency; check whether that glitches).
+
+## stutter capture 2 (2026-10-13 ~08:06): a slow drift
+
+- 118 s btmon capture. The user heard the stutter start at about 100–105 s.
+- Send side clean the whole time: exactly 357 packets per 5 s, completion median 19–20 ms / p90 30 ms, no response or events from the sink at all.
+- One gap at stream start: sequence 25 → 33 (7 packets, 98 ms, lost about 0.4 s in). It's the same "drop after packet 25" seen in earlier captures: probably the encoder/socket startup in PipeWire. It's a one-off, but the sink gets a 98 ms hole. Worth fixing separately.
+- **Host audio rate against the capture clock: +80 ppm.** We send audio about 80 µs/s faster than real time, as measured by the kernel. If the sink's clock matches the kernel's, the sink's buffer grows by about 8 ms in 100 s.
+- So the onset at about 100 s matches a slow drift crossing a latency limit after roughly 8–10 ms of creep. That's a tight window, which suggests the sink's max−target margin is small, or the 98 ms start hole already put the sink near a limit. The ±0.5 % `sp_adjust` trim (dirty-side note) should absorb 80 ppm in principle, so it may be too slow or not driven by buffer level.
+- Test: the TTP-adjust correction (drift PR), plus not losing packets at stream start.
