@@ -4,21 +4,28 @@
 # -6 dBFS, looping) with the real caps, framing, RTP and timing. Lets us test negotiation and
 # framing on a headset before the codec core exists.
 #
-#   scripts/dev-replay.sh [header-in-rtp|header-after-rtp|header-in-rtp-swapped] [vector]
+#   scripts/dev-replay.sh [ttp-clock|ttp-clock-offset|header-in-rtp|header-after-rtp|header-in-rtp-swapped] [vector]
+#
+# Framings (default ttp-clock):
+#   ttp-clock              RTP timestamp = µs clock from 0, +14000 per packet; SSRC 00 00 00 AE (spec §7B)
+#   ttp-clock-offset       same, clock starts at the TTP offset (203000 µs on the Px7)
+#   header-in-rtp          old: constant timestamp 1F 63 38 01, SSRC 00 00 00 AE
+#   header-after-rtp       normal RTP header, 8-byte header as a payload prefix
+#   header-in-rtp-swapped  header-in-rtp with each 4-byte half reversed (§7A.2 option b)
 #
 # A/B switches (spec §7A.3), passed through to the plugin if set:
 #   APTX_ADAPTIVE_PT=<0..127>   RTP payload type (default 96)
 #   APTX_ADAPTIVE_NOSWAP=1      don't 16-bit swap the payload
-# e.g. APTX_ADAPTIVE_PT=0 scripts/dev-replay.sh header-in-rtp sine1k.r2.bin
+# e.g. APTX_ADAPTIVE_PT=0 scripts/dev-replay.sh ttp-clock-offset sine1k.r2.bin
 #
 # Doesn't restart anything or touch the headset; it prints the commands for that.
 set -euo pipefail
 
-framing=${1:-header-in-rtp}
+framing=${1:-ttp-clock}
 case $framing in
-header-in-rtp | header-after-rtp | header-in-rtp-swapped) ;;
+ttp-clock | ttp-clock-offset | header-in-rtp | header-after-rtp | header-in-rtp-swapped) ;;
 *)
-	echo "usage: $0 [header-in-rtp|header-after-rtp|header-in-rtp-swapped] [vector]" >&2
+	echo "usage: $0 [ttp-clock|ttp-clock-offset|header-in-rtp|header-after-rtp|header-in-rtp-swapped] [vector]" >&2
 	exit 2
 	;;
 esac
@@ -81,6 +88,6 @@ systemctl --user restart wireplumber pipewire pipewire-pulse
 pactl set-card-profile "\$(pactl list cards short | awk '/bluez_card\./ {print \$2; exit}')" a2dp-sink
 
 # To try another framing, vector or switch, re-run e.g.
-#   APTX_ADAPTIVE_PT=0 $0 header-in-rtp-swapped sine1k.r2.bin
+#   APTX_ADAPTIVE_PT=0 $0 ttp-clock-offset sine1k.r1.bin
 # and redo (a)-(c).
 EOF

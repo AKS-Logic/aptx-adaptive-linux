@@ -73,6 +73,11 @@ impl<C: Core> Stream<C> {
         self.row
     }
 
+    #[must_use]
+    pub fn config(&self) -> Config {
+        self.config
+    }
+
     /// Interleaved samples per packet.
     #[must_use]
     pub fn samples_per_packet(&self) -> usize {

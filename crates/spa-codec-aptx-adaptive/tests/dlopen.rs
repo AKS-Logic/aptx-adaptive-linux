@@ -294,7 +294,8 @@ fn init_succeeds_but_encode_is_unimplemented() {
         let mut out = [0u8; 1024];
         let hdr = c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), 1, 0);
         assert_eq!(hdr, 12);
-        assert_eq!(out[4..12], [0x1f, 0x63, 0x38, 0x01, 0, 0, 0, 0xae]);
+        // ttp-clock: the first packet's timestamp is 0, SSRC is header bytes 4..7.
+        assert_eq!(out[4..12], [0, 0, 0, 0, 0, 0, 0, 0xae]);
         let pcm = vec![0u8; block as usize];
         let (mut written, mut flush) = (0usize, 0);
         let res = c.encode.unwrap()(

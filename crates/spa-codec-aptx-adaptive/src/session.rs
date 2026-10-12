@@ -12,10 +12,14 @@ use crate::dev::{AnyCore, Options, Replay};
 /// How the 8-byte aptX Adaptive header goes on air (spec §7.2, `QUESTIONS.md`). Unconfirmed
 /// either way; needs a capture from an Android source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(clippy::enum_variant_names, reason = "they're all header placements")]
 pub enum Framing {
-    /// The spec's hypothesis: header bytes 0..3 are the RTP timestamp and 4..7 the SSRC, most
-    /// significant byte first. No payload prefix.
+    /// Spec §7B: the RTP timestamp is a time-to-play clock in µs, advancing by the packet
+    /// duration from 0; the SSRC is header bytes 4..7. No payload prefix.
+    TtpClock,
+    /// Like `TtpClock`, but the clock starts at the TTP offset (header bytes 0..1 × 8 µs).
+    TtpClockOffset,
+    /// Header bytes 0..3 are the RTP timestamp (constant) and 4..7 the SSRC, most significant
+    /// byte first. No payload prefix.
     HeaderInRtp,
     /// A normal RTP header (timestamp in samples), then the 8 bytes as a payload prefix.
     HeaderAfterRtp,
@@ -24,7 +28,7 @@ pub enum Framing {
 }
 
 /// The default; `APTX_ADAPTIVE_FRAMING` overrides it (see `dev`).
-pub const FRAMING: Framing = Framing::HeaderInRtp;
+pub const FRAMING: Framing = Framing::TtpClock;
 
 pub const RTP_HEADER_LEN: usize = 12;
 /// UNCERTAIN: the spec doesn't give one. aptX HD uses 96.
@@ -73,6 +77,8 @@ pub struct Session<C> {
     swap: bool,
     mtu: usize,
     pcm: Vec<i32>,
+    /// Packets sent so far; drives the TTP clock.
+    packets: u32,
 }
 
 impl Session<Encoder> {
@@ -115,7 +121,10 @@ impl Session<AnyCore> {
 
 fn header_len(framing: Framing) -> usize {
     match framing {
-        Framing::HeaderInRtp | Framing::HeaderInRtpSwapped => RTP_HEADER_LEN,
+        Framing::TtpClock
+        | Framing::TtpClockOffset
+        | Framing::HeaderInRtp
+        | Framing::HeaderInRtpSwapped => RTP_HEADER_LEN,
         Framing::HeaderAfterRtp => RTP_HEADER_LEN + HEADER_LEN,
     }
 }
@@ -145,12 +154,25 @@ impl<C: Core> Session<C> {
             payload_type: RTP_PAYLOAD_TYPE,
             swap: true,
             mtu,
+            packets: 0,
         })
     }
 
     /// One packet's worth of interleaved `S24_32` PCM.
     pub fn block_size(&self) -> usize {
         self.pcm.len() * BYTES_PER_SAMPLE
+    }
+
+    /// One packet's duration in µs (14000 for 672 frames at 48 kHz).
+    fn packet_us(&self) -> u32 {
+        let c = self.stream.config();
+        let frames = self.stream.samples_per_packet() as u64 / u64::from(c.channels);
+        (frames * 1_000_000 / u64::from(c.sample_rate)) as u32
+    }
+
+    /// The §7B timestamp of the next packet: `start + n × packet duration`, wrapping.
+    fn ttp_clock(&self, start: u32) -> u32 {
+        start.wrapping_add(self.packets.wrapping_mul(self.packet_us()))
     }
 
     pub fn interval_ns(&self) -> u64 {
@@ -190,6 +212,15 @@ impl<C: Core> Session<C> {
         h[1] = self.payload_type;
         h[2..4].copy_from_slice(&seqnum.to_be_bytes());
         match self.framing {
+            Framing::TtpClock | Framing::TtpClockOffset => {
+                let start = if self.framing == Framing::TtpClockOffset {
+                    u32::from(u16::from_le_bytes([aptx[0], aptx[1]])) * 8
+                } else {
+                    0
+                };
+                h[4..8].copy_from_slice(&self.ttp_clock(start).to_be_bytes());
+                h[8..12].copy_from_slice(&aptx[4..8]);
+            }
             Framing::HeaderInRtp => h[4..12].copy_from_slice(&aptx),
             Framing::HeaderInRtpSwapped => {
                 h[4..12].copy_from_slice(&aptx);
@@ -229,6 +260,9 @@ impl<C: Core> Session<C> {
             *s = (i32::from_ne_bytes(*b) << 8) >> 8;
         }
         let written = self.stream.push(&self.pcm, &mut dst[..room])?;
+        if written.is_some() {
+            self.packets = self.packets.wrapping_add(1);
+        }
         if let (Some(n), false) = (written, self.swap) {
             // The stream always swaps; swapping again undoes it.
             for p in dst[..n].as_chunks_mut::<2>().0 {
@@ -261,8 +295,67 @@ mod tests {
     }
 
     #[test]
-    fn default_is_header_in_rtp() {
-        assert_eq!(FRAMING, Framing::HeaderInRtp);
+    fn default_is_ttp_clock() {
+        assert_eq!(FRAMING, Framing::TtpClock);
+    }
+
+    /// Sends `n` packets and returns their RTP headers.
+    fn headers(s: &mut Session<Fake>, n: usize) -> Vec<[u8; 12]> {
+        let src = vec![0u8; s.block_size()];
+        let mut buf = vec![0u8; 2048];
+        (0..n)
+            .map(|i| {
+                let len = s.start_encode(&mut buf, i as u16, 0xdead_beef).unwrap();
+                let r = s.encode(&src, &mut buf[len..]).unwrap();
+                assert!(r.flush);
+                buf[..12].try_into().unwrap()
+            })
+            .collect()
+    }
+
+    fn timestamp(h: &[u8; 12]) -> u32 {
+        u32::from_be_bytes(h[4..8].try_into().unwrap())
+    }
+
+    #[test]
+    fn ttp_clock_advances_per_packet() {
+        let mut s = session(Framing::TtpClock);
+        assert_eq!(s.packet_us(), 14_000);
+        let hs = headers(&mut s, 5);
+        for (i, h) in hs.iter().enumerate() {
+            assert_eq!(timestamp(h), i as u32 * 14_000);
+            assert_eq!(h[..4], [0x80, 96, 0, i as u8]);
+            assert_eq!(h[8..12], [0, 0, 0, 0xae]);
+        }
+    }
+
+    #[test]
+    fn ttp_clock_offset_starts_at_ttp() {
+        let mut s = session(Framing::TtpClockOffset);
+        let hs = headers(&mut s, 3);
+        for (i, h) in hs.iter().enumerate() {
+            assert_eq!(timestamp(h), 203_000 + i as u32 * 14_000);
+            assert_eq!(h[8..12], [0, 0, 0, 0xae]);
+        }
+        assert_eq!(hs[0][4..8], 203_000u32.to_be_bytes());
+    }
+
+    #[test]
+    fn ttp_clock_wraps() {
+        let mut s = session(Framing::TtpClockOffset);
+        s.packets = (u32::MAX - 203_000) / 14_000;
+        let hs = headers(&mut s, 2);
+        let before = timestamp(&hs[0]);
+        assert!(before > u32::MAX - 14_000);
+        assert_eq!(timestamp(&hs[1]), before.wrapping_add(14_000));
+        assert!(timestamp(&hs[1]) < 14_000);
+        assert_eq!(hs[1][8..12], [0, 0, 0, 0xae]);
+
+        let mut s = session(Framing::TtpClock);
+        s.packets = u32::MAX;
+        let hs = headers(&mut s, 2);
+        assert_eq!(timestamp(&hs[0]), u32::MAX.wrapping_mul(14_000));
+        assert_eq!(timestamp(&hs[1]), 0);
     }
 
     #[test]
@@ -387,7 +480,11 @@ mod tests {
     /// buffer, `encode` whole blocks until `need_flush`, send, repeat.
     #[test]
     fn one_second_like_media_sink() {
-        for framing in [Framing::HeaderInRtp, Framing::HeaderAfterRtp] {
+        for framing in [
+            Framing::TtpClock,
+            Framing::HeaderInRtp,
+            Framing::HeaderAfterRtp,
+        ] {
             let mut s = session(framing);
             let header = header_len(framing);
             let frames = 48_000;
@@ -432,7 +529,11 @@ mod tests {
         let path = vector("sine1k.r1.bin");
         let file = std::fs::read(&path).unwrap();
         assert_eq!(file.len(), 71 * 656);
-        for framing in [Framing::HeaderInRtp, Framing::HeaderAfterRtp] {
+        for framing in [
+            Framing::TtpClock,
+            Framing::HeaderInRtp,
+            Framing::HeaderAfterRtp,
+        ] {
             let opts = Options {
                 framing,
                 replay: Some(path.clone()),
@@ -455,10 +556,14 @@ mod tests {
             for (i, p) in sent.iter().enumerate() {
                 assert_eq!(p.len(), header + 656, "{framing:?} packet {i}");
                 assert_eq!(p[2..4], (i as u16).to_be_bytes());
-                assert_eq!(
-                    p[header - 8..header],
+                let aptx = if framing == Framing::TtpClock {
+                    let mut a = [0, 0, 0, 0, 0, 0, 0, 0xae];
+                    a[..4].copy_from_slice(&(i as u32 * 14_000).to_be_bytes());
+                    a
+                } else {
                     [0x1f, 0x63, 0x38, 0x01, 0, 0, 0, 0xae]
-                );
+                };
+                assert_eq!(p[header - 8..header], aptx, "{framing:?} packet {i}");
                 let want = &file[(i % 71) * 656..][..656];
                 let mut swapped = [0u8; 656];
                 for (o, w) in swapped
@@ -512,6 +617,7 @@ mod tests {
     #[test]
     fn small_mtu_shrinks_packets() {
         assert_eq!(budget(Framing::HeaderInRtp, 600), 588);
+        assert_eq!(budget(Framing::TtpClock, 600), 588);
         assert_eq!(budget(Framing::HeaderAfterRtp, 600), 580);
         let s = Session::new(DecoderLevel::R1, 600).unwrap();
         assert_eq!(s.stream.row().packet_bytes, 588);
