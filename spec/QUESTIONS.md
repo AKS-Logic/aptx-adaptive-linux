@@ -232,3 +232,10 @@ btmon, time from sending each media ACL packet to the controller's Number of Com
 - Default RTP header with source type 2 is now §7F: timestamp = `adjust_ms << 16 | samples per channel in this packet` with adjust 0 (`00 00 02 a0` on every 672-sample packet), SSRC `0x000000a3` (HQ; `0x000000a1` if the profile were LL0), constant for the session. Sequence +1, swapped payload right after the 12-byte header. First packets: `80 60 00 01 00 00 02 a0 00 00 00 a3`, `80 60 00 02 00 00 02 a0 00 00 00 a3`, …
 - The old `00 00 00 ae` SSRC (header bytes 4..7) and the µs clock are no longer the default. Dev switches (`dev-replay`): `APTX_ADAPTIVE_TS=samples-per-packet|us|samples` (the last two are the old running clocks), `APTX_ADAPTIVE_SSRC=0x..` still overrides; non-default values are logged at init.
 - Still open: the §7F UNCERTAIN older-sink reading of the timestamp as µs, and whether the latency adjustment should ever be non-zero.
+
+## WORKING (2026-10-13 07:51): aptX Adaptive plays cleanly on the Px7 S2e
+
+- Default plugin build: source type 2 (byte 6 `0x12`, §7E), RTP timestamp `0x000002A0` every packet and SSRC `0x000000A3` (§7F), real encoder, 364 kbps / 14 ms / 656-byte packets.
+- btmon: 71.2 packets/s, 5 missing in 25 s, controller completion median 20 ms / p90 31 ms (same as aptX HD). The user hears it as smooth, quality comparable to aptX HD.
+- **Works with stock BlueZ 5.87 (A2DP 1.4 advertised).** The A2DP 1.3 patch isn't needed: it only made the sink offer Delay Reporting. The silence was entirely the source type.
+- Remaining: the HQ/LL mode switch, automatic codec selection, the encoder delay (`get_delay`), and keeping aptX HD from being set up first on connect (codec switch chime).
