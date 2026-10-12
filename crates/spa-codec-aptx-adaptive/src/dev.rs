@@ -4,9 +4,9 @@
 //!   (e.g. `tests/vectors/r2/sine1k.r1.bin`) in order, looping. Framing, RTP and timing stay
 //!   the real code path. For testing negotiation and framing on a headset before the codec
 //!   core exists.
-//! - `APTX_ADAPTIVE_FRAMING=ttp-clock|ttp-clock-offset|header-in-rtp|header-after-rtp`:
-//!   overrides [`session::FRAMING`] (`header-after-rtp`).
-//!   With `dev-replay`, also `header-in-rtp-swapped` (spec §7A.2 option b).
+//! - `APTX_ADAPTIVE_FRAMING=phone`: the default, [`session::FRAMING`] (spec §7D). With
+//!   `dev-replay`, also the superseded `ttp-clock-offset`, `header-in-rtp`, `header-after-rtp`
+//!   and `header-in-rtp-swapped`.
 //! - `APTX_ADAPTIVE_PT=0..127`, only with `dev-replay`: the RTP payload type.
 //! - `APTX_ADAPTIVE_NOSWAP=1`, only with `dev-replay`: send the payload without the 16-bit swap.
 
@@ -50,16 +50,18 @@ impl Options {
         let framing = match var(FRAMING_VAR) {
             None => session::FRAMING,
             Some(v) => match v.to_str() {
-                Some("ttp-clock") => Framing::TtpClock,
-                Some("ttp-clock-offset") => Framing::TtpClockOffset,
-                Some("header-in-rtp") => Framing::HeaderInRtp,
-                Some("header-after-rtp") => Framing::HeaderAfterRtp,
+                Some("phone") => Framing::Phone,
+                Some("ttp-clock-offset") if dev => Framing::TtpClockOffset,
+                Some("header-in-rtp") if dev => Framing::HeaderInRtp,
+                Some("header-after-rtp") if dev => Framing::HeaderAfterRtp,
                 Some("header-in-rtp-swapped") if dev => Framing::HeaderInRtpSwapped,
                 _ => {
-                    return Err(format!(
-                        "{FRAMING_VAR}={} is not ttp-clock, ttp-clock-offset, header-in-rtp or header-after-rtp",
-                        v.display()
-                    ));
+                    let names = if dev {
+                        "phone, ttp-clock-offset, header-in-rtp, header-after-rtp or header-in-rtp-swapped"
+                    } else {
+                        "phone (the others need dev-replay)"
+                    };
+                    return Err(format!("{FRAMING_VAR}={} is not {names}", v.display()));
                 }
             },
         };
@@ -235,7 +237,7 @@ mod tests {
         assert_eq!(o.framing, session::FRAMING);
         assert_eq!(o.replay, None);
         assert_eq!(o.describe(&e), None);
-        let e = env(&[(REPLAY_VAR, ""), (FRAMING_VAR, "header-after-rtp")]);
+        let e = env(&[(REPLAY_VAR, ""), (FRAMING_VAR, "phone")]);
         let o = Options::from_env(&e).unwrap();
         assert_eq!(o.replay, None);
         assert_eq!(o.describe(&e), None);
@@ -243,14 +245,21 @@ mod tests {
 
     #[test]
     fn parses_framing() {
-        let e = env(&[(FRAMING_VAR, "ttp-clock")]);
-        let o = Options::from_env(&e).unwrap();
-        assert_eq!(o.framing, Framing::TtpClock);
-        assert_eq!(
-            o.describe(&e).as_deref(),
-            Some("aptx-adaptive: framing: TtpClock")
-        );
+        assert_eq!(session::FRAMING, Framing::Phone);
+        let o = Options::from_env(env(&[(FRAMING_VAR, "phone")])).unwrap();
+        assert_eq!(o.framing, Framing::Phone);
         assert!(Options::from_env(env(&[(FRAMING_VAR, "bogus")])).is_err());
+        assert!(Options::from_env(env(&[(FRAMING_VAR, "ttp-clock")])).is_err());
+    }
+
+    #[cfg(feature = "dev-replay")]
+    #[test]
+    fn parses_old_framings_with_feature() {
+        let e = env(&[(FRAMING_VAR, "header-after-rtp")]);
+        assert_eq!(
+            Options::from_env(&e).unwrap().describe(&e).as_deref(),
+            Some("aptx-adaptive: framing: HeaderAfterRtp")
+        );
         for (name, framing) in [
             ("ttp-clock-offset", Framing::TtpClockOffset),
             ("header-in-rtp", Framing::HeaderInRtp),
@@ -299,7 +308,14 @@ mod tests {
         let o = Options::from_env(&e).unwrap();
         assert_eq!(o, Options::default());
         assert_eq!(o.describe(&e), None);
-        assert!(Options::from_env(env(&[(FRAMING_VAR, "header-in-rtp-swapped")])).is_err());
+        for name in [
+            "ttp-clock-offset",
+            "header-in-rtp",
+            "header-after-rtp",
+            "header-in-rtp-swapped",
+        ] {
+            assert!(Options::from_env(env(&[(FRAMING_VAR, name)])).is_err());
+        }
     }
 
     #[cfg(not(feature = "dev-replay"))]

@@ -9,19 +9,20 @@ use std::io::Write as _;
 
 use crate::dev::{AnyCore, Options, Replay};
 
-/// How the 8-byte aptX Adaptive header goes on air (spec §7.2, `QUESTIONS.md`). Unconfirmed
-/// either way; needs a capture from an Android source.
+/// How a packet goes on air. `Phone` is the ground truth (spec §7D); the rest are older
+/// hypotheses, selectable only with `dev-replay`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Framing {
-    /// Spec §7B: the RTP timestamp is a time-to-play clock in µs, advancing by the packet
-    /// duration from 0; the SSRC is header bytes 4..7. No payload prefix.
-    TtpClock,
-    /// Like `TtpClock`, but the clock starts at the TTP offset (header bytes 0..1 × 8 µs).
+    /// Spec §7D, as a Snapdragon phone sends it: the RTP timestamp is a time-to-play clock in
+    /// µs, advancing by the packet duration from 0; the SSRC is header bytes 4..7. The swapped
+    /// codec packet follows the 12-byte RTP header directly.
+    Phone,
+    /// DEV ONLY. Like `Phone`, but the clock starts at the TTP offset (header bytes 0..1 × 8 µs).
     TtpClockOffset,
-    /// Header bytes 0..3 are the RTP timestamp (constant) and 4..7 the SSRC, most significant
-    /// byte first. No payload prefix.
+    /// DEV ONLY. Header bytes 0..3 are the RTP timestamp (constant) and 4..7 the SSRC, most
+    /// significant byte first. No payload prefix.
     HeaderInRtp,
-    /// Spec §7C: a normal RTP header (timestamp = sample count, as `media-sink.c` passes it;
+    /// DEV ONLY. Spec §7C: a normal RTP header (timestamp = sample count, as `media-sink.c` passes it;
     /// SSRC 0), then the 8 bytes as a payload prefix, then the swapped packet.
     HeaderAfterRtp,
     /// DEV ONLY (spec §7A.2 option b): like `HeaderInRtp` with each 4-byte half reversed.
@@ -29,10 +30,10 @@ pub enum Framing {
 }
 
 /// The default; `APTX_ADAPTIVE_FRAMING` overrides it (see `dev`).
-pub const FRAMING: Framing = Framing::HeaderAfterRtp;
+pub const FRAMING: Framing = Framing::Phone;
 
 pub const RTP_HEADER_LEN: usize = 12;
-/// UNCERTAIN: the spec doesn't give one. aptX HD uses 96.
+/// What the phone sends (spec §7D).
 pub const RTP_PAYLOAD_TYPE: u8 = 96;
 const RTP_SSRC: u32 = 0;
 
@@ -122,7 +123,7 @@ impl Session<AnyCore> {
 
 fn header_len(framing: Framing) -> usize {
     match framing {
-        Framing::TtpClock
+        Framing::Phone
         | Framing::TtpClockOffset
         | Framing::HeaderInRtp
         | Framing::HeaderInRtpSwapped => RTP_HEADER_LEN,
@@ -171,7 +172,7 @@ impl<C: Core> Session<C> {
         (frames * 1_000_000 / u64::from(c.sample_rate)) as u32
     }
 
-    /// The §7B timestamp of the next packet: `start + n × packet duration`, wrapping.
+    /// The §7D timestamp of the next packet: `start + n × packet duration`, wrapping.
     fn ttp_clock(&self, start: u32) -> u32 {
         start.wrapping_add(self.packets.wrapping_mul(self.packet_us()))
     }
@@ -213,7 +214,7 @@ impl<C: Core> Session<C> {
         h[1] = self.payload_type;
         h[2..4].copy_from_slice(&seqnum.to_be_bytes());
         match self.framing {
-            Framing::TtpClock | Framing::TtpClockOffset => {
+            Framing::Phone | Framing::TtpClockOffset => {
                 let start = if self.framing == Framing::TtpClockOffset {
                     u32::from(u16::from_le_bytes([aptx[0], aptx[1]])) * 8
                 } else {
@@ -296,8 +297,8 @@ mod tests {
     }
 
     #[test]
-    fn default_is_header_after_rtp() {
-        assert_eq!(FRAMING, Framing::HeaderAfterRtp);
+    fn default_is_phone() {
+        assert_eq!(FRAMING, Framing::Phone);
     }
 
     /// Sends `n` packets and returns their RTP headers.
@@ -318,16 +319,64 @@ mod tests {
         u32::from_be_bytes(h[4..8].try_into().unwrap())
     }
 
+    /// Spec §7D: `80 60`, PipeWire's sequence, a µs clock stepping by the packet duration,
+    /// SSRC `00 00 00 ae`, then the swapped codec packet with nothing in front.
     #[test]
-    fn ttp_clock_advances_per_packet() {
-        let mut s = session(Framing::TtpClock);
+    fn phone_packets() {
+        let mut s = session(Framing::Phone);
         assert_eq!(s.packet_us(), 14_000);
-        let hs = headers(&mut s, 5);
-        for (i, h) in hs.iter().enumerate() {
-            assert_eq!(timestamp(h), i as u32 * 14_000);
-            assert_eq!(h[..4], [0x80, 96, 0, i as u8]);
-            assert_eq!(h[8..12], [0, 0, 0, 0xae]);
+        let mut src = vec![0u8; s.block_size()];
+        src[..4].copy_from_slice(&5i32.to_ne_bytes());
+        src[4..8].copy_from_slice(&6i32.to_ne_bytes());
+        let mut buf = vec![0xffu8; 2048];
+        for i in 0..5u16 {
+            let len = s.start_encode(&mut buf, i + 1, 0xdead_beef).unwrap();
+            assert_eq!(len, 12);
+            let r = s.encode(&src, &mut buf[len..]).unwrap();
+            assert_eq!((r.written, r.flush), (656, true));
+            assert_eq!(buf[..4], [0x80, 0x60, 0, i as u8 + 1]);
+            assert_eq!(buf[4..8], (u32::from(i) * 14_000).to_be_bytes());
+            assert_eq!(buf[8..12], [0, 0, 0, 0xae]);
+            assert_eq!(buf[12..15], [6, 5, 0]);
         }
+    }
+
+    /// The timestamp step comes from samples and rate, not a fixed 14 ms.
+    #[test]
+    fn phone_clock_follows_packet_duration() {
+        for budget in [MTU, 600, 400] {
+            let mut s = session_with(Framing::Phone, MTU, budget);
+            let c = s.stream.config();
+            let frames = s.stream.samples_per_packet() as u64 / u64::from(c.channels);
+            let step = (frames * 1_000_000 / u64::from(c.sample_rate)) as u32;
+            let hs = headers(&mut s, 3);
+            assert_eq!(timestamp(&hs[1]) - timestamp(&hs[0]), step);
+            assert_eq!(timestamp(&hs[2]) - timestamp(&hs[1]), step);
+        }
+    }
+
+    /// The layout and length of the phone capture's first packet (spec §7D): 668 bytes,
+    /// `80 60 00 01 <ts> 00 00 00 ae 81 00 d0 a1 …`.
+    #[test]
+    fn matches_phone_capture_first_packet() {
+        let opts = Options {
+            replay: Some(vector("sine1k.r1.bin")),
+            ..Options::default()
+        };
+        let mut s = Session::open(DecoderLevel::R1, MTU, &opts).unwrap();
+        let src = vec![0u8; s.block_size()];
+        let mut buf = vec![0u8; 2048];
+        let len = s.start_encode(&mut buf, 1, 0).unwrap();
+        let r = s.encode(&src, &mut buf[len..]).unwrap();
+        assert!(r.flush);
+        let p = &buf[..len + r.written];
+        assert_eq!(p.len(), 668);
+        assert_eq!(p[..4], [0x80, 0x60, 0x00, 0x01]);
+        assert_eq!(p[8..12], [0, 0, 0, 0xae]);
+        assert_eq!(
+            (p[12], p[13], p[14] & 0xf0, p[15]),
+            (0x81, 0x00, 0xd0, 0xa1)
+        );
     }
 
     #[test]
@@ -352,7 +401,7 @@ mod tests {
         assert!(timestamp(&hs[1]) < 14_000);
         assert_eq!(hs[1][8..12], [0, 0, 0, 0xae]);
 
-        let mut s = session(Framing::TtpClock);
+        let mut s = session(Framing::Phone);
         s.packets = u32::MAX;
         let hs = headers(&mut s, 2);
         assert_eq!(timestamp(&hs[0]), u32::MAX.wrapping_mul(14_000));
@@ -447,9 +496,9 @@ mod tests {
 
     #[test]
     fn start_encode_needs_room() {
-        let mut s = session(Framing::HeaderAfterRtp);
+        let mut s = session(FRAMING);
         assert_eq!(
-            s.start_encode(&mut [0; 19], 0, 0),
+            s.start_encode(&mut [0; 11], 0, 0),
             Err(SessionError::NoSpace)
         );
     }
@@ -516,7 +565,7 @@ mod tests {
     #[test]
     fn one_second_like_media_sink() {
         for framing in [
-            Framing::TtpClock,
+            Framing::Phone,
             Framing::HeaderInRtp,
             Framing::HeaderAfterRtp,
         ] {
@@ -565,7 +614,7 @@ mod tests {
         let file = std::fs::read(&path).unwrap();
         assert_eq!(file.len(), 71 * 656);
         for framing in [
-            Framing::TtpClock,
+            Framing::Phone,
             Framing::HeaderInRtp,
             Framing::HeaderAfterRtp,
         ] {
@@ -591,7 +640,7 @@ mod tests {
             for (i, p) in sent.iter().enumerate() {
                 assert_eq!(p.len(), header + 656, "{framing:?} packet {i}");
                 assert_eq!(p[2..4], (i as u16).to_be_bytes());
-                let aptx = if framing == Framing::TtpClock {
+                let aptx = if framing == Framing::Phone {
                     let mut a = [0, 0, 0, 0, 0, 0, 0, 0xae];
                     a[..4].copy_from_slice(&(i as u32 * 14_000).to_be_bytes());
                     a
@@ -642,6 +691,8 @@ mod tests {
         };
         let mut s = Session::open(DecoderLevel::R1, MTU, &opts).unwrap();
         assert_eq!(s.start_encode(&mut [0; 64], 0, 0), Ok(20));
+        let mut s = Session::open(DecoderLevel::R1, MTU, &Options::default()).unwrap();
+        assert_eq!(s.start_encode(&mut [0; 64], 0, 0), Ok(12));
         let src = vec![0u8; s.block_size()];
         let r = s.encode(&src, &mut [0; 1000]).unwrap();
         assert_eq!((r.written, r.flush), (656, true));
@@ -650,10 +701,11 @@ mod tests {
     #[test]
     fn small_mtu_shrinks_packets() {
         assert_eq!(budget(Framing::HeaderInRtp, 600), 588);
-        assert_eq!(budget(Framing::TtpClock, 600), 588);
+        assert_eq!(budget(Framing::Phone, 600), 588);
         assert_eq!(budget(Framing::HeaderAfterRtp, 600), 580);
         let s = Session::new(DecoderLevel::R1, 600).unwrap();
-        assert_eq!(s.stream.row().packet_bytes, 580);
+        assert_eq!(s.stream.row().packet_bytes, 588);
+        assert_eq!(header_len(FRAMING), 12);
     }
 
     /// Real packets from the real encoder: swapped `00 01 a1 ..` (config 0, Lp 656).

@@ -293,25 +293,24 @@ fn init_and_encode_a_real_packet() {
         assert_eq!(block, BLOCK_SIZE);
         let mut out = [0u8; 1024];
         let hdr = c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), 1, 0);
-        assert_eq!(hdr, 20);
-        // header-after-rtp (spec §7C): timestamp 0 as passed, SSRC 0, then the 8-byte header.
-        assert_eq!(out[4..12], [0; 8]);
-        assert_eq!(out[12..20], [0x1f, 0x63, 0x38, 0x01, 0, 0, 0, 0xae]);
+        assert_eq!(hdr, 12);
+        // Spec §7D: 80 60, sequence, µs clock from 0, SSRC 00 00 00 ae, no payload prefix.
+        assert_eq!(out[..12], [0x80, 0x60, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xae]);
         let pcm = vec![0u8; block as usize];
         let (mut written, mut flush) = (0usize, 0);
         let res = c.encode.unwrap()(
             data,
             pcm.as_ptr().cast(),
             pcm.len(),
-            out.as_mut_ptr().add(20).cast(),
-            out.len() - 20,
+            out.as_mut_ptr().add(12).cast(),
+            out.len() - 12,
             &raw mut written,
             &raw mut flush,
         );
         assert_eq!(res, block);
         assert_eq!((written, flush), (656, 1));
         // Swapped config 0 packet: 00 01 a1 .. becomes 01 00 .. a1 (0x80 on byte 1 if padded).
-        assert_eq!((out[20] & 0x7f, out[21], out[23]), (0x01, 0x00, 0xa1));
+        assert_eq!((out[12] & 0x7f, out[13], out[15]), (0x01, 0x00, 0xa1));
         assert_eq!(c.abr_process.unwrap()(data, 0), 0);
         let mut delay = 99;
         c.get_delay.unwrap()(data, &raw mut delay, ptr::null_mut());
