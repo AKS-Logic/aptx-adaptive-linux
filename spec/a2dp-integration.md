@@ -610,3 +610,16 @@ New analysis questions §7A/§7B. The best available evidence for an aptX Adapti
 Also:
 - header byte 3 is a packet-type index into the packet-size list {348, 656, 140, 152, 560, 760, 960, 348, 980}. Our table cfg bytes are consistent with it (1 = 656).
 - the "header-after-RTP" layout was only ever tested in runs where the restart caused a disconnect chime, so it hasn't actually been ruled out.
+
+## 7D. Ground truth: a Snapdragon phone streaming to an R1 sink (2026-10-13)
+
+Captured from a OnePlus 15 (Snapdragon) streaming aptX Adaptive to this machine, which advertised the Px7 S2e's exact caps. 2609 packets over about 33 s. This supersedes §7A to §7C.
+
+- **SetConfiguration** from the phone: `d7 00 00 00 ad 00 10 02 37 6a 00 af 64 4b 00 00 aa` + zeros. That's exactly what our `select_config` sends, so negotiation is confirmed.
+- **Every media packet is 668 bytes:** a 12-byte RTP header followed directly by the 656-byte codec packet. There is **no separate 8-byte header** in the payload.
+- **RTP header:** `80 60` (V=2, PT 96, marker clear), sequence +1 per packet, then a 32-bit timestamp, then SSRC `00 00 00 ae`.
+  - The SSRC carries the HQ/LL mode byte (`ae` = HQ) in its last byte, with the other three bytes zero.
+  - The **timestamp is a time-to-play clock in µs**, big-endian. It advances by the packet's audio duration: 14000 µs for 14 ms packets, and 12000 µs in stretches where the phone sends 12 ms packets. The steps also jitter by ±1 µs. The start value is arbitrary (`0xbddc3048` in the capture).
+- **Payload:** the 16-bit byte-swapped codec packet, exactly as specified. The first bytes on air are `81 00 d0 a1 …`, which unswap to the codec's `00 81 a1 d0`.
+- **So the 8-byte header's fields map into RTP like this:** the TTP/period/cfg bytes aren't sent at all; the TTP clock replaces them in the timestamp field. Byte 7 (`ae`/`ad`) becomes the low byte of the SSRC, and bytes 4..6 (zero) its high bytes.
+- The phone switched between 14 ms and 12 ms packets during the stream, so its encoder changed table rows on the fly. Both are valid for an R1 sink.
