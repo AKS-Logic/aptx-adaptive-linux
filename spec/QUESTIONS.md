@@ -67,3 +67,10 @@ Conclusion: the chime doesn't separate layouts. It seems tied to the restart and
 ## todo once audio works
 
 - Make aptX Adaptive the default for aptX Adaptive sinks locally. A WirePlumber rule that sets the device's default profile to `a2dp-sink-aptx_adaptive`, installed by `scripts/install-plugin.sh`, is enough. Upstreaming is parked; the patch is on branch `upstream-adr` (PR #5, closed).
+
+## live test round 3: ttp-clock (2026-10-12)
+
+- btmon confirms the on-air RTP: `80 60 seq seq <ts BE> 00 00 00 ae`, with the timestamp stepping by 14000 (0x36b0) per packet from 0. AVDTP Start was accepted, the headset stayed connected through 12 s of streaming, and played **silence**.
+- ttp-clock with PT 0: inconclusive. The headset was already dropping the link repeatedly.
+- The repeated drops came from WirePlumber saving `a2dp-sink-aptx_adaptive` as the device's default profile, so every reconnect went straight into a non-working stream. Switching back to `a2dp-sink` (aptX HD) fixed it. **Live tests must restore `a2dp-sink` when they finish.** The install script should never leave aptX Adaptive as the saved default until it works.
+- An advancing µs timestamp alone doesn't fix the silence.
