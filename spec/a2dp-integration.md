@@ -584,3 +584,17 @@ This supersedes §7 where they disagree. None of it has been verified over the a
 4. Unswapped payload, to rule the swap out completely.
 5. Check that the sequence number increases by exactly 1 per packet and that packets go out every 14 ms, not in bursts.
 6. Check the 664-byte payload (8 + 656) plus the 12-byte RTP header fits the negotiated MTU.
+
+## 7B. RTP timestamp and payload type (receiver analysis, 2026-10-12)
+
+From analysing a newer-generation receiver of the same vendor's codec. That receiver can't decode R1/R2 bitstreams, so this is inferred for the Px7 S2e, not proven:
+
+- RTP header: 12 bytes, no CSRCs, then the swapped payload. The first payload byte is the frame type. That rules out putting the 8-byte header after the RTP header.
+- The sequence number and timestamp are big-endian on air. The timestamp is a **time-to-play clock in µs**:
+  - the first packet after a reset anchors it;
+  - a sequence jump of more than 1, or a timestamp change of more than 150000, resets the decoder;
+  - a packet more than about one frame late is dropped.
+- With a constant timestamp (our current `1F 63 38 01`), every packet after the first looks late and gets dropped. That matches "accepted, no error, silence".
+- **Fix to try:** the timestamp advances by the packet duration in µs (14000 per 672-sample packet at 48 kHz) from any start value. Possibly the 203 ms TTP offset (header bytes 0..1 × 8 µs) is added once to the start. UNCERTAIN which.
+- SSRC: the last byte is a mode/control byte, so `00 00 00 AE` is consistent. A constant value is fine.
+- Payload type: that receiver only accepts **0**. The earlier PT 0 live test kept the constant timestamp, so it didn't rule PT 0 out.
