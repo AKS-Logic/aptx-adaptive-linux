@@ -175,3 +175,13 @@ Leading hypothesis: the Px7's aptX Adaptive SEP only reports Delay Reporting to 
 - The Px7 S2e stayed connected and silent. It played its disconnect chime right after connecting, before any audio.
 
 Conclusion: every AVDTP, SDP, AVRCP, L2CAP, HCI link-policy and media-byte difference we could find between the working phone and this host has now been matched. What's left is the controller (Realtek RTL8922 vs Qualcomm), below what the host can control. Next: test with a Qualcomm-based HCI controller (e.g. QCNFA765/WCN6855 or QCA6174A M.2 card in an M.2-to-USB adapter), keeping A2DP 1.3.
+
+## the "disconnect chime right after connecting" (2026-10-13)
+
+The user notes this chime isn't normal headset behaviour. What the captures show around it:
+
+- The Bluetooth link is never dropped at the HCI level when the chime plays in the middle of a connection.
+- In fin2, both mid-test disconnects came from the **host**: KDE's Bluetooth applet (plasmashell, D-Bus :1.52) called `Device1.Disconnect`, then `Device1.Connect`, about 2 s after a stream was suspended. The user wasn't clicking it at those times. Something in KDE (bluedevil / the audio applet) is cycling the device, probably when the PipeWire node disappears or errors. That gives a real disconnect/reconnect, hence the chime.
+- The connection sequence after connecting is near-identical to the phone's: SDP, RFCOMM/HFP, AVDTP signalling, AVCTP, and the headset's own SDP queries (PSM 1). The phone opens PSM 25 (AVDTP) before the headset queries it, and we do the same. One difference: the phone opens AVDTP signalling directly, while our host first configures **aptX HD (SEID 7)**, then Closes it and reconfigures to SEID 9 (Adaptive). With the stock aptX HD default, the headset briefly runs an aptX HD stream before switching.
+- Hypothesis for the chime: the HD → Adaptive reconfigure (Close of SEID 7, Set Configuration on SEID 9) makes the headset tear down and rebuild its audio path, and it plays its "disconnected" prompt while doing so. That would fit "chime right after connecting" (when PipeWire immediately switches to the profile saved as default) and "chime when the profile switches".
+- To test: make aptX Adaptive the **first and only** codec configured on connect (the earlier combined test did this with `bluez5.codecs = [sbc, aptx_adaptive]`; that run was also silent, and whether it chimed wasn't recorded), and stop KDE from cycling the device (e.g. `systemctl --user stop plasma-kded6` or disable bluedevil during the test).
