@@ -131,3 +131,14 @@ Conclusion: the chime doesn't separate layouts. It seems tied to the restart and
 - An earlier capture also suggested the offload start config carries an SCMS-T flag. If the sink needs SCMS-T configured, each media packet then carries a 1-byte content-protection header (between the RTP header and the codec payload) and the sink may mute without it.
 - To test: add Content Protection SCMS-T (type 0x0002) to SetConfiguration, and prepend the SCMS-T byte (0x00 = copy allowed) to every payload.
 - Correction (public sources): the CP header byte is bit 0 = L-bit, bit 1 = Cp-bit (Bluetooth Assigned Numbers, A/V content protection, note 3). Android's `AVDT_CP_SCMS_COPY_FREE` is **0x02**; 0x00 is `COPY_NEVER`. The dev switch `APTX_ADAPTIVE_SCMST=1` sends 0x02 by default; `APTX_ADAPTIVE_SCMST_BYTE=0x00` tries the other.
+
+## phone to real Px7 S2e: bugreport findings (2026-10-13)
+
+The HCI snoop file in the bugreport was empty (16 bytes): the vendor snoop logger failed an SELinux check. The phone's logcat and Bluetooth dumpsys still show:
+
+- **No content protection.** The phone configures the Px7's aptX Adaptive SEP with protocol service capabilities mask `0x102`, which is Media Transport + Delay Reporting. **Not SCMS-T.** So the SCMS-T lead is very likely wrong; the phone plays fine without it.
+- **Delay reporting is configured,** and the sink reports 200 ms (2000 in 1/10 ms). BlueZ already negotiates Delay Reporting when both sides offer it; check our SetConfiguration includes it.
+- Stream MTU 883. The offload start adds "AVDTP media header" into the stream MTU (895 = 883 + 12): a plain 12-byte RTP header, same as §7D.
+- Offload parameters for this sink: sample rate 48k, 24-bit, sink buffering min/max 20/100 ms for LL, HQ and TWS, TTP bytes `37 6a 00 af 64 4b` (the sink's own), encoder "Mode" 4266 (0x10AA), "mode 4096" (0x1000) sent to the controller as aptX Adaptive mode, input mode 0, R2.1 supported true.
+- Interop: the phone checks `OplusAvrcpUseA2dpOnly` against the Px7 (no match).
+- "Don't use RTP header: false", so RTP is used.
