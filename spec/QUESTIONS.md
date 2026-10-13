@@ -337,3 +337,12 @@ Where we deviate from or can't follow the spec exactly:
 - Switch HQ → LL via `pw-cli set-param <node> Props '{ quality = 1 }'`: audible fade/gap, then LL plays fine. 100 packets/s, 360 bytes (12 + 348), header `… 00 00 01 e0 00 00 00 a1`, completion med 19 / p90 49 ms.
 - Switch LL → HQ: audible fade/gap, back to 668-byte `a3` packets, 0 missing sequence numbers across the switch.
 - With stock BlueZ (A2DP 1.4) the Px7 doesn't offer Delay Reporting, so no Delay Report to check the target latency on air.
+
+## target latency confirmed on air (2026-10-13 11:09)
+
+With the A2DP-1.3 bluetoothd (so the Px7 offers Delay Reporting) and the merged plugin: SetConfiguration `12 02 50 6a 64 af 64 4b 00 00 aa` + zeros.
+- Before Start the Px7 reports 200 ms.
+- **LL after Start: Delay Report 80.0 ms.** That's our LL0 byte `0x50`, raised from the Px7's 55 ms per §7H.
+- **HQ after Start: Delay Report 200.0 ms.** That's the HQ byte `0x64` × 2 ms per §7G.
+
+So the sink's active target matches what we send in both modes.
