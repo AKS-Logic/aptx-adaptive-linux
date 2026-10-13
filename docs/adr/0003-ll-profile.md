@@ -17,7 +17,7 @@ The plugin exports two `media_codec` entries for the one `aptx_adaptive` endpoin
 | `endpoint_name` | `aptx_adaptive` | `aptx_adaptive` |
 | streams start in | HQ, or the device's `bluez5.a2dp.aptx-adaptive.mode` if it's the owner | LL |
 
-One of them is the **owner**: it has the slot's id (LDAC or LC3plus HR, ADR 0002) and `fill_caps`, and comes first. The other is the **alias**: id `SPA_BLUETOOTH_AUDIO_CODEC_MPEG` (3), `fill_caps = NULL`. Which one owns the endpoint is chosen when the plugin loads, from `APTX_ADAPTIVE_DEFAULT_MODE=hq|ll` (default `hq`; unknown values log an error and use `hq`). `scripts/install-plugin.sh` writes it into the same systemd drop-ins as `APTX_ADAPTIVE_SLOT`. All callbacks are shared. The `quality` prop works on both entries, and a reset (`set_props` with no param) goes back to the entry's own starting mode.
+One of them is the **owner**: it has the slot's id (LDAC or LC3plus HR, ADR 0002; aptX HD in the `aptx` slot, ADR 0004) and `fill_caps`, and comes first. The other is the **alias**: id `SPA_BLUETOOTH_AUDIO_CODEC_MPEG` (3), or `SPA_BLUETOOTH_AUDIO_CODEC_APTX` (6) in the `aptx` slot, and `fill_caps = NULL`. Which one owns the endpoint is chosen when the plugin loads, from `APTX_ADAPTIVE_DEFAULT_MODE=hq|ll` (default `hq`; unknown values log an error and use `hq`). `scripts/install-plugin.sh` writes it into the same systemd drop-ins as `APTX_ADAPTIVE_SLOT`. All callbacks are shared. The `quality` prop works on both entries, and a reset (`set_props` with no param) goes back to the entry's own starting mode.
 
 Only the HQ owner reads `bluez5.a2dp.aptx-adaptive.mode`. Every other entry starts in the mode its label says, so the label is never wrong after a profile pick or a connect.
 

@@ -1,7 +1,9 @@
 use std::ffi::CStr;
 
 pub const INTERFACE_TYPE: &CStr = c"Spa:Pointer:Interface:Bluez5:Codec:Media:Private";
-pub const FACTORY_NAME: &CStr = c"api.codec.bluez5.media.lc3plus";
+pub const FACTORY_NAME_LC3PLUS: &CStr = c"api.codec.bluez5.media.lc3plus";
+pub const FACTORY_NAME_APTX: &CStr = c"api.codec.bluez5.media.aptx";
+pub const FACTORY_DESCRIPTION: &CStr = c"Bluetooth codec plugin (aptX Adaptive)";
 pub const CODEC_NAME: &CStr = c"aptx_adaptive";
 pub const CODEC_DESCRIPTION: &CStr = c"aptX Adaptive";
 pub const LL_NAME: &CStr = c"aptx_adaptive_ll";

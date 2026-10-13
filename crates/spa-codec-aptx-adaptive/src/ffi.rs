@@ -7,6 +7,8 @@ pub const SPA_VERSION_BLUEZ5_CODEC_MEDIA: u32 = 16;
 #[cfg(test)]
 pub const SPA_PARAM_ENUM_FORMAT: u32 = 3;
 pub const SPA_BLUETOOTH_AUDIO_CODEC_MPEG: u32 = 3;
+pub const SPA_BLUETOOTH_AUDIO_CODEC_APTX: u32 = 6;
+pub const SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD: u32 = 7;
 pub const SPA_BLUETOOTH_AUDIO_CODEC_LDAC: u32 = 8;
 pub const SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR: u32 = 13;
 pub const MEDIA_CODEC_A2DP: u32 = 0;
@@ -341,6 +343,30 @@ pub struct media_codec {
 pub struct spa_bluez5_codec_a2dp {
     pub iface: spa_interface,
     pub codecs: *const *const media_codec,
+}
+
+pub type SpaHandleFactoryEnumFn =
+    unsafe extern "C" fn(*mut *const spa_handle_factory, *mut u32) -> c_int;
+
+pub const RTLD_NOW: c_int = 2;
+pub const RTLD_LOCAL: c_int = 0;
+
+#[repr(C)]
+pub struct DlInfo {
+    pub fname: *const c_char,
+    pub fbase: *mut c_void,
+    pub sname: *const c_char,
+    pub saddr: *mut c_void,
+}
+
+// glibc ≥ 2.34 has these in libc and keeps libdl as an empty stub; older glibc needs libdl.
+#[link(name = "dl")]
+unsafe extern "C" {
+    pub fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+    pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    pub fn dlclose(handle: *mut c_void) -> c_int;
+    pub fn dlerror() -> *const c_char;
+    pub fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
 }
 
 #[cfg(target_pointer_width = "64")]

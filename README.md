@@ -20,22 +20,50 @@ mise run install-plugin
 systemctl --user restart wireplumber pipewire
 ```
 
-This builds the plugin, installs it to `~/.local/lib/spa-0.2/bluez5/`, and adds systemd user drop-ins so WirePlumber and PipeWire find it. Re-running it is safe.
+This builds the plugin, installs it to `~/.local/lib/spa-0.2/bluez5/`, and adds systemd user drop-ins so WirePlumber and PipeWire find it. In the default slot it also installs a WirePlumber script, `~/.local/share/wireplumber/scripts/aptx-linux/aptx-adaptive-guard.lua`, enabled by `~/.config/wireplumber/wireplumber.conf.d/90-aptx-adaptive-guard.conf` (see below). Re-running it is safe.
 
-The plugin is installed as PipeWire's LC3plus HR plugin, so it replaces a real LC3plus plugin if you have one.
+By default the plugin is installed as PipeWire's **aptX plugin** (`libspa-codec-bluez5-aptx.so`). It loads the real system aptX plugin and passes aptX, aptX HD and aptX-LL through unchanged, so headsets without aptX Adaptive work exactly as before. The other install slots use the LC3plus HR plugin file instead (see below). Only one file is ever installed; switching slots removes the other.
+
+If the real aptX plugin can't be loaded (not installed, or from another PipeWire version), aptX and aptX HD are unavailable while ours is installed. WirePlumber's log says why:
+
+```sh
+journalctl --user -u wireplumber | grep 'aptx-adaptive: aptX'
+# aptx-adaptive: aptX passthrough: 6 codecs from /usr/lib/spa-0.2/bluez5/libspa-codec-bluez5-aptx.so
+```
 
 ## codec selection
 
-By default the plugin borrows PipeWire's LDAC codec id, which ranks above aptX HD, aptX and AAC. A headset with aptX Adaptive gets it as soon as it connects, as the plain `a2dp-sink` profile (HQ, or low latency, see below); aptX HD is still there as `a2dp-sink-aptx_hd`. There's no `a2dp-sink-aptx_adaptive` profile in this slot, so if WirePlumber saved that one earlier it falls back to `a2dp-sink`. See [ADR 0002](docs/adr/0002-codec-autoselect.md).
+The install slot (`APTX_ADAPTIVE_SLOT`) decides which PipeWire codec ids aptX Adaptive borrows, and so where it ranks:
 
-**If your headset also supports LDAC**, the two share that id, and which one you get can change between restarts. Install in the LC3plus HR slot instead:
+| slot | plugin file | aptX Adaptive on connect | notes |
+|---|---|---|---|
+| `aptx` (default) | aptX | yes, unless the headset has LDAC | replaces aptX HD and aptX on aptX Adaptive headsets only ([ADR 0004](docs/adr/0004-aptx-slot.md)) |
+| `ldac` | LC3plus HR | yes, above LDAC | clashes with LDAC on headsets that have both ([ADR 0002](docs/adr/0002-codec-autoselect.md)) |
+| `lc3plus_hr` | LC3plus HR | no, pick it by hand | below aptX HD, aptX and AAC |
+
+**`aptx` slot (default).** aptX Adaptive takes PipeWire's aptX HD and aptX codec ids. PipeWire makes one profile per id, using the codecs the headset supports, so:
+
+- On a headset with aptX Adaptive, the aptX HD and aptX profiles become aptX Adaptive (HQ and low latency). The separate aptX HD and aptX profiles disappear; that's intended. aptX-LL, AAC and SBC are unchanged.
+- On a headset without aptX Adaptive, nothing changes: aptX HD and aptX are the real ones.
+- LDAC is untouched. LDAC ranks above aptX HD, so **a headset with both LDAC and aptX Adaptive connects on LDAC**. Pick aptX Adaptive by hand there (`a2dp-sink-aptx_adaptive`, or `…_ll`).
+- `pw-dump` shows the codec ids as `aptx_hd` (aptX Adaptive's connect profile) and `aptx` (the other mode). These are only borrowed ids. `api.bluez5.codec` and the profile names say `aptx_adaptive`.
+- Some headsets set up the codec themselves and may pick aptX HD. PipeWire then labels the card with the aptX Adaptive profile while aptX HD actually runs. This slot installs a small WirePlumber script that notices this and switches to aptX Adaptive once per connection. You may hear one codec-change chime. Check its log line:
+
+  ```sh
+  journalctl --user -u wireplumber | grep 're-selecting it via'
+  ```
+
+  To fix it by hand, pick the other aptX Adaptive profile, then the one you want. Picking the same profile again does nothing. This hasn't been tested on such a headset yet ([ADR 0004](docs/adr/0004-aptx-slot.md), "risks").
+
+Other slots:
 
 ```sh
-APTX_ADAPTIVE_SLOT=lc3plus_hr mise run install-plugin
+APTX_ADAPTIVE_SLOT=ldac mise run install-plugin         # the old default
+APTX_ADAPTIVE_SLOT=lc3plus_hr mise run install-plugin   # aptX HD on connect
 systemctl --user restart wireplumber pipewire
 ```
 
-In that slot aptX Adaptive ranks below aptX HD, aptX and AAC, so pick it after connecting (the headset chimes when the codec changes):
+In the `lc3plus_hr` slot aptX Adaptive ranks below aptX HD, aptX and AAC, so pick it after connecting (the headset chimes when the codec changes):
 
 ```sh
 pactl list cards short          # find the bluez_card.… name
@@ -64,15 +92,16 @@ The profile names depend on that choice, because PipeWire calls the connect-time
 
 | | HQ, shown as "…codec aptX Adaptive)" | low latency, shown as "…codec aptX Adaptive (Low Latency))" |
 |---|---|---|
-| default mode `hq` | `a2dp-sink` | `a2dp-sink-aptx_adaptive_ll` |
-| default mode `ll` | `a2dp-sink-aptx_adaptive` | `a2dp-sink` |
+| `aptx` or `ldac` slot, default mode `hq` | `a2dp-sink` | `a2dp-sink-aptx_adaptive_ll` |
+| `aptx` or `ldac` slot, default mode `ll` | `a2dp-sink-aptx_adaptive` | `a2dp-sink` |
+| `aptx` slot, headset also has LDAC | `a2dp-sink-aptx_adaptive` | `a2dp-sink-aptx_adaptive_ll` |
 | `lc3plus_hr` slot, either mode | `a2dp-sink-aptx_adaptive` | `a2dp-sink-aptx_adaptive_ll` |
 
 The full labels are "High Fidelity Playback (A2DP Sink, codec aptX Adaptive)" and "High Fidelity Playback (A2DP Sink, codec aptX Adaptive (Low Latency))".
 
-With the default mode's profile there's a single Bluetooth setup on connect, and the label matches what's running. In the `lc3plus_hr` slot, aptX HD is set up on connect whatever the mode (see above).
+With the default mode's profile there's a single Bluetooth setup on connect, and the label matches what's running. In the `lc3plus_hr` slot aptX HD is set up on connect whatever the mode, and in the `aptx` slot a headset with LDAC gets LDAC (see above).
 
-WirePlumber remembers the profile you pick per headset and restores it on the next connect. Switching profile reconfigures the Bluetooth stream: there's a gap of a second or two, and the Px7 S2e plays its chime. So if you usually want the other mode, change the default mode instead of switching every time. `pw-dump` shows the non-default profile's codec id as `mpeg`; that's only a borrowed id, see [ADR 0003](docs/adr/0003-ll-profile.md).
+WirePlumber remembers the profile you pick per headset and restores it on the next connect. Switching profile reconfigures the Bluetooth stream: there's a gap of a second or two, and the Px7 S2e plays its chime. So if you usually want the other mode, change the default mode instead of switching every time. `pw-dump` shows the non-default profile's codec id as `aptx` (`mpeg` in the `ldac` and `lc3plus_hr` slots); that's only a borrowed id, see [ADR 0003](docs/adr/0003-ll-profile.md) and [ADR 0004](docs/adr/0004-aptx-slot.md).
 
 The default mode is a systemd drop-in environment variable, not a WirePlumber setting. PipeWire binds a fresh connection to whichever codec entry owns the Bluetooth endpoint. That's fixed when the plugin loads, and nothing in the WirePlumber or PipeWire config reaches it (details in ADR 0003).
 
@@ -143,7 +172,7 @@ scripts/install-plugin.sh --uninstall
 systemctl --user restart wireplumber pipewire
 ```
 
-This removes the plugin and the drop-ins. It's safe to run twice. Directories the install created (`~/.local/lib/spa-0.2/…`, `${XDG_CONFIG_HOME:-~/.config}/systemd/user/….d`) are removed only if empty, so `~/.local/lib` and `${XDG_CONFIG_HOME:-~/.config}/systemd/user` themselves are left in place.
+This removes the plugin (under either file name), the WirePlumber script and its config fragment, and the drop-ins. It's safe to run twice. Directories the install created (`~/.local/lib/spa-0.2/…`, `${XDG_CONFIG_HOME:-~/.config}/systemd/user/….d`, `…/wireplumber/…`) are removed only if empty, so `~/.local/lib` and `${XDG_CONFIG_HOME:-~/.config}/systemd/user` themselves are left in place.
 
 ## clean room
 

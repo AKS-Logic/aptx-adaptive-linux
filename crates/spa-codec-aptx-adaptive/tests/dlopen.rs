@@ -10,7 +10,7 @@ mod fixtures;
 mod ids;
 
 use std::ffi::{CStr, c_int, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
 use std::sync::OnceLock;
@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 use ffi::{
     A2DP_CODEC_VENDOR, A2DP_MAX_CAPS_SIZE, EINVAL, ENOENT, ENOTSUP, MEDIA_CODEC_A2DP,
     SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_FORMAT_S24_32_LE,
+    SPA_BLUETOOTH_AUDIO_CODEC_APTX, SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD,
     SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR, SPA_BLUETOOTH_AUDIO_CODEC_LDAC,
     SPA_BLUETOOTH_AUDIO_CODEC_MPEG, SPA_MEDIA_SUBTYPE_RAW, SPA_MEDIA_TYPE_AUDIO,
     SPA_PARAM_ENUM_FORMAT, SPA_PARAM_PROP_INFO, SPA_PARAM_PROPS, SPA_PROP_QUALITY, SPA_TYPE_INT,
@@ -56,31 +57,68 @@ fn plugin_path() -> &'static PathBuf {
     })
 }
 
-/// The two entries in plugin order: endpoint owner, then alias.
+/// Our two entries in plugin order (endpoint owner, then alias), and the whole export list,
+/// which in the `aptx` slot goes on with the real aptX plugin's codecs.
 struct Loaded {
     _lib: libloading::Library,
     _handle: Vec<u64>,
     codec: &'static media_codec,
     ll: &'static media_codec,
+    all: Vec<&'static media_codec>,
 }
 
 fn load() -> Loaded {
-    // SAFETY: our own plugin, no global constructors with side effects.
-    let lib = unsafe { libloading::Library::new(plugin_path()) }.unwrap();
+    load_from(plugin_path(), slot_factory_name())
+}
+
+fn slot_factory_name() -> &'static CStr {
+    match std::env::var("APTX_ADAPTIVE_SLOT").as_deref() {
+        Ok("ldac" | "lc3plus_hr") => ids::FACTORY_NAME_LC3PLUS,
+        _ => ids::FACTORY_NAME_APTX,
+    }
+}
+
+/// Loads a codec plugin the way `codec-loader.c` does and returns its codec list.
+fn load_from(path: &Path, factory_name: &CStr) -> Loaded {
+    // SAFETY: a PipeWire codec plugin, no global constructors with side effects.
+    let lib = unsafe { libloading::Library::new(path) }.unwrap();
     // SAFETY: symbol type matches the C declaration.
     let enum_fn = unsafe { lib.get::<EnumFn>(b"spa_handle_factory_enum\0") }.unwrap();
 
-    let mut factory = ptr::null();
+    let mut names = Vec::new();
+    let mut found = None;
     let mut index = 0;
-    // SAFETY: valid out-pointers.
-    assert_eq!(unsafe { enum_fn(&raw mut factory, &raw mut index) }, 1);
-    // SAFETY: plugin returned a static factory.
-    let f = unsafe { &*factory };
-    assert_eq!(f.version, SPA_VERSION_HANDLE_FACTORY);
-    // SAFETY: NUL-terminated static string.
-    assert_eq!(unsafe { CStr::from_ptr(f.name) }, ids::FACTORY_NAME);
-    // SAFETY: valid out-pointers.
-    assert_eq!(unsafe { enum_fn(&raw mut factory, &raw mut index) }, 0);
+    loop {
+        let mut factory = ptr::null();
+        // SAFETY: valid out-pointers.
+        match unsafe { enum_fn(&raw mut factory, &raw mut index) } {
+            0 => break,
+            1 => {}
+            r => panic!("spa_handle_factory_enum: {r}"),
+        }
+        // SAFETY: plugin returned a static factory.
+        let f = unsafe { &*factory };
+        assert_eq!(f.version, SPA_VERSION_HANDLE_FACTORY);
+        // SAFETY: NUL-terminated static string.
+        let name = unsafe { CStr::from_ptr(f.name) };
+        names.push(name);
+        if name == factory_name {
+            found = Some(f);
+        }
+    }
+    let f = found.unwrap_or_else(|| panic!("no {factory_name:?} in {names:?}"));
+    // SAFETY: plugins point info at a static dict.
+    let desc = unsafe { (*(*f.info).items).value };
+    // SAFETY: static string.
+    let ours = unsafe { CStr::from_ptr(desc) } == ids::FACTORY_DESCRIPTION;
+    assert_eq!(ours, !path.starts_with(SYSTEM_PLUGIN_DIR));
+    if ours {
+        assert_eq!(
+            names,
+            [ids::FACTORY_NAME_APTX, ids::FACTORY_NAME_LC3PLUS],
+            "both file names' factories"
+        );
+    }
 
     // SAFETY: calling the factory as the loader would.
     let size = unsafe { f.get_size.unwrap()(f, ptr::null()) };
@@ -100,16 +138,19 @@ fn load() -> Loaded {
     // SAFETY: plugin returned its interface struct.
     let iface = unsafe { &*iface.cast::<spa_bluez5_codec_a2dp>() };
     assert_eq!(iface.iface.version, SPA_VERSION_BLUEZ5_CODEC_MEDIA);
-    // SAFETY: NULL-terminated array of static codecs.
-    let (codec, ll) = unsafe {
-        assert!((*iface.codecs.add(2)).is_null());
-        (&**iface.codecs, &**iface.codecs.add(1))
-    };
+    let mut all = Vec::new();
+    // SAFETY: NULL-terminated array of codecs that live as long as the library.
+    unsafe {
+        while let Some(c) = (*iface.codecs.add(all.len())).as_ref() {
+            all.push(c);
+        }
+    }
     Loaded {
         _lib: lib,
         _handle: handle,
-        codec,
-        ll,
+        codec: all[0],
+        ll: all.get(1).copied().unwrap_or(all[0]),
+        all,
     }
 }
 
@@ -182,12 +223,29 @@ fn init_with_props(
 fn codec_metadata() {
     let l = load();
     let owner = l.codec;
-    let want = match std::env::var("APTX_ADAPTIVE_SLOT").as_deref() {
-        Ok("lc3plus_hr") => SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR,
-        _ => SPA_BLUETOOTH_AUDIO_CODEC_LDAC,
+    let (want, want_alias) = match std::env::var("APTX_ADAPTIVE_SLOT").as_deref() {
+        Ok("lc3plus_hr") => (
+            SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR,
+            SPA_BLUETOOTH_AUDIO_CODEC_MPEG,
+        ),
+        Ok("ldac") => (
+            SPA_BLUETOOTH_AUDIO_CODEC_LDAC,
+            SPA_BLUETOOTH_AUDIO_CODEC_MPEG,
+        ),
+        _ => (
+            SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD,
+            SPA_BLUETOOTH_AUDIO_CODEC_APTX,
+        ),
     };
     assert_eq!(owner.id, want);
     assert!(owner.fill_caps.is_some());
+    if want_alias == SPA_BLUETOOTH_AUDIO_CODEC_MPEG {
+        assert_eq!(l.all.len(), 2);
+    }
+    for c in &l.all[2..] {
+        // SAFETY: static strings.
+        assert_ne!(unsafe { CStr::from_ptr(c.name) }, ids::CODEC_NAME);
+    }
     let ll_default = std::env::var("APTX_ADAPTIVE_DEFAULT_MODE").as_deref() == Ok("ll");
     let (hq, ll) = if ll_default {
         (l.ll, l.codec)
@@ -218,14 +276,14 @@ fn codec_metadata() {
         assert_eq!(c.send_buf_size, ids::SEND_BUF_SIZE);
         assert!(c.abr_process.is_some());
     }
-    check_alias(l.ll, owner);
+    check_alias(l.ll, owner, want_alias);
     if std::env::var_os(SLOT_CHILD_VAR).is_some() {
         std::process::exit(SLOT_CHILD_OK);
     }
 }
 
-fn check_alias(alias: &media_codec, owner: &media_codec) {
-    assert_eq!(alias.id, SPA_BLUETOOTH_AUDIO_CODEC_MPEG);
+fn check_alias(alias: &media_codec, owner: &media_codec, id: u32) {
+    assert_eq!(alias.id, id);
     assert_ne!(alias.id, owner.id);
     assert!(alias.fill_caps.is_none());
     // SAFETY: static strings.
@@ -273,9 +331,10 @@ fn check_alias(alias: &media_codec, owner: &media_codec) {
 const SLOT_CHILD_VAR: &str = "APTX_ADAPTIVE_TEST_SLOT_CHILD";
 const SLOT_CHILD_OK: i32 = 42;
 
-fn run_child(name: &str, env: &[(&str, &str)]) {
+/// Runs one test in a child process with `env`; returns its stderr.
+fn run_child(name: &str, env: &[(&str, &str)]) -> String {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args(["--exact", name, "--test-threads=1"])
+    cmd.args(["--exact", name, "--test-threads=1", "--nocapture"])
         .env_remove("APTX_ADAPTIVE_SLOT")
         .env_remove("APTX_ADAPTIVE_DEFAULT_MODE")
         .env(SLOT_CHILD_VAR, "1");
@@ -283,17 +342,18 @@ fn run_child(name: &str, env: &[(&str, &str)]) {
         cmd.env(k, v);
     }
     let out = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
         out.status.code() == Some(SLOT_CHILD_OK),
-        "{name} {env:?}: {}{}",
+        "{name} {env:?}: {}{stderr}",
         String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
     );
+    stderr
 }
 
 #[test]
 fn slot_and_default_mode_follow_env() {
-    for slot in ["ldac", "lc3plus_hr", "bogus"] {
+    for slot in ["aptx", "ldac", "lc3plus_hr", "bogus"] {
         for mode in ["hq", "ll", "bogus"] {
             run_child(
                 "codec_metadata",
@@ -886,4 +946,222 @@ fn bitpool_callbacks_in_r1_ll_change_nothing() {
         c.deinit.unwrap()(data);
         c.clear_props.unwrap()(props);
     }
+}
+
+const SYSTEM_PLUGIN_DIR: &str = env!("APTX_ADAPTIVE_SYSTEM_PLUGINDIR");
+const APTX_LIB: &str = "bluez5/libspa-codec-bluez5-aptx.so";
+const PLUGIN_DIR_VAR: &str = "APTX_ADAPTIVE_TEST_PLUGIN_DIR";
+
+/// The installed PipeWire aptX plugin, if it has our codec ABI version.
+fn real_aptx() -> Option<PathBuf> {
+    let path = Path::new(SYSTEM_PLUGIN_DIR).join(APTX_LIB);
+    if !path.exists() {
+        eprintln!("skipped: no {}", path.display());
+        return None;
+    }
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", "real_aptx_abi_probe", "--test-threads=1"])
+        .env(SLOT_CHILD_VAR, "1");
+    if cmd.status().unwrap().code() == Some(SLOT_CHILD_OK) {
+        Some(path)
+    } else {
+        eprintln!("skipped: {} has another codec ABI", path.display());
+        None
+    }
+}
+
+/// Child only: exits OK if the real aptX plugin's interface version is ours.
+#[test]
+fn real_aptx_abi_probe() {
+    if std::env::var_os(SLOT_CHILD_VAR).is_none() {
+        return;
+    }
+    let l = load_from(
+        &Path::new(SYSTEM_PLUGIN_DIR).join(APTX_LIB),
+        ids::FACTORY_NAME_APTX,
+    );
+    assert!(!l.all.is_empty());
+    std::process::exit(SLOT_CHILD_OK);
+}
+
+/// A plugin dir holding only our plugin, installed under the aptX file name.
+fn own_plugin_dir(tag: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.scratch/dlopen-tests")
+        .join(format!("{tag}-{}", std::process::id()));
+    let lib = dir.join(APTX_LIB);
+    std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+    std::fs::copy(plugin_path(), &lib).unwrap();
+    dir
+}
+
+const CODEC_ORDER: [u32; 8] = [
+    0x200, // LC3
+    SPA_BLUETOOTH_AUDIO_CODEC_LDAC,
+    SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD,
+    SPA_BLUETOOTH_AUDIO_CODEC_APTX,
+    4,  // AAC
+    18, // OPUS_G
+    SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR,
+    SPA_BLUETOOTH_AUDIO_CODEC_MPEG,
+];
+
+/// `codec_order_cmp` from PipeWire 1.6.9's `codec-loader.c`, abridged to the ids above
+/// (every other id ranks after them).
+fn codec_order_cmp(a: &&media_codec, b: &&media_codec) -> std::cmp::Ordering {
+    let order = |c: &media_codec| {
+        CODEC_ORDER
+            .iter()
+            .position(|&id| id == c.id)
+            .unwrap_or(CODEC_ORDER.len())
+    };
+    let (pa, pb) = (ptr::from_ref(*a), ptr::from_ref(*b));
+    order(a).cmp(&order(b)).then(pa.cmp(&pb))
+}
+
+fn as_bytes(c: &media_codec) -> &[u8] {
+    // SAFETY: a media_codec is plain data, size_of bytes long.
+    unsafe { std::slice::from_raw_parts(ptr::from_ref(c).cast(), size_of::<media_codec>()) }
+}
+
+fn fill_caps(c: &media_codec) -> Vec<u8> {
+    let mut caps = [0u8; A2DP_MAX_CAPS_SIZE];
+    // SAFETY: caps is A2DP_MAX_CAPS_SIZE bytes.
+    let n = unsafe { c.fill_caps.unwrap()(c, 0, ptr::null(), caps.as_mut_ptr()) };
+    assert!(n > 0);
+    caps[..n as usize].to_vec()
+}
+
+#[test]
+fn aptx_slot_passes_real_codecs_through() {
+    let Some(dir) = std::env::var_os(PLUGIN_DIR_VAR) else {
+        let Some(real) = real_aptx() else { return };
+        let ours = own_plugin_dir("passthrough");
+        let search = format!(
+            "{}:{}",
+            ours.display(),
+            real.parent().unwrap().parent().unwrap().display()
+        );
+        for mode in ["hq", "ll"] {
+            let log = run_child(
+                "aptx_slot_passes_real_codecs_through",
+                &[
+                    ("APTX_ADAPTIVE_SLOT", "aptx"),
+                    ("APTX_ADAPTIVE_DEFAULT_MODE", mode),
+                    ("SPA_PLUGIN_DIR", &search),
+                    (PLUGIN_DIR_VAR, ours.to_str().unwrap()),
+                ],
+            );
+            assert!(log.contains("aptX passthrough: 6 codecs from"), "{log}");
+            assert!(log.contains(SYSTEM_PLUGIN_DIR), "{log}");
+            assert!(!log.contains("unavailable"), "{log}");
+        }
+        std::fs::remove_dir_all(ours).unwrap();
+        return;
+    };
+    let l = load_from(&Path::new(&dir).join(APTX_LIB), ids::FACTORY_NAME_APTX);
+    let real = load_from(
+        &Path::new(SYSTEM_PLUGIN_DIR).join(APTX_LIB),
+        ids::FACTORY_NAME_APTX,
+    );
+
+    let ll_default = std::env::var("APTX_ADAPTIVE_DEFAULT_MODE").as_deref() == Ok("ll");
+    let names: Vec<&CStr> = l
+        .all
+        .iter()
+        // SAFETY: static strings.
+        .map(|c| unsafe { CStr::from_ptr(c.name) })
+        .collect();
+    let (owner_name, alias_name) = if ll_default {
+        (c"aptx_adaptive_ll", c"aptx_adaptive")
+    } else {
+        (c"aptx_adaptive", c"aptx_adaptive_ll")
+    };
+    assert_eq!(
+        names,
+        [
+            owner_name,
+            alias_name,
+            c"aptx_hd",
+            c"aptx",
+            c"aptx_ll",
+            c"aptx_ll",
+            c"aptx_ll_duplex",
+            c"aptx_ll_duplex",
+        ]
+    );
+    let (owner, alias) = (l.all[0], l.all[1]);
+    assert_eq!(
+        (owner.id, alias.id),
+        (
+            SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD,
+            SPA_BLUETOOTH_AUDIO_CODEC_APTX
+        )
+    );
+    assert!(owner.fill_caps.is_some() && alias.fill_caps.is_none());
+
+    let copies = &l.all[2..];
+    assert_eq!(copies.len(), real.all.len());
+    for (copy, orig) in copies.iter().zip(&real.all) {
+        assert!(!ptr::eq(*copy, *orig), "a copy, not the real static");
+        assert_eq!(as_bytes(copy), as_bytes(orig), "same fields and pointers");
+        assert_eq!(
+            copy.encode.map(|f| f as usize),
+            orig.encode.map(|f| f as usize)
+        );
+        for o in [owner, alias] {
+            assert!(ptr::from_ref(o) < ptr::from_ref(*copy));
+        }
+    }
+    let hd = copies[0];
+    assert_eq!(hd.id, SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD);
+    let caps = fill_caps(hd);
+    assert_eq!(caps, fill_caps(real.all[0]));
+    assert_eq!(caps.len(), 11);
+    assert_eq!(caps[..6], [0xD7, 0, 0, 0, 0x24, 0]);
+    assert_eq!(fill_caps(copies[1])[..6], [0x4F, 0, 0, 0, 0x01, 0]);
+
+    let mut sorted = l.all.clone();
+    sorted.sort_by(codec_order_cmp);
+    let first = |id: u32| *sorted.iter().find(|c| c.id == id).unwrap();
+    assert!(ptr::eq(first(SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD), owner));
+    assert!(ptr::eq(first(SPA_BLUETOOTH_AUDIO_CODEC_APTX), alias));
+    let pos = |c: &media_codec| sorted.iter().position(|s| ptr::eq(*s, c)).unwrap();
+    assert!(pos(owner) < pos(copies[0]) && pos(alias) < pos(copies[1]));
+    std::process::exit(SLOT_CHILD_OK);
+}
+
+#[test]
+fn aptx_slot_without_real_plugin_exports_only_ours() {
+    let Some(dir) = std::env::var_os(PLUGIN_DIR_VAR) else {
+        let ours = own_plugin_dir("alone");
+        for mode in ["hq", "ll"] {
+            let log = run_child(
+                "aptx_slot_without_real_plugin_exports_only_ours",
+                &[
+                    ("APTX_ADAPTIVE_SLOT", "aptx"),
+                    ("APTX_ADAPTIVE_DEFAULT_MODE", mode),
+                    ("SPA_PLUGIN_DIR", ours.to_str().unwrap()),
+                    (PLUGIN_DIR_VAR, ours.to_str().unwrap()),
+                ],
+            );
+            assert!(
+                log.contains("aptx-adaptive: aptX/aptX HD unavailable: no real"),
+                "{log}"
+            );
+        }
+        std::fs::remove_dir_all(ours).unwrap();
+        return;
+    };
+    let l = load_from(&Path::new(&dir).join(APTX_LIB), ids::FACTORY_NAME_APTX);
+    assert_eq!(l.all.len(), 2);
+    assert_eq!(
+        (l.codec.id, l.ll.id),
+        (
+            SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD,
+            SPA_BLUETOOTH_AUDIO_CODEC_APTX
+        )
+    );
+    check_alias(l.ll, l.codec, SPA_BLUETOOTH_AUDIO_CODEC_APTX);
+    std::process::exit(SLOT_CHILD_OK);
 }

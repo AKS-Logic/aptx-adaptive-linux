@@ -12,6 +12,7 @@ mod ffi;
 #[cfg(test)]
 mod fixtures;
 mod ids;
+mod passthrough;
 mod pod;
 mod props;
 mod session;
@@ -25,12 +26,11 @@ use std::sync::Once;
 
 use ffi::{
     A2DP_CODEC_VENDOR, A2DP_MAX_CAPS_SIZE, EINVAL, ENOENT, ENOSPC, ENOTSUP, MEDIA_CODEC_A2DP,
-    NEED_FLUSH_ALL, NEED_FLUSH_NO, SPA_BLUETOOTH_AUDIO_CODEC_MPEG, SPA_MEDIA_SUBTYPE_RAW,
-    SPA_MEDIA_TYPE_AUDIO, SPA_VERSION_BLUEZ5_CODEC_MEDIA, SPA_VERSION_HANDLE,
-    SPA_VERSION_HANDLE_FACTORY, a2dp_vendor_codec_t, media_codec, media_codec_audio_info,
-    spa_audio_info, spa_audio_info_raw, spa_bluez5_codec_a2dp, spa_callbacks, spa_dict,
-    spa_dict_item, spa_handle, spa_handle_factory, spa_interface, spa_interface_info, spa_pod,
-    spa_pod_builder, spa_support,
+    NEED_FLUSH_ALL, NEED_FLUSH_NO, SPA_MEDIA_SUBTYPE_RAW, SPA_MEDIA_TYPE_AUDIO,
+    SPA_VERSION_BLUEZ5_CODEC_MEDIA, SPA_VERSION_HANDLE, SPA_VERSION_HANDLE_FACTORY,
+    a2dp_vendor_codec_t, media_codec, media_codec_audio_info, spa_audio_info, spa_audio_info_raw,
+    spa_bluez5_codec_a2dp, spa_callbacks, spa_dict, spa_dict_item, spa_handle, spa_handle_factory,
+    spa_interface, spa_interface_info, spa_pod, spa_pod_builder, spa_support,
 };
 use props::Props;
 use session::{Session, SessionError};
@@ -51,18 +51,17 @@ fn set_errno(e: c_int) {
     unsafe { *__errno_location() = e };
 }
 
-const fn codec(mode: slot::DefaultMode, owner: Option<slot::Slot>) -> media_codec {
+/// One entry: the endpoint `owner` has the slot's id and `fill_caps`, the alias neither.
+const fn codec(mode: DefaultMode, slot: Slot, owner: bool) -> media_codec {
     let (name, description) = match mode {
-        slot::DefaultMode::Hq => (ids::CODEC_NAME, ids::CODEC_DESCRIPTION),
-        slot::DefaultMode::Ll => (ids::LL_NAME, ids::LL_DESCRIPTION),
+        DefaultMode::Hq => (ids::CODEC_NAME, ids::CODEC_DESCRIPTION),
+        DefaultMode::Ll => (ids::LL_NAME, ids::LL_DESCRIPTION),
     };
-    let id = match owner {
-        Some(slot) => slot.id(),
-        None => SPA_BLUETOOTH_AUDIO_CODEC_MPEG,
-    };
-    let fill_caps = match owner {
-        Some(_) => Some(codec_fill_caps as _),
-        None => None,
+    let id = if owner { slot.id() } else { slot.alias_id() };
+    let fill_caps = if owner {
+        Some(codec_fill_caps as _)
+    } else {
+        None
     };
     media_codec {
         id,
@@ -110,14 +109,24 @@ const fn codec(mode: slot::DefaultMode, owner: Option<slot::Slot>) -> media_code
     }
 }
 
-static HQ_LDAC: SyncStatic<media_codec> = SyncStatic(codec(DefaultMode::Hq, Some(Slot::Ldac)));
+static HQ_LDAC: SyncStatic<media_codec> = SyncStatic(codec(DefaultMode::Hq, Slot::Ldac, true));
 static HQ_LC3PLUS_HR: SyncStatic<media_codec> =
-    SyncStatic(codec(DefaultMode::Hq, Some(Slot::Lc3plusHr)));
-static HQ_ALIAS: SyncStatic<media_codec> = SyncStatic(codec(DefaultMode::Hq, None));
-static LL_LDAC: SyncStatic<media_codec> = SyncStatic(codec(DefaultMode::Ll, Some(Slot::Ldac)));
+    SyncStatic(codec(DefaultMode::Hq, Slot::Lc3plusHr, true));
+static HQ_ALIAS: SyncStatic<media_codec> = SyncStatic(codec(DefaultMode::Hq, Slot::Ldac, false));
+static LL_LDAC: SyncStatic<media_codec> = SyncStatic(codec(DefaultMode::Ll, Slot::Ldac, true));
 static LL_LC3PLUS_HR: SyncStatic<media_codec> =
-    SyncStatic(codec(DefaultMode::Ll, Some(Slot::Lc3plusHr)));
-static LL_ALIAS: SyncStatic<media_codec> = SyncStatic(codec(DefaultMode::Ll, None));
+    SyncStatic(codec(DefaultMode::Ll, Slot::Lc3plusHr, true));
+static LL_ALIAS: SyncStatic<media_codec> = SyncStatic(codec(DefaultMode::Ll, Slot::Ldac, false));
+
+/// The `aptx` slot: our owner and alias, then copies of the real aptX plugin's codecs.
+static APTX_HQ: passthrough::Table = passthrough::Table::new(
+    codec(DefaultMode::Hq, Slot::Aptx, true),
+    codec(DefaultMode::Ll, Slot::Aptx, false),
+);
+static APTX_LL: passthrough::Table = passthrough::Table::new(
+    codec(DefaultMode::Ll, Slot::Aptx, true),
+    codec(DefaultMode::Hq, Slot::Aptx, false),
+);
 
 type CodecList = SyncStatic<[*const media_codec; 3]>;
 static CODECS_HQ_LDAC: CodecList =
@@ -136,40 +145,61 @@ static CODECS_LL_LC3PLUS_HR: CodecList = SyncStatic([
 ]);
 
 fn entry_profile(codec: *const media_codec) -> Option<aptx_adaptive::Profile> {
-    let is =
-        |list: &[&SyncStatic<media_codec>]| list.iter().any(|c| ptr::eq(codec, &raw const c.0));
-    if is(&[&LL_LDAC, &LL_LC3PLUS_HR, &LL_ALIAS]) {
+    let is = |list: &[*const media_codec]| list.iter().any(|&c| ptr::eq(codec, c));
+    let [aptx_ll_owner, aptx_hq_alias] = APTX_LL.ours();
+    let aptx_ll_alias = APTX_HQ.ours()[1];
+    if is(&[
+        &raw const LL_LDAC.0,
+        &raw const LL_LC3PLUS_HR.0,
+        &raw const LL_ALIAS.0,
+        aptx_ll_owner,
+        aptx_ll_alias,
+    ]) {
         Some(aptx_adaptive::Profile::Ll)
-    } else if is(&[&HQ_ALIAS]) {
+    } else if is(&[&raw const HQ_ALIAS.0, aptx_hq_alias]) {
         Some(aptx_adaptive::Profile::Hq)
     } else {
         None
     }
 }
 
-fn codecs() -> *const *const media_codec {
+fn config(factory: slot::Factory) -> (Slot, DefaultMode) {
     static BAD_ENV_LOGGED: Once = Once::new();
     let var = |k: &str| std::env::var_os(k);
-    let slot = Slot::from_env(var);
+    let slot = slot::resolve(Slot::from_env(var), var(slot::SLOT_VAR).is_some(), factory);
     let mode = DefaultMode::from_env(var);
     BAD_ENV_LOGGED.call_once(|| {
-        for e in [slot.as_ref().err(), mode.as_ref().err()]
-            .into_iter()
-            .flatten()
-        {
+        let slot_err = slot.as_ref().err().map(|(_, e)| e);
+        for e in [slot_err, mode.as_ref().err()].into_iter().flatten() {
             let _ = writeln!(std::io::stderr(), "aptx-adaptive: {e}");
         }
     });
-    let list = match (
-        slot.unwrap_or(Slot::DEFAULT),
+    (
+        slot.unwrap_or_else(|(s, _)| s),
         mode.unwrap_or(DefaultMode::DEFAULT),
-    ) {
+    )
+}
+
+fn codecs(
+    factory: slot::Factory,
+    info: *const spa_dict,
+    support: *const spa_support,
+    n_support: u32,
+) -> *const *const media_codec {
+    let list = match config(factory) {
+        (Slot::Aptx, DefaultMode::Hq) => return APTX_HQ.codecs(info, support, n_support),
+        (Slot::Aptx, DefaultMode::Ll) => return APTX_LL.codecs(info, support, n_support),
         (Slot::Ldac, DefaultMode::Hq) => &CODECS_HQ_LDAC,
         (Slot::Lc3plusHr, DefaultMode::Hq) => &CODECS_HQ_LC3PLUS_HR,
         (Slot::Ldac, DefaultMode::Ll) => &CODECS_LL_LDAC,
         (Slot::Lc3plusHr, DefaultMode::Ll) => &CODECS_LL_LC3PLUS_HR,
     };
     list.0.as_ptr()
+}
+
+#[cfg(test)]
+const fn codec_for_test() -> media_codec {
+    codec(DefaultMode::Hq, Slot::Ldac, true)
 }
 
 fn caps_err(e: caps::CapsError) -> c_int {
@@ -691,13 +721,19 @@ unsafe extern "C" fn factory_get_size(
 unsafe extern "C" fn factory_init(
     factory: *const spa_handle_factory,
     handle: *mut spa_handle,
-    _info: *const spa_dict,
-    _support: *const spa_support,
-    _n_support: u32,
+    info: *const spa_dict,
+    support: *const spa_support,
+    n_support: u32,
 ) -> c_int {
     if factory.is_null() || handle.is_null() {
         return -EINVAL;
     }
+    let which = if ptr::eq(factory, &raw const FACTORY_APTX.0) {
+        slot::Factory::Aptx
+    } else {
+        slot::Factory::Lc3plus
+    };
+    let codecs = codecs(which, info, support, n_support);
     let this = handle.cast::<Handle>();
     // SAFETY: the loader allocates get_size() bytes for the handle, suitably aligned.
     unsafe {
@@ -713,7 +749,7 @@ unsafe extern "C" fn factory_init(
                     data: this.cast(),
                 },
             },
-            codecs: codecs(),
+            codecs,
         });
     }
     0
@@ -746,7 +782,7 @@ unsafe extern "C" fn factory_enum_interface_info(
 
 static FACTORY_INFO_ITEMS: SyncStatic<[spa_dict_item; 1]> = SyncStatic([spa_dict_item {
     key: c"factory.description".as_ptr(),
-    value: c"Bluetooth codec plugin (aptX Adaptive)".as_ptr(),
+    value: ids::FACTORY_DESCRIPTION.as_ptr(),
 }]);
 
 static FACTORY_INFO: SyncStatic<spa_dict> = SyncStatic(spa_dict {
@@ -755,14 +791,22 @@ static FACTORY_INFO: SyncStatic<spa_dict> = SyncStatic(spa_dict {
     items: FACTORY_INFO_ITEMS.0.as_ptr(),
 });
 
-static FACTORY: SyncStatic<spa_handle_factory> = SyncStatic(spa_handle_factory {
-    version: SPA_VERSION_HANDLE_FACTORY,
-    name: ids::FACTORY_NAME.as_ptr(),
-    info: &raw const FACTORY_INFO.0,
-    get_size: Some(factory_get_size),
-    init: Some(factory_init),
-    enum_interface_info: Some(factory_enum_interface_info),
-});
+const fn factory(name: &'static CStr) -> spa_handle_factory {
+    spa_handle_factory {
+        version: SPA_VERSION_HANDLE_FACTORY,
+        name: name.as_ptr(),
+        info: &raw const FACTORY_INFO.0,
+        get_size: Some(factory_get_size),
+        init: Some(factory_init),
+        enum_interface_info: Some(factory_enum_interface_info),
+    }
+}
+
+/// `codec-loader.c` asks each plugin file for the factory named after the file, so we export
+/// both names and the one PipeWire asks for tells us which file we were installed as.
+static FACTORY_APTX: SyncStatic<spa_handle_factory> = SyncStatic(factory(ids::FACTORY_NAME_APTX));
+static FACTORY_LC3PLUS: SyncStatic<spa_handle_factory> =
+    SyncStatic(factory(ids::FACTORY_NAME_LC3PLUS));
 
 ///
 /// # Safety
@@ -777,10 +821,11 @@ pub unsafe extern "C" fn spa_handle_factory_enum(
     }
     // SAFETY: checked non-null.
     unsafe {
-        if *index != 0 {
-            return 0;
-        }
-        *factory = &raw const FACTORY.0;
+        *factory = match *index {
+            0 => &raw const FACTORY_APTX.0,
+            1 => &raw const FACTORY_LC3PLUS.0,
+            _ => return 0,
+        };
         *index += 1;
     }
     1

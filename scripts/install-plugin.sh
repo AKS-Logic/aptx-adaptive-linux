@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Builds the plugin and installs it for the current user as PipeWire's LC3plus HR plugin
-# file (docs/adr/0001-architecture.md), claiming the codec id picked by APTX_ADAPTIVE_SLOT.
+# Builds the plugin and installs it for the current user, as PipeWire's aptX plugin file
+# (slot aptx, docs/adr/0004-aptx-slot.md) or its LC3plus HR plugin file (slots ldac and
+# lc3plus_hr, docs/adr/0001-architecture.md). Only one of the two is ever installed.
+# Slot aptx also installs a WirePlumber script (wireplumber/aptx-adaptive-guard.lua) into
+# ${XDG_DATA_HOME:-~/.local/share}/wireplumber/scripts/aptx-linux and a fragment enabling it into
+# ${XDG_CONFIG_HOME:-~/.config}/wireplumber/wireplumber.conf.d; other slots remove them.
 # Safe to re-run. Doesn't restart anything.
 #
 #   scripts/install-plugin.sh               install or update
@@ -11,11 +15,14 @@
 #
 # Needs cargo, pkg-config with libspa-0.2, and python3 (not for --uninstall).
 # CARGO_FEATURES (optional) is passed to cargo build --features, e.g. dev-replay.
-# APTX_ADAPTIVE_SLOT (optional, default ldac) picks the codec id the plugin claims
-# (docs/adr/0002-codec-autoselect.md):
-#   ldac        ranked above aptX HD, so a headset with aptX Adaptive gets it on connect
-#   lc3plus_hr  aptX HD (or aptX, AAC) on connect, aptX Adaptive picked by hand. Use this
-#               for headsets that also support LDAC.
+# APTX_ADAPTIVE_SLOT (optional, default aptx) picks the plugin file and the codec ids the
+# plugin claims:
+#   aptx        replaces PipeWire's aptX plugin and passes its codecs through; aptX Adaptive
+#               takes the aptX HD and aptX ids, so an aptX Adaptive headset gets it on
+#               connect and LDAC is left alone (docs/adr/0004-aptx-slot.md)
+#   ldac        borrows the LDAC id, ranked above aptX HD (docs/adr/0002-codec-autoselect.md).
+#               Collides with LDAC on headsets that have both.
+#   lc3plus_hr  aptX HD (or aptX, AAC) on connect, aptX Adaptive picked by hand
 # APTX_ADAPTIVE_DEFAULT_MODE (optional, default hq) picks the mode a fresh connection gets
 # (docs/adr/0003-ll-profile.md):
 #   hq  the aptX Adaptive profile on connect, Low Latency picked by hand
@@ -26,9 +33,15 @@ set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 user_plugin_dir=$HOME/.local/lib/spa-0.2
-dest=$user_plugin_dir/bluez5/libspa-codec-bluez5-lc3plus.so
+aptx_dest=$user_plugin_dir/bluez5/libspa-codec-bluez5-aptx.so
+lc3plus_dest=$user_plugin_dir/bluez5/libspa-codec-bluez5-lc3plus.so
 units=(wireplumber.service pipewire.service)
 dev_dropin=$config_home/systemd/user/wireplumber.service.d/aptx-adaptive-dev-replay.conf
+# WirePlumber 0.5 reads conf.d fragments from the config dir and scripts from the data dir.
+wp_conf_dir=$config_home/wireplumber/wireplumber.conf.d
+wp_script_dir=${XDG_DATA_HOME:-$HOME/.local/share}/wireplumber/scripts/aptx-linux
+guard_conf=$wp_conf_dir/90-aptx-adaptive-guard.conf
+guard_script=$wp_script_dir/aptx-adaptive-guard.lua
 
 daemon_reload() {
 	if command -v systemctl >/dev/null; then
@@ -43,14 +56,27 @@ remove() {
 	fi
 }
 
+remove_guard() {
+	remove "$guard_conf"
+	remove "$guard_script"
+	for dir in "$wp_script_dir" "$wp_conf_dir" "$(dirname "$wp_script_dir")" \
+		"$(dirname "$(dirname "$wp_script_dir")")" "$(dirname "$wp_conf_dir")"; do
+		if [[ -d $dir ]] && rmdir "$dir" 2>/dev/null; then
+			echo "removed empty $dir"
+		fi
+	done
+}
+
 case ${1-} in
 --uninstall)
-	remove "$dest"
+	remove "$aptx_dest"
+	remove "$lc3plus_dest"
 	for unit in "${units[@]}"; do
 		remove "$config_home/systemd/user/$unit.d/aptx-adaptive.conf"
 	done
 	remove "$dev_dropin"
-dirs=()
+	remove_guard
+	dirs=()
 	for unit in "${units[@]}"; do
 		dirs+=("$config_home/systemd/user/$unit.d")
 	done
@@ -71,11 +97,18 @@ dirs=()
 	;;
 esac
 
-slot=${APTX_ADAPTIVE_SLOT:-ldac}
+slot=${APTX_ADAPTIVE_SLOT:-aptx}
 case $slot in
-ldac | lc3plus_hr) ;;
+aptx)
+	dest=$aptx_dest
+	other_dest=$lc3plus_dest
+	;;
+ldac | lc3plus_hr)
+	dest=$lc3plus_dest
+	other_dest=$aptx_dest
+	;;
 *)
-	echo "error: APTX_ADAPTIVE_SLOT=$slot is not ldac or lc3plus_hr" >&2
+	echo "error: APTX_ADAPTIVE_SLOT=$slot is not aptx, ldac or lc3plus_hr" >&2
 	exit 2
 	;;
 esac
@@ -93,12 +126,17 @@ if ! system_plugin_dir=$(pkg-config --variable=plugindir libspa-0.2) || [[ -z $s
 	exit 1
 fi
 
-if [[ -e $system_plugin_dir/bluez5/libspa-codec-bluez5-lc3plus.so ]]; then
+if [[ $slot == aptx ]]; then
+	if [[ ! -e $system_plugin_dir/bluez5/libspa-codec-bluez5-aptx.so ]]; then
+		echo "warning: $system_plugin_dir has no aptX plugin to pass through; aptX and aptX HD" >&2
+		echo "         will be unavailable (docs/adr/0004-aptx-slot.md)" >&2
+	fi
+elif [[ -e $system_plugin_dir/bluez5/libspa-codec-bluez5-lc3plus.so ]]; then
 	echo "warning: $system_plugin_dir has a real LC3plus plugin; ours shadows it" >&2
 fi
 if [[ $slot == ldac && -e $system_plugin_dir/bluez5/libspa-codec-bluez5-ldac.so ]]; then
 	echo "note: the LDAC plugin is installed. If a headset supports both LDAC and aptX Adaptive," >&2
-	echo "      install with APTX_ADAPTIVE_SLOT=lc3plus_hr (docs/adr/0002-codec-autoselect.md)" >&2
+	echo "      install with the default APTX_ADAPTIVE_SLOT=aptx (docs/adr/0004-aptx-slot.md)" >&2
 fi
 
 features=()
@@ -110,6 +148,17 @@ target_dir=$(cargo metadata --manifest-path "$repo/Cargo.toml" --format-version 
 	python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
 install -Dm644 "$target_dir/release/libspa_codec_aptx_adaptive.so" "$dest"
 echo "installed $dest"
+remove "$other_dest"
+
+if [[ $slot == aptx ]]; then
+	# Recovers a headset that configured the real aptX HD under our profile (ADR 0004).
+	install -Dm644 "$repo/wireplumber/aptx-adaptive-guard.lua" "$guard_script"
+	install -Dm644 "$repo/wireplumber/90-aptx-adaptive-guard.conf" "$guard_conf"
+	echo "installed $guard_script"
+	echo "installed $guard_conf"
+else
+	remove_guard
+fi
 
 dropin_body="[Service]
 Environment=\"SPA_PLUGIN_DIR=$user_plugin_dir:$system_plugin_dir\"
@@ -137,25 +186,37 @@ echo "restart to load it: systemctl --user restart wireplumber pipewire"
 echo
 hq_profile=a2dp-sink-aptx_adaptive
 ll_profile=a2dp-sink-aptx_adaptive_ll
-if [[ $slot == ldac && $default_mode == hq ]]; then
+if [[ $slot != lc3plus_hr && $default_mode == hq ]]; then
 	hq_profile=a2dp-sink
-elif [[ $slot == ldac ]]; then
+elif [[ $slot != lc3plus_hr ]]; then
 	ll_profile=a2dp-sink
 fi
-if [[ $slot == ldac ]]; then
+case $slot in
+aptx)
+	cat <<'EOF'
+Codec slot: aptx. The plugin replaces PipeWire's aptX plugin and passes aptX, aptX HD and
+aptX-LL through. On a headset with aptX Adaptive, aptX Adaptive takes the aptX HD and aptX
+profiles; headsets without it keep aptX HD and aptX as before. LDAC is untouched and still
+ranks first, so a headset with both connects on LDAC. A WirePlumber script switches an
+aptX Adaptive headset that set itself up on the real aptX HD over to aptX Adaptive.
+EOF
+	;;
+ldac)
 	cat <<'EOF'
 Codec slot: ldac. PipeWire ranks aptX Adaptive above aptX HD, aptX and AAC, so BlueZ
 configures it directly on connect when the headset has it, and aptX HD becomes
-a2dp-sink-aptx_hd.
-To go back: APTX_ADAPTIVE_SLOT=lc3plus_hr scripts/install-plugin.sh, then restart.
+a2dp-sink-aptx_hd. A headset that also has LDAC may get either (docs/adr/0002).
+To go back to the default: APTX_ADAPTIVE_SLOT=aptx scripts/install-plugin.sh, then restart.
 EOF
-else
+	;;
+*)
 	cat <<'EOF'
 Codec slot: lc3plus_hr. PipeWire ranks aptX Adaptive below aptX HD, aptX and AAC, so aptX
 HD is configured on connect. Pick an aptX Adaptive profile by hand (KDE, pavucontrol, or
 pactl set-card-profile); each switch makes the headset chime.
 EOF
-fi
+	;;
+esac
 cat <<EOF
 Default mode: $default_mode (APTX_ADAPTIVE_DEFAULT_MODE=hq|ll). Profiles:
   $hq_profile   aptX Adaptive (HQ)

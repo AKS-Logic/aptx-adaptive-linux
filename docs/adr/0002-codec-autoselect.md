@@ -1,5 +1,7 @@
 # 0002 - configure aptX Adaptive first on connect
 
+**Status: default superseded by [ADR 0004](0004-aptx-slot.md).** The default slot is now `aptx`, which takes the aptX HD and aptX ids and passes PipeWire's real aptX plugin through, with no LDAC collision. The `ldac` slot described here still works with `APTX_ADAPTIVE_SLOT=ldac`, unchanged. Where this ADR says "default", read "the `ldac` slot". The analysis of how BlueZ picks the first codec still holds.
+
 ## problem
 
 On connect the host configured aptX HD (Set Configuration on the Px7's SEID 7). WirePlumber then restored the saved `a2dp-sink-aptx_adaptive` profile, so PipeWire closed that stream and reconfigured SEID 9. The headset plays its disconnect chime on every such switch (`spec/QUESTIONS.md`, "clean-path test").
@@ -18,9 +20,9 @@ So no WirePlumber rule or device property can make the first configuration aptX 
 
 The plugin claims `SPA_BLUETOOTH_AUDIO_CODEC_LDAC` (8) as its `id` by default, instead of `LC3PLUS_HR` (13). `codec_order` ranks LDAC second, above aptX HD, so our endpoint is registered before aptX HD and BlueZ configures aptX Adaptive directly on any device that has it. Devices without aptX Adaptive have no matching remote SEP, BlueZ skips our endpoint, and nothing changes for them.
 
-The file name and factory stay `libspa-codec-bluez5-lc3plus.so` / `api.codec.bluez5.media.lc3plus` (ADR 0001); only the `id` moves. The id is chosen at factory init from `APTX_ADAPTIVE_SLOT=ldac|lc3plus_hr` (default `ldac`), which `scripts/install-plugin.sh` writes into the wireplumber/pipewire drop-ins. An unknown value logs an error and falls back to `ldac`.
+The file name and factory stay `libspa-codec-bluez5-lc3plus.so` / `api.codec.bluez5.media.lc3plus` (ADR 0001); only the `id` moves. The id is chosen at factory init from `APTX_ADAPTIVE_SLOT=ldac|lc3plus_hr`, which `scripts/install-plugin.sh` writes into the wireplumber/pipewire drop-ins. When the plugin is loaded as the LC3plus file, an unset variable still means `ldac`, and an unknown value logs an error and falls back to `ldac`. (Since ADR 0004 the installer's default is `aptx`, which uses the aptX file instead.)
 
-A process that loads the plugin **without** our drop-in gets the LDAC slot silently, since the default needs no variable. That covers anything that loads the bluez5 monitor outside `wireplumber.service`/`pipewire.service` but still finds our plugin, e.g. a `SPA_PLUGIN_DIR` set some other way. This is intended: the default is the behaviour we want. Only the `lc3plus_hr` choice depends on the drop-in reaching the process.
+A process that loads the LC3plus file **without** our drop-in gets the LDAC slot silently, since that needs no variable. That covers anything that loads the bluez5 monitor outside `wireplumber.service`/`pipewire.service` but still finds our plugin, e.g. a `SPA_PLUGIN_DIR` set some other way. This is intended: the default is the behaviour we want. Only the `lc3plus_hr` choice depends on the drop-in reaching the process.
 
 To go back to the old ranking, or to remove everything:
 
@@ -36,7 +38,7 @@ systemctl --user restart wireplumber pipewire
 - **aptX Adaptive wins automatically**, including while it still has open issues (stutter, no LL mode). ADR 0001's "never win auto-selection" is gone. Anyone who wants aptX HD by default uses the `lc3plus_hr` slot or picks `a2dp-sink-aptx_hd`.
 - **LDAC collision, and it isn't deterministic.** `libspa-codec-bluez5-ldac.so` is installed here, and both codecs then have id 8. They register as separate endpoints (`ldac`, `aptx_adaptive`), but `bluez5-device.c` keys profiles and the codec property by id (`get_supported_media_codec`, "skip endpoint aliases"). So on a headset with **both** LDAC and aptX Adaptive, only the first of the two in the codec list gets a profile, and BlueZ configures that one on connect. `codec_order_cmp` breaks ties between equal ids by comparing the `media_codec` pointers, which live in two different `.so` files. With ASLR their relative addresses change on each load, so which codec wins can change every time WirePlumber restarts.
   - The plugin can't detect this and back off. `select_config` and `check_caps` only see the caps of one remote endpoint, never the device's other endpoints, so it can't tell whether the headset also has LDAC.
-  - The Px7 S2e has no LDAC, so nothing collides for it. **For a headset with both codecs, install with `APTX_ADAPTIVE_SLOT=lc3plus_hr`**, which has no shared id. Leaving `ldac` out of `bluez5.codecs` also works, but removes LDAC everywhere. `install-plugin.sh` prints a note when it installs the `ldac` slot next to an installed LDAC plugin.
+  - The Px7 S2e has no LDAC, so nothing collides for it. **For a headset with both codecs, use the `aptx` slot (ADR 0004, now the default) or `lc3plus_hr`**, neither of which shares an id with LDAC. Leaving `ldac` out of `bluez5.codecs` also works, but removes LDAC everywhere. `install-plugin.sh` prints a note when it installs the `ldac` slot next to an installed LDAC plugin.
 - **Type info.** `spa_type_bluetooth_audio_codec` names id 8 `ldac`, so tools that print the `bluetoothAudioCodec` prop id by type name (e.g. `pw-dump` Props) say `ldac`. `api.bluez5.codec`, the profile names and descriptions use our `name`/`description` and say `aptx_adaptive` / "aptX Adaptive".
 - **Latency fallback.** The only other id-specific path, `transport_get_delay`'s default when the device sends no delay report, is 125 ms for both LDAC and LC3plus HR.
 
