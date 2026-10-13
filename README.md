@@ -12,7 +12,7 @@ Needs PipeWire 1.6.x. Design notes are in [docs/adr/](docs/adr/).
 
 ## install
 
-You need `mise`, `pkg-config` with the libspa development headers, and `python3`.
+You need `mise` (it provides Rust, Python and uv: run `mise install`) and `pkg-config` with the libspa development headers.
 
 ```sh
 mise install
