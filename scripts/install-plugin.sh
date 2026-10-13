@@ -16,7 +16,11 @@
 #   ldac        ranked above aptX HD, so a headset with aptX Adaptive gets it on connect
 #   lc3plus_hr  aptX HD (or aptX, AAC) on connect, aptX Adaptive picked by hand. Use this
 #               for headsets that also support LDAC.
-# Re-run with the other value to switch; only the drop-ins change.
+# APTX_ADAPTIVE_DEFAULT_MODE (optional, default hq) picks the mode a fresh connection gets
+# (docs/adr/0003-ll-profile.md):
+#   hq  the aptX Adaptive profile on connect, Low Latency picked by hand
+#   ll  the aptX Adaptive (Low Latency) profile on connect, HQ picked by hand
+# Re-run with other values to switch; only the drop-ins change.
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -77,6 +81,14 @@ ldac | lc3plus_hr) ;;
 	exit 2
 	;;
 esac
+default_mode=${APTX_ADAPTIVE_DEFAULT_MODE:-hq}
+case $default_mode in
+hq | ll) ;;
+*)
+	echo "error: APTX_ADAPTIVE_DEFAULT_MODE=$default_mode is not hq or ll" >&2
+	exit 2
+	;;
+esac
 
 # SPA_PLUGIN_DIR replaces the built-in search path, so the system dir must be right.
 if ! system_plugin_dir=$(pkg-config --variable=plugindir libspa-0.2) || [[ -z $system_plugin_dir ]]; then
@@ -107,6 +119,7 @@ echo "installed $dest"
 dropin_body="[Service]
 Environment=\"SPA_PLUGIN_DIR=$user_plugin_dir:$system_plugin_dir\"
 Environment=\"APTX_ADAPTIVE_SLOT=$slot\"
+Environment=\"APTX_ADAPTIVE_DEFAULT_MODE=$default_mode\"
 "
 for unit in "${units[@]}"; do
 	dropin=$config_home/systemd/user/$unit.d/aptx-adaptive.conf
@@ -128,20 +141,33 @@ daemon_reload
 
 echo "restart to load it: systemctl --user restart wireplumber pipewire"
 echo
+# PipeWire names the best-ranked codec's profile plain a2dp-sink: in the ldac slot, the
+# default mode's entry.
+hq_profile=a2dp-sink-aptx_adaptive
+ll_profile=a2dp-sink-aptx_adaptive_ll
+if [[ $slot == ldac && $default_mode == hq ]]; then
+	hq_profile=a2dp-sink
+elif [[ $slot == ldac ]]; then
+	ll_profile=a2dp-sink
+fi
 if [[ $slot == ldac ]]; then
 	cat <<'EOF'
 Codec slot: ldac. PipeWire ranks aptX Adaptive above aptX HD, aptX and AAC, so BlueZ
-configures it directly on connect when the headset has it. It's then the plain a2dp-sink
-profile, and aptX HD becomes a2dp-sink-aptx_hd.
+configures it directly on connect when the headset has it, and aptX HD becomes
+a2dp-sink-aptx_hd.
 To go back: APTX_ADAPTIVE_SLOT=lc3plus_hr scripts/install-plugin.sh, then restart.
 EOF
 else
 	cat <<'EOF'
 Codec slot: lc3plus_hr. PipeWire ranks aptX Adaptive below aptX HD, aptX and AAC, so aptX
-HD is configured on connect. Pick the a2dp-sink-aptx_adaptive profile by hand (pavucontrol,
-or pactl set-card-profile); each switch makes the headset chime.
+HD is configured on connect. Pick an aptX Adaptive profile by hand (KDE, pavucontrol, or
+pactl set-card-profile); each switch makes the headset chime.
 EOF
 fi
-echo 'Low latency is the a2dp-sink-aptx_adaptive_ll profile (KDE, pavucontrol, pactl).'
-echo 'If monitor.bluez.properties sets bluez5.codecs, it must include "aptx_adaptive", and'
-echo '"aptx_adaptive_ll" for the low-latency profile.'
+cat <<EOF
+Default mode: $default_mode (APTX_ADAPTIVE_DEFAULT_MODE=hq|ll). Profiles:
+  $hq_profile   aptX Adaptive (HQ)
+  $ll_profile   aptX Adaptive (Low Latency)
+If monitor.bluez.properties sets bluez5.codecs, it must include "aptx_adaptive" and
+"aptx_adaptive_ll".
+EOF

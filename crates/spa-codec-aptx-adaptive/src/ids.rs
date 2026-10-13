@@ -6,7 +6,7 @@ pub const INTERFACE_TYPE: &CStr = c"Spa:Pointer:Interface:Bluez5:Codec:Media:Pri
 pub const FACTORY_NAME: &CStr = c"api.codec.bluez5.media.lc3plus";
 pub const CODEC_NAME: &CStr = c"aptx_adaptive";
 pub const CODEC_DESCRIPTION: &CStr = c"aptX Adaptive";
-/// The low-latency entry: an alias on the same endpoint, so it gets its own card profile
+/// The low-latency entry, on the same endpoint, so it gets its own card profile
 /// (`docs/adr/0003-ll-profile.md`).
 pub const LL_NAME: &CStr = c"aptx_adaptive_ll";
 pub const LL_DESCRIPTION: &CStr = c"aptX Adaptive (Low Latency)";

@@ -26,7 +26,7 @@ The plugin is installed as PipeWire's LC3plus HR plugin, so it replaces a real L
 
 ## codec selection
 
-By default the plugin borrows PipeWire's LDAC codec id, which ranks above aptX HD, aptX and AAC. A headset with aptX Adaptive gets it as soon as it connects, as the plain `a2dp-sink` profile; aptX HD is still there as `a2dp-sink-aptx_hd`. There's no `a2dp-sink-aptx_adaptive` profile in this slot, so if WirePlumber saved that one earlier it falls back to `a2dp-sink`. See [ADR 0002](docs/adr/0002-codec-autoselect.md).
+By default the plugin borrows PipeWire's LDAC codec id, which ranks above aptX HD, aptX and AAC. A headset with aptX Adaptive gets it as soon as it connects, as the plain `a2dp-sink` profile (HQ, or low latency, see below); aptX HD is still there as `a2dp-sink-aptx_hd`. There's no `a2dp-sink-aptx_adaptive` profile in this slot, so if WirePlumber saved that one earlier it falls back to `a2dp-sink`. See [ADR 0002](docs/adr/0002-codec-autoselect.md).
 
 **If your headset also supports LDAC**, the two share that id, and which one you get can change between restarts. Install in the LC3plus HR slot instead:
 
@@ -46,18 +46,35 @@ If your WirePlumber config sets `bluez5.codecs`, add `"aptx_adaptive"` and `"apt
 
 ## HQ or low latency
 
-The default is HQ. Low latency is a separate card profile, so you can pick it anywhere profiles are listed:
-
-| profile (`pactl list cards`) | shown as |
-|---|---|
-| `a2dp-sink` (`a2dp-sink-aptx_adaptive` in the `lc3plus_hr` slot) | High Fidelity Playback (A2DP Sink, codec aptX Adaptive) |
-| `a2dp-sink-aptx_adaptive_ll` | High Fidelity Playback (A2DP Sink, codec aptX Adaptive (Low Latency)) |
+HQ and low latency are two card profiles, so you can pick either anywhere profiles are listed:
 
 - **KDE:** System Settings → Sound, the "Profile:" box under the headset; or the tray's volume applet, right-click the headset → Profiles.
-- **pavucontrol:** Configuration tab, the headset's Profile list. The Codec list next to it shows "aptX Adaptive (Low Latency)" too.
-- **command line:** `pactl set-card-profile <card> a2dp-sink-aptx_adaptive_ll`
+- **pavucontrol:** Configuration tab, the headset's Profile list. The Codec list next to it shows both too.
+- **command line:** `pactl set-card-profile <card> <profile>`
 
-WirePlumber remembers the profile per headset. Switching profile reconfigures the Bluetooth stream, so there's a gap of a second or two, and the Px7 S2e plays its chime. On connect the headset always starts in the main profile, so a saved low-latency profile costs one extra switch (and chime) each time. To start in low latency without that, use the `bluez5.a2dp.aptx-adaptive.mode` setting below instead. `pw-dump` shows the low-latency profile's codec id as `mpeg`; that's only a borrowed id, see [ADR 0003](docs/adr/0003-ll-profile.md).
+Which one a headset gets **on connect** is set at install time:
+
+```sh
+APTX_ADAPTIVE_DEFAULT_MODE=ll mise run install-plugin   # low latency on connect
+APTX_ADAPTIVE_DEFAULT_MODE=hq mise run install-plugin   # HQ on connect (the default)
+systemctl --user restart wireplumber pipewire
+```
+
+The profile names depend on that choice, because PipeWire calls the connect-time profile plain `a2dp-sink`:
+
+| | HQ, shown as "…codec aptX Adaptive)" | low latency, shown as "…codec aptX Adaptive (Low Latency))" |
+|---|---|---|
+| default mode `hq` | `a2dp-sink` | `a2dp-sink-aptx_adaptive_ll` |
+| default mode `ll` | `a2dp-sink-aptx_adaptive` | `a2dp-sink` |
+| `lc3plus_hr` slot, either mode | `a2dp-sink-aptx_adaptive` | `a2dp-sink-aptx_adaptive_ll` |
+
+The full labels are "High Fidelity Playback (A2DP Sink, codec aptX Adaptive)" and "High Fidelity Playback (A2DP Sink, codec aptX Adaptive (Low Latency))".
+
+With the default mode's profile there's a single Bluetooth setup on connect, and the label matches what's running. In the `lc3plus_hr` slot, aptX HD is set up on connect whatever the mode (see above).
+
+WirePlumber remembers the profile you pick per headset and restores it on the next connect. Switching profile reconfigures the Bluetooth stream: there's a gap of a second or two, and the Px7 S2e plays its chime. So if you usually want the other mode, change the default mode instead of switching every time. `pw-dump` shows the non-default profile's codec id as `mpeg`; that's only a borrowed id, see [ADR 0003](docs/adr/0003-ll-profile.md).
+
+The default mode is a systemd drop-in environment variable, not a WirePlumber setting. PipeWire binds a fresh connection to whichever codec entry owns the Bluetooth endpoint. That's fixed when the plugin loads, and nothing in the WirePlumber or PipeWire config reaches it (details in ADR 0003).
 
 To switch without the reconfigure, set the codec's `quality` property on the Bluetooth output node (0 = HQ, 1 = low latency), the same way LDAC's quality is set. This works in either profile:
 
@@ -71,7 +88,7 @@ pw-cli enum-params "$id" Props                    # what's actually running
 
 You can also find the `bluez_output.…` node id with `wpctl status`. The audio fades out, goes silent for just under a second, and fades back in. The headset's latency mode changes during the silence.
 
-**A `quality` change doesn't survive a reconnect.** To start the main profile in low latency every time, add a WirePlumber drop-in, e.g. `~/.config/wireplumber/wireplumber.conf.d/aptx-adaptive.conf`, then run `systemctl --user restart wireplumber`:
+**A `quality` change doesn't survive a reconnect.** The older way to start in low latency, a WirePlumber setting, still works with default mode `hq`, but the profile is still labelled plain "aptX Adaptive" while it runs low latency. Prefer `APTX_ADAPTIVE_DEFAULT_MODE=ll`. With default mode `ll`, or in the non-default profile, the setting is ignored. For reference, the drop-in goes in e.g. `~/.config/wireplumber/wireplumber.conf.d/aptx-adaptive.conf`, then run `systemctl --user restart wireplumber`:
 
 ```
 monitor.bluez.rules = [

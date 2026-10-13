@@ -62,12 +62,15 @@ fn plugin_path() -> &'static PathBuf {
     })
 }
 
+/// The two entries, in the plugin's order: the one that owns the endpoint first, then the
+/// alias. Tests other than the env ones run with `APTX_ADAPTIVE_DEFAULT_MODE` unset, so `codec`
+/// is the HQ owner and `ll` the LL alias.
 struct Loaded {
     _lib: libloading::Library,
     _handle: Vec<u64>,
-    /// The main entry: HQ unless the device setting says LL.
+    /// Owns the endpoint (`fill_caps`, the slot's id): what a fresh connection binds.
     codec: &'static media_codec,
-    /// The low-latency alias on the same endpoint.
+    /// The alias on the same endpoint.
     ll: &'static media_codec,
 }
 
@@ -184,51 +187,30 @@ fn init_with_props(
     }
 }
 
+/// Checks both entries against `APTX_ADAPTIVE_SLOT` and `APTX_ADAPTIVE_DEFAULT_MODE`. The
+/// default mode's entry owns the endpoint; the other is the alias.
 #[test]
 fn codec_metadata() {
     let l = load();
-    let c = l.codec;
+    let owner = l.codec;
     let want = match std::env::var("APTX_ADAPTIVE_SLOT").as_deref() {
         Ok("lc3plus_hr") => SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR,
         // Unset, and anything unknown, falls back to the LDAC slot.
         _ => SPA_BLUETOOTH_AUDIO_CODEC_LDAC,
     };
-    assert_eq!(c.id, want);
-    assert_eq!(c.kind, MEDIA_CODEC_A2DP);
-    assert_eq!(c.codec_id, A2DP_CODEC_VENDOR);
-    let (vid, cid) = (c.vendor.vendor_id, c.vendor.codec_id);
-    assert_eq!((vid, cid), (ids::VENDOR_ID, ids::CODEC_ID));
+    assert_eq!(owner.id, want);
+    assert!(owner.fill_caps.is_some());
+    let ll_default = std::env::var("APTX_ADAPTIVE_DEFAULT_MODE").as_deref() == Ok("ll");
+    let (hq, ll) = if ll_default {
+        (l.ll, l.codec)
+    } else {
+        (l.codec, l.ll)
+    };
     // SAFETY: static strings.
     unsafe {
-        assert_eq!(CStr::from_ptr(c.name), ids::CODEC_NAME);
-        assert_eq!(CStr::from_ptr(c.description), ids::CODEC_DESCRIPTION);
-        assert_eq!(CStr::from_ptr(c.endpoint_name), ids::CODEC_NAME);
-    }
-    assert!(c.fill_caps.is_some());
-    assert!(c.encode.is_some() && c.decode.is_none());
-    // A bigger socket buffer than media-sink's 4 × MTU default, so a start-up stall doesn't drop packets.
-    assert_eq!(c.send_buf_size, ids::SEND_BUF_SIZE);
-    assert!(c.abr_process.is_some());
-    // The LL alias is the same in every slot.
-    check_ll_entry(l.ll, c);
-    if std::env::var_os(SLOT_CHILD_VAR).is_some() {
-        std::process::exit(SLOT_CHILD_OK);
-    }
-}
-
-/// The low-latency entry is a shared-endpoint alias of `main`, like PipeWire's `sbc_xq`:
-/// - its own id (MPEG), so `bluez5-device.c` lists a separate profile for it;
-/// - no `fill_caps`, so `codec-loader.c` keeps it next to `main` and `bluez5-dbus.c` registers
-///   no second endpoint;
-/// - `main`'s endpoint name, so a `SetConfiguration` on that endpoint can bind to it.
-///
-/// Everything else matches `main`.
-fn check_ll_entry(ll: &media_codec, main: &media_codec) {
-    assert_eq!(ll.id, SPA_BLUETOOTH_AUDIO_CODEC_MPEG);
-    assert_ne!(ll.id, main.id);
-    assert!(ll.fill_caps.is_none());
-    // SAFETY: static strings.
-    unsafe {
+        assert_eq!(CStr::from_ptr(hq.name), ids::CODEC_NAME);
+        assert_eq!(CStr::from_ptr(hq.name), c"aptx_adaptive");
+        assert_eq!(CStr::from_ptr(hq.description), ids::CODEC_DESCRIPTION);
         assert_eq!(CStr::from_ptr(ll.name), ids::LL_NAME);
         assert_eq!(CStr::from_ptr(ll.name), c"aptx_adaptive_ll");
         assert_eq!(CStr::from_ptr(ll.description), ids::LL_DESCRIPTION);
@@ -236,19 +218,52 @@ fn check_ll_entry(ll: &media_codec, main: &media_codec) {
             CStr::from_ptr(ll.description),
             c"aptX Adaptive (Low Latency)"
         );
-        assert_eq!(CStr::from_ptr(ll.endpoint_name), ids::CODEC_NAME);
     }
-    assert_eq!((ll.kind, ll.codec_id), (main.kind, main.codec_id));
-    let (vid, cid) = (ll.vendor.vendor_id, ll.vendor.codec_id);
-    assert_eq!((vid, cid), (ids::VENDOR_ID, ids::CODEC_ID));
-    assert_eq!(ll.send_buf_size, main.send_buf_size);
-    assert!(ll.duplex_codec.is_null() && !ll.stream_pkt);
-    // Same callbacks as the main entry.
+    for c in [owner, l.ll] {
+        assert_eq!(c.kind, MEDIA_CODEC_A2DP);
+        assert_eq!(c.codec_id, A2DP_CODEC_VENDOR);
+        let (vid, cid) = (c.vendor.vendor_id, c.vendor.codec_id);
+        assert_eq!((vid, cid), (ids::VENDOR_ID, ids::CODEC_ID));
+        // SAFETY: static string.
+        assert_eq!(unsafe { CStr::from_ptr(c.endpoint_name) }, ids::CODEC_NAME);
+        assert!(c.encode.is_some() && c.decode.is_none());
+        // A bigger socket buffer than media-sink's 4 × MTU default, so a start-up stall doesn't
+        // drop packets.
+        assert_eq!(c.send_buf_size, ids::SEND_BUF_SIZE);
+        assert!(c.abr_process.is_some());
+    }
+    check_alias(l.ll, owner);
+    if std::env::var_os(SLOT_CHILD_VAR).is_some() {
+        std::process::exit(SLOT_CHILD_OK);
+    }
+}
+
+/// The second entry is a shared-endpoint alias of the owner, like PipeWire's `sbc_xq`:
+/// - its own id (MPEG), so `bluez5-device.c` lists a separate profile for it;
+/// - no `fill_caps`, so `codec-loader.c` keeps it next to the owner, `bluez5-dbus.c` registers
+///   no second endpoint, and a connection with no preferred codec never binds it;
+/// - the owner's endpoint name, so a `SetConfiguration` on that endpoint can bind to it.
+///
+/// Every callback is the owner's.
+fn check_alias(alias: &media_codec, owner: &media_codec) {
+    assert_eq!(alias.id, SPA_BLUETOOTH_AUDIO_CODEC_MPEG);
+    assert_ne!(alias.id, owner.id);
+    assert!(alias.fill_caps.is_none());
+    // SAFETY: static strings.
+    unsafe {
+        assert_eq!(
+            CStr::from_ptr(alias.endpoint_name),
+            CStr::from_ptr(owner.endpoint_name)
+        );
+    }
+    assert_eq!((alias.kind, alias.codec_id), (owner.kind, owner.codec_id));
+    assert_eq!(alias.send_buf_size, owner.send_buf_size);
+    assert!(alias.duplex_codec.is_null() && !alias.stream_pkt);
     let same = |a: Option<usize>, b: Option<usize>| a.is_some() && a == b;
     macro_rules! same_fn {
         ($($f:ident),*) => {$(
             assert!(
-                same(ll.$f.map(|f| f as usize), main.$f.map(|f| f as usize)),
+                same(alias.$f.map(|f| f as usize), owner.$f.map(|f| f as usize)),
                 stringify!($f)
             );
         )*};
@@ -271,7 +286,7 @@ fn check_ll_entry(ll: &media_codec, main: &media_codec) {
         encode,
         get_delay
     );
-    assert!(ll.decode.is_none());
+    assert!(alias.decode.is_none());
 }
 
 const SLOT_CHILD_VAR: &str = "APTX_ADAPTIVE_TEST_SLOT_CHILD";
@@ -279,24 +294,96 @@ const SLOT_CHILD_VAR: &str = "APTX_ADAPTIVE_TEST_SLOT_CHILD";
 /// exits 0, so it can't pass by accident.
 const SLOT_CHILD_OK: i32 = 42;
 
-/// Re-runs `codec_metadata` in a child with each `APTX_ADAPTIVE_SLOT`, since the slot is read
-/// from the environment at factory init and tests can't safely set it in-process.
-#[test]
-fn slot_follows_env() {
-    for slot in ["ldac", "lc3plus_hr", "bogus"] {
-        let out = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "codec_metadata", "--test-threads=1"])
-            .env("APTX_ADAPTIVE_SLOT", slot)
-            .env(SLOT_CHILD_VAR, "1")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.code() == Some(SLOT_CHILD_OK),
-            "slot {slot}: {}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+/// Runs test `name` in a child with `env` and expects it to pass. The slot and default mode
+/// are read from the environment at factory init, and tests can't safely set them in-process.
+fn run_child(name: &str, env: &[(&str, &str)]) {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", name, "--test-threads=1"])
+        .env_remove("APTX_ADAPTIVE_SLOT")
+        .env_remove("APTX_ADAPTIVE_DEFAULT_MODE")
+        .env(SLOT_CHILD_VAR, "1");
+    for (k, v) in env {
+        cmd.env(k, v);
     }
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.code() == Some(SLOT_CHILD_OK),
+        "{name} {env:?}: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn slot_and_default_mode_follow_env() {
+    for slot in ["ldac", "lc3plus_hr", "bogus"] {
+        for mode in ["hq", "ll", "bogus"] {
+            run_child(
+                "codec_metadata",
+                &[
+                    ("APTX_ADAPTIVE_SLOT", slot),
+                    ("APTX_ADAPTIVE_DEFAULT_MODE", mode),
+                ],
+            );
+        }
+    }
+}
+
+/// With `APTX_ADAPTIVE_DEFAULT_MODE=ll` the LL entry owns the endpoint, so a fresh connection
+/// binds it: it starts in LL with no props and, unlike the HQ owner, ignores
+/// `bluez5.a2dp.aptx-adaptive.mode = hq`. The HQ alias starts in HQ, even with `mode = ll`.
+/// The `quality` prop still switches either.
+#[test]
+fn ll_default_streams() {
+    if std::env::var_os(SLOT_CHILD_VAR).is_none() {
+        run_child(
+            "ll_default_streams",
+            &[("APTX_ADAPTIVE_DEFAULT_MODE", "ll")],
+        );
+        return;
+    }
+    let l = load();
+    let (ll, hq) = (l.codec, l.ll);
+    // SAFETY: static strings.
+    unsafe {
+        assert_eq!(CStr::from_ptr(ll.name), c"aptx_adaptive_ll");
+        assert_eq!(CStr::from_ptr(hq.name), c"aptx_adaptive");
+    }
+    assert!(ll.fill_caps.is_some() && hq.fill_caps.is_none());
+    for (c, mode, quality) in [(ll, c"hq", 1), (hq, c"ll", 0)] {
+        let props = init_props(c, Some(mode));
+        assert_eq!(
+            enum_props(c, props, SPA_PARAM_PROPS, 0).1,
+            quality_props(quality).to_vec()
+        );
+        // SAFETY: props from init_props.
+        unsafe { c.clear_props.unwrap()(props) };
+    }
+    for (c, interval) in [(ll, 10_000_000), (hq, 14_000_000)] {
+        let mut config = PX7_S2E_CONFIG;
+        let info = validated_info(c, &config);
+        let data = init(c, &mut config, &info);
+        assert!(!data.is_null());
+        // SAFETY: data from init.
+        unsafe {
+            assert_eq!(c.get_interval.unwrap()(data), interval);
+            c.deinit.unwrap()(data);
+        }
+    }
+    // The LL owner switches live to HQ and resets back to LL.
+    let props = init_props(ll, None);
+    // SAFETY: props from init_props.
+    unsafe {
+        let hq_q = quality_props(0);
+        assert_eq!(ll.set_props.unwrap()(props, hq_q.as_ptr().cast()), 1);
+        assert_eq!(ll.set_props.unwrap()(props, ptr::null()), 1);
+        assert_eq!(
+            enum_props(ll, props, SPA_PARAM_PROPS, 0).1,
+            quality_props(1).to_vec()
+        );
+        ll.clear_props.unwrap()(props);
+    }
+    std::process::exit(SLOT_CHILD_OK);
 }
 
 #[test]
