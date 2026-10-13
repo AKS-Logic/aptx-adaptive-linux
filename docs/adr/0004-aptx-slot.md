@@ -56,8 +56,14 @@ On the first `factory_init`:
 
 1. **Find it.** Look in each directory of `SPA_PLUGIN_DIR`, colon-separated as PipeWire splits it, for `bluez5/libspa-codec-bluez5-aptx.so`. If the variable is unset, look in PipeWire's own default dir, which `build.rs` takes from `pkg-config --variable=plugindir libspa-0.2` (`/usr/lib/spa-0.2` if pkg-config fails). Our own file is skipped by device and inode, found with `dladdr` on `spa_handle_factory_enum`.
 2. **Load it.** `dlopen(RTLD_NOW | RTLD_LOCAL)`, find factory `api.codec.bluez5.media.aptx`, and init a handle with the same `info` and `support` array we were given. The real `impl_init` ignores them (`media-codecs.c` L190-214).
-3. **Check it.** The `Bluez5CodecMedia` interface version must be 16. `aptx_hd` and `aptx` must be present with the expected ids, vendor/codec ids and callbacks, which catches a layout change. A factory whose description is ours, i.e. another copy of this plugin, is refused rather than nested.
-4. **Keep it.** The library and the handle stay loaded for the life of the process; nothing calls `dlclose` or `clear` on success.
+3. **Check it.** The `Bluez5CodecMedia` interface version must be 16. PipeWire bumps it whenever `struct media_codec` changes (comment at `media-codecs.h` L23-30), so the version is what guarantees the layout we copy. The content checks catch a plugin that has the version but not the contents we expect:
+   - every entry has a name, is A2DP, has the vendor codec type, and has `select_config`, `enum_config`, `init` and `deinit`;
+   - `aptx_hd` and `aptx` are present, with their ids and vendor/codec ids, `fill_caps` and `encode`.
+
+   A factory whose description is ours, i.e. another copy of this plugin, is refused rather than nested.
+4. **Keep it.** On success nothing calls `dlclose` or `clear`, because the copies point into the real library. The real library stays loaded for the life of the process. The real plugin's handle (64 bytes in 1.6.9; anything outside `size_of::<spa_handle>()..=4096` is refused) is leaked on purpose. `codec-loader.c` only unloads our `.so` when the bluez5 monitor is torn down (`free_media_codecs`, L233-242). If it's loaded again in the same process, its statics start fresh and it loads the real plugin again. So each reload of our `.so` leaks one small handle and adds one `dlopen` reference to the real library. On failure the handle is freed and the library closed.
+
+`dlopen`, `dlsym` and `dladdr` come from libc on glibc ≥ 2.34. The plugin also links `libdl` (`#[link(name = "dl")]`), which is an empty stub there and the real thing on older glibc, so both work.
 
 If any step fails, the plugin logs `aptx-adaptive: aptX/aptX HD unavailable: <reason>` at load and exports only its own two entries. On success it logs `aptx-adaptive: aptX passthrough: 6 codecs from <path>`.
 
@@ -75,12 +81,53 @@ The real plugin doesn't log and has no `set_log` (1.6.9), so nothing is lost by 
 - **Latency fallback.** With no delay report, `transport_get_delay` (`bluez5-dbus.c` L3697-3706) uses 125 ms for `APTX_HD` and `APTX`, the same as for LDAC, MPEG and LC3plus HR. Nothing changes from the other slots.
 - **Type names.** `spa_type_bluetooth_audio_codec` names id 7 `aptx_hd` and id 6 `aptx` (`type-info.h` L29-30). So `pw-dump`'s device Props print `aptx_hd` for the owner's profile and `aptx` for the alias's. `api.bluez5.codec`, profile names and descriptions use our own name and description (`aptx_adaptive`, "aptX Adaptive"). The same cosmetic issue as `ldac` / `mpeg` in ADRs 0002 and 0003.
 - **Without the real plugin** (not installed, or a PipeWire with another codec ABI), aptX and aptX HD disappear for every headset while ours is installed, and the error says so. `install-plugin.sh` warns at install time if the system plugin dir has no aptX plugin.
+- **Headset-initiated aptX HD is a regression** against the `ldac` slot, mitigated by a WirePlumber guard script that the installer adds for this slot. See "risks found in the source" below.
 - **PipeWire upgrades.** A new PipeWire with codec ABI 16 and another set of aptX entries is passed through as is. A new ABI version makes the real plugin unavailable (logged) until this plugin is rebuilt. Our own entries would be rejected by the codec loader then anyway.
 
 ## risks found in the source
 
-- **A transport on the real aptX HD shows up as the aptX Adaptive profile.** The device's current profile comes from the transport's id (`this->props.codec = t->media_codec->id`, `bluez5-device.c` L1279). Suppose an Adaptive headset's stream ends up on the real `aptx_hd`. That could happen if the headset initiates the configuration and picks the aptX HD endpoint, or if `aptx_adaptive` is left out of `bluez5.codecs`. The card then shows the aptX Adaptive (owner) profile while aptX HD runs, and `set_profile` sees the same id and doesn't switch (L1442-1447). The node's `api.bluez5.codec` still says `aptx_hd`. Host-initiated connects, the case in ADR 0002's btmon captures, take our endpoint first (it's registered first), so they're unaffected. Picking the profile again doesn't help. Disconnecting and reconnecting from the host does.
+### regression: headset-initiated configuration on the real aptX HD
+
+The device's current profile comes from the running transport's **id** (`this->props.codec = t->media_codec->id`, `bluez5-device.c` L1279). Suppose an aptX Adaptive headset configures the real `aptx_hd` endpoint itself, with BlueZ only passing the headset's SetConfiguration on to PipeWire.
+
+- The transport's id is 7. On that headset id 7 is our aptX Adaptive owner profile, so the card shows "aptX Adaptive" while aptX HD runs. The sink node's `api.bluez5.codec` still says `aptx_hd`.
+- WirePlumber then restores the saved profile, `a2dp-sink`, which is the same id. `set_profile` returns early when profile and id match (L1442-1447), so nothing reconfigures and the stream stays on aptX HD for the whole connection.
+
+**In the `ldac` slot this recovered.** Our id was 8 there, and a headset-initiated aptX HD transport showed up as the real `a2dp-sink-aptx_hd` profile. WirePlumber's restore of the saved `a2dp-sink` (id 8) differed by id, so it reconfigured to aptX Adaptive at the cost of one chime. That's a regression of the `aptx` slot.
+
+How likely it is:
+- The Px7 S2e never initiated in our captures; the host always did. Host-initiated connects take our endpoint first, because it's registered first (ADR 0002), so they're unaffected.
+- A OnePlus phone captured as an A2DP source did have its sink pick aptX HD remotely, so some headsets will initiate.
+- The same state can come from a `bluez5.codecs` list that leaves out `aptx_adaptive` but keeps `aptx_hd`. In that case the guard doesn't fire, since our profile isn't offered at all.
+
+Manual recovery: pick the other aptX Adaptive profile and then the wanted one back. Each step differs by id from the previous one, so each reconfigures, and the second lands on our entry. Picking the same profile again does nothing, and disconnecting and reconnecting from the host also works.
+
+**Mitigation: a WirePlumber guard** (`wireplumber/aptx-adaptive-guard.lua`, installed for slot `aptx` only). It does the same thing automatically, once per connection:
+
+- **Triggers:** a bluez5 `Audio/Sink` node with `api.bluez5.codec` = `aptx_hd` or `aptx` appears, or the device's `EnumProfile`/`Profile` params change. After 1.5 s, so WirePlumber's own profile restore has run, the guard checks the state.
+- **Condition:** the current profile is A2DP (`index >> 16 == 2`, `get_index_from_profile`, `bluez5-device.c` L1883-1900), its codec id (`index & 0xffff`) matches the running real codec (7 for `aptx_hd`, 6 for `aptx`), and its description contains "aptX Adaptive" (our entry's description, put there by `build_profile`, L2104). A headset without aptX Adaptive never has our entries among its profiles (`get_supported_media_codec` only takes supported entries, L227-257), so its aptX HD profile reads "aptX HD" and is never touched.
+- **Action:**
+  1. Set `Profile` to index 0 (`off`). That releases the transports (L1449-1451).
+  2. Set `Profile` back to the same index, with `save = false`.
+  - The second set differs from `off`, so `set_profile` runs `spa_bt_device_ensure_media_codec` with every supported entry of that id in order (`get_media_codecs`, L207-225; `bluez5-dbus.c` L5092-5117). The first one is ours, so it reconfigures to aptX Adaptive.
+  - It logs `… runs aptx_hd under profile 'a2dp-sink' (…aptX Adaptive); re-selecting it via 'off' to switch to aptX Adaptive` at info level, topic `s-aptx-adaptive`.
+- **Rate limit:** one attempt per device per connection, keyed by the device's bound id and cleared on `device-removed`, so it can't loop even if the switch fails.
+
+Why "off" and not the alternatives:
+- **Device `Props` `bluetoothAudioCodec`:** it's keyed by id. `impl_set_param` looks up the id among the supported codecs and calls `set_profile(this, this->profile, codec_id, true)` (L3243-3250). With the same id that's the early return, so it's a no-op.
+- **The other aptX Adaptive profile and back:** this works, but it's two codec reconfigures (two SetConfigurations, probably two chimes). The intermediate one starts a stream in the other mode.
+- **Via `off`:** a transport release plus one SetConfiguration. It's the cheapest path through `set_profile` that ends in a codec switch.
+
+Live test pending: no headset that initiates the configuration has been tried with the guard. Offline, `wireplumber/test-guard.lua` drives the hook with stubbed WirePlumber objects (run by `cargo test`), and the script loads and registers its hooks in WirePlumber 0.5.18.
+
+### other
+
 - **`bluez5.codecs`.** A list that names `aptx_hd` but not `aptx_adaptive` disables our entries by name, and the real aptX HD then gets its profile back on Adaptive headsets too. That's fine. A list with `aptx_adaptive` but without `aptx_hd` / `aptx` removes those codecs for non-Adaptive headsets, as it would with the stock plugin.
+- **Stale LC3plus file (minor).** Say a previous `ldac` or `lc3plus_hr` install leaves `libspa-codec-bluez5-lc3plus.so` next to the new aptX file. PipeWire loads both, the aptX file first (`codec-loader.c` L184, L188).
+  - The LC3plus copy sees `APTX_ADAPTIVE_SLOT=aptx` from the drop-in, logs that it doesn't fit, and runs the `ldac` slot. That adds a second `aptx_adaptive` owner and an MPEG alias.
+  - The loader drops the second owner as a duplicate endpoint, since both have `fill_caps` (L139-148). It keeps the alias, which has none.
+  - That orphan is an extra aptX Adaptive profile under id 3 (MPEG). Picking it switches to our endpoint with the alias's mode, so it works, but it has the same name and label as the real alias profile (e.g. two `a2dp-sink-aptx_adaptive_ll`).
+  - `install-plugin.sh` prevents this by removing the other file on every install.
 
 ## alternatives
 

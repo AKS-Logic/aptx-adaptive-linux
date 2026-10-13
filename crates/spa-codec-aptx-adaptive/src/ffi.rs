@@ -359,6 +359,8 @@ pub struct DlInfo {
     pub saddr: *mut c_void,
 }
 
+// glibc ≥ 2.34 has these in libc and keeps libdl as an empty stub; older glibc needs libdl.
+#[link(name = "dl")]
 unsafe extern "C" {
     pub fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
     pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;

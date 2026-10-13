@@ -27,6 +27,8 @@ use crate::ids;
 
 /// The real plugin exports 6 entries in PipeWire 1.6.9.
 pub const MAX_REAL: usize = 16;
+/// The real handle is a `spa_handle` plus a `spa_bluez5_codec_a2dp` (64 bytes in 1.6.9).
+const MAX_HANDLE_SIZE: usize = 4096;
 pub const REAL_LIB: &str = "bluez5/libspa-codec-bluez5-aptx.so";
 /// PipeWire's compiled-in plugin dir, used when `SPA_PLUGIN_DIR` is unset (as PipeWire does).
 pub const SYSTEM_PLUGIN_DIR: &str = env!("APTX_ADAPTIVE_SYSTEM_PLUGINDIR");
@@ -244,8 +246,11 @@ unsafe fn probe(
         let (Some(get_size), Some(init)) = (f.get_size, f.init) else {
             return Err("factory without get_size/init".into());
         };
-        let size = get_size(f, info).max(size_of::<spa_handle>());
-        let mem: &'static mut [u64] = Box::leak(vec![0u64; size.div_ceil(8)].into_boxed_slice());
+        let size = get_size(f, info);
+        if !(size_of::<spa_handle>()..=MAX_HANDLE_SIZE).contains(&size) {
+            return Err(format!("unexpected handle size {size}"));
+        }
+        let mut mem = vec![0u64; size.div_ceil(8)].into_boxed_slice();
         let h = mem.as_mut_ptr().cast::<spa_handle>();
         let res = init(f, h, info, support, n_support);
         if res < 0 {
@@ -286,6 +291,9 @@ unsafe fn probe(
             clear();
             return Err(e);
         }
+        // The copies point into the handle's library, so the handle (a few dozen bytes) and
+        // our dlopen reference live as long as the process.
+        Box::leak(mem);
         Ok(codecs)
     }
 }
@@ -298,8 +306,12 @@ unsafe fn is_ours(info: *const spa_dict) -> bool {
     desc == ids::FACTORY_DESCRIPTION.to_str().ok()
 }
 
-/// Checks that the list looks like PipeWire 1.6's aptX plugin with our struct layout: the
-/// `aptx_hd` and `aptx` entries have the ids, vendor ids and callbacks where we expect them.
+/// Checks that the list looks like PipeWire 1.6's aptX plugin with our struct layout.
+///
+/// The ABI version check already covers the struct layout; this guards against a plugin that
+/// has the version but not the contents we expect. Every entry needs a name, A2DP kind,
+/// vendor codec type and the callbacks PipeWire calls on any A2DP codec; `aptx_hd` and `aptx`
+/// must also have their ids and vendor ids where we expect them.
 fn validate(codecs: &[*const media_codec]) -> Result<(), String> {
     if codecs.len() > MAX_REAL {
         return Err(format!("more than {MAX_REAL} codecs"));
@@ -317,6 +329,20 @@ fn validate(codecs: &[*const media_codec]) -> Result<(), String> {
         }
         // SAFETY: checked non-null; PipeWire codec names are static C strings.
         let name = unsafe { CStr::from_ptr(c.name) };
+        if c.kind != MEDIA_CODEC_A2DP
+            || c.codec_id != A2DP_CODEC_VENDOR
+            || c.select_config.is_none()
+            || c.enum_config.is_none()
+            || c.init.is_none()
+            || c.deinit.is_none()
+        {
+            return Err(format!(
+                "unexpected codec layout ({} is kind {}, type {:#x})",
+                name.to_string_lossy(),
+                c.kind,
+                c.codec_id
+            ));
+        }
         let want = match name.to_bytes() {
             b"aptx_hd" => Some((0, SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD, 0xD7, 0x24)),
             b"aptx" => Some((1, SPA_BLUETOOTH_AUDIO_CODEC_APTX, 0x4F, 0x01)),
@@ -324,12 +350,8 @@ fn validate(codecs: &[*const media_codec]) -> Result<(), String> {
         };
         if let Some((slot, id, vendor, codec)) = want {
             if c.id != id
-                || c.kind != MEDIA_CODEC_A2DP
-                || c.codec_id != A2DP_CODEC_VENDOR
                 || (v, cid) != (vendor, codec)
                 || c.fill_caps.is_none()
-                || c.select_config.is_none()
-                || c.init.is_none()
                 || c.encode.is_none()
             {
                 return Err(format!(
@@ -380,5 +402,24 @@ mod tests {
         assert!(validate(&[&raw const hd]).unwrap_err().contains("layout"));
         hd.id = SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD;
         assert_eq!(validate(&[&raw const hd]), Err("no aptx codec".into()));
+        let mut aptx = crate::codec_for_test();
+        aptx.name = c"aptx".as_ptr();
+        aptx.vendor.vendor_id = 0x4F;
+        aptx.vendor.codec_id = 0x01;
+        aptx.id = SPA_BLUETOOTH_AUDIO_CODEC_APTX;
+        assert_eq!(validate(&[&raw const hd, &raw const aptx]), Ok(()));
+
+        let mut other = crate::codec_for_test();
+        other.name = c"aptx_ll".as_ptr();
+        other.vendor.vendor_id = 0x0A;
+        let check = |o: &media_codec| validate(&[&raw const hd, &raw const aptx, o]);
+        assert_eq!(check(&other), Ok(()));
+        other.kind = 1;
+        assert!(check(&other).unwrap_err().contains("aptx_ll is kind 1"));
+        other.kind = MEDIA_CODEC_A2DP;
+        other.init = None;
+        assert!(check(&other).unwrap_err().contains("layout"));
+        other.name = ptr::null();
+        assert!(check(&other).unwrap_err().contains("without a name"));
     }
 }

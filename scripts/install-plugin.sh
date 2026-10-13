@@ -2,6 +2,9 @@
 # Builds the plugin and installs it for the current user, as PipeWire's aptX plugin file
 # (slot aptx, docs/adr/0004-aptx-slot.md) or its LC3plus HR plugin file (slots ldac and
 # lc3plus_hr, docs/adr/0001-architecture.md). Only one of the two is ever installed.
+# Slot aptx also installs a WirePlumber script (wireplumber/aptx-adaptive-guard.lua) into
+# ${XDG_DATA_HOME:-~/.local/share}/wireplumber/scripts/aptx-linux and a fragment enabling it into
+# ${XDG_CONFIG_HOME:-~/.config}/wireplumber/wireplumber.conf.d; other slots remove them.
 # Safe to re-run. Doesn't restart anything.
 #
 #   scripts/install-plugin.sh               install or update
@@ -34,6 +37,11 @@ aptx_dest=$user_plugin_dir/bluez5/libspa-codec-bluez5-aptx.so
 lc3plus_dest=$user_plugin_dir/bluez5/libspa-codec-bluez5-lc3plus.so
 units=(wireplumber.service pipewire.service)
 dev_dropin=$config_home/systemd/user/wireplumber.service.d/aptx-adaptive-dev-replay.conf
+# WirePlumber 0.5 reads conf.d fragments from the config dir and scripts from the data dir.
+wp_conf_dir=$config_home/wireplumber/wireplumber.conf.d
+wp_script_dir=${XDG_DATA_HOME:-$HOME/.local/share}/wireplumber/scripts/aptx-linux
+guard_conf=$wp_conf_dir/90-aptx-adaptive-guard.conf
+guard_script=$wp_script_dir/aptx-adaptive-guard.lua
 
 daemon_reload() {
 	if command -v systemctl >/dev/null; then
@@ -48,6 +56,17 @@ remove() {
 	fi
 }
 
+remove_guard() {
+	remove "$guard_conf"
+	remove "$guard_script"
+	for dir in "$wp_script_dir" "$wp_conf_dir" "$(dirname "$wp_script_dir")" \
+		"$(dirname "$(dirname "$wp_script_dir")")" "$(dirname "$wp_conf_dir")"; do
+		if [[ -d $dir ]] && rmdir "$dir" 2>/dev/null; then
+			echo "removed empty $dir"
+		fi
+	done
+}
+
 case ${1-} in
 --uninstall)
 	remove "$aptx_dest"
@@ -56,6 +75,7 @@ case ${1-} in
 		remove "$config_home/systemd/user/$unit.d/aptx-adaptive.conf"
 	done
 	remove "$dev_dropin"
+	remove_guard
 	dirs=()
 	for unit in "${units[@]}"; do
 		dirs+=("$config_home/systemd/user/$unit.d")
@@ -130,6 +150,16 @@ install -Dm644 "$target_dir/release/libspa_codec_aptx_adaptive.so" "$dest"
 echo "installed $dest"
 remove "$other_dest"
 
+if [[ $slot == aptx ]]; then
+	# Recovers a headset that configured the real aptX HD under our profile (ADR 0004).
+	install -Dm644 "$repo/wireplumber/aptx-adaptive-guard.lua" "$guard_script"
+	install -Dm644 "$repo/wireplumber/90-aptx-adaptive-guard.conf" "$guard_conf"
+	echo "installed $guard_script"
+	echo "installed $guard_conf"
+else
+	remove_guard
+fi
+
 dropin_body="[Service]
 Environment=\"SPA_PLUGIN_DIR=$user_plugin_dir:$system_plugin_dir\"
 Environment=\"APTX_ADAPTIVE_SLOT=$slot\"
@@ -167,7 +197,8 @@ aptx)
 Codec slot: aptx. The plugin replaces PipeWire's aptX plugin and passes aptX, aptX HD and
 aptX-LL through. On a headset with aptX Adaptive, aptX Adaptive takes the aptX HD and aptX
 profiles; headsets without it keep aptX HD and aptX as before. LDAC is untouched and still
-ranks first, so a headset with both connects on LDAC.
+ranks first, so a headset with both connects on LDAC. A WirePlumber script switches an
+aptX Adaptive headset that set itself up on the real aptX HD over to aptX Adaptive.
 EOF
 	;;
 ldac)

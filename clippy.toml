@@ -1,1 +1,1 @@
-doc-valid-idents = ["PipeWire", "LC3plus", "aptX", "..", ]
+doc-valid-idents = ["PipeWire", "WirePlumber", "LC3plus", "aptX", "..", ]

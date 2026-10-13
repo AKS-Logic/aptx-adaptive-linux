@@ -20,7 +20,7 @@ mise run install-plugin
 systemctl --user restart wireplumber pipewire
 ```
 
-This builds the plugin, installs it to `~/.local/lib/spa-0.2/bluez5/`, and adds systemd user drop-ins so WirePlumber and PipeWire find it. Re-running it is safe.
+This builds the plugin, installs it to `~/.local/lib/spa-0.2/bluez5/`, and adds systemd user drop-ins so WirePlumber and PipeWire find it. In the default slot it also installs a WirePlumber script, `~/.local/share/wireplumber/scripts/aptx-linux/aptx-adaptive-guard.lua`, enabled by `~/.config/wireplumber/wireplumber.conf.d/90-aptx-adaptive-guard.conf` (see below). Re-running it is safe.
 
 By default the plugin is installed as PipeWire's **aptX plugin** (`libspa-codec-bluez5-aptx.so`). It loads the real system aptX plugin and passes aptX, aptX HD and aptX-LL through unchanged, so headsets without aptX Adaptive work exactly as before. The other install slots use the LC3plus HR plugin file instead (see below). Only one file is ever installed; switching slots removes the other.
 
@@ -47,6 +47,13 @@ The install slot (`APTX_ADAPTIVE_SLOT`) decides which PipeWire codec ids aptX Ad
 - On a headset without aptX Adaptive, nothing changes: aptX HD and aptX are the real ones.
 - LDAC is untouched. LDAC ranks above aptX HD, so **a headset with both LDAC and aptX Adaptive connects on LDAC**. Pick aptX Adaptive by hand there (`a2dp-sink-aptx_adaptive`, or `…_ll`).
 - `pw-dump` shows the codec ids as `aptx_hd` (aptX Adaptive's connect profile) and `aptx` (the other mode). These are only borrowed ids. `api.bluez5.codec` and the profile names say `aptx_adaptive`.
+- Some headsets set up the codec themselves and may pick aptX HD. PipeWire then labels the card with the aptX Adaptive profile while aptX HD actually runs. This slot installs a small WirePlumber script that notices this and switches to aptX Adaptive once per connection. You may hear one codec-change chime. Check its log line:
+
+  ```sh
+  journalctl --user -u wireplumber | grep 're-selecting it via'
+  ```
+
+  To fix it by hand, pick the other aptX Adaptive profile, then the one you want. Picking the same profile again does nothing. This hasn't been tested on such a headset yet ([ADR 0004](docs/adr/0004-aptx-slot.md), "risks").
 
 Other slots:
 
@@ -165,7 +172,7 @@ scripts/install-plugin.sh --uninstall
 systemctl --user restart wireplumber pipewire
 ```
 
-This removes the plugin (under either file name) and the drop-ins. It's safe to run twice. Directories the install created (`~/.local/lib/spa-0.2/…`, `${XDG_CONFIG_HOME:-~/.config}/systemd/user/….d`) are removed only if empty, so `~/.local/lib` and `${XDG_CONFIG_HOME:-~/.config}/systemd/user` themselves are left in place.
+This removes the plugin (under either file name), the WirePlumber script and its config fragment, and the drop-ins. It's safe to run twice. Directories the install created (`~/.local/lib/spa-0.2/…`, `${XDG_CONFIG_HOME:-~/.config}/systemd/user/….d`, `…/wireplumber/…`) are removed only if empty, so `~/.local/lib` and `${XDG_CONFIG_HOME:-~/.config}/systemd/user` themselves are left in place.
 
 ## clean room
 
