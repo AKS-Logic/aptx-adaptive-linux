@@ -117,6 +117,20 @@ pub fn min_bitrate(config: Config) -> Result<u32> {
     Ok(alloc::bitrate_range(params(config)?).0)
 }
 
+/// The filterbank delay in sample frames (`a2dp-integration.md` §7I), not counting the packet
+/// wait. `None` for config 4, whose delay isn't measured yet.
+///
+/// # Errors
+/// As for [`Encoder::new`].
+pub fn delay_frames(config: Config) -> Result<Option<u32>> {
+    Ok(match params(config)?.variant {
+        Variant::Cfg0 => Some(90),
+        Variant::Cfg1 => Some(66),
+        Variant::Cfg3 => Some(255),
+        Variant::Cfg4 => None,
+    })
+}
+
 /// The smallest packet for a `period_ms` row whose MTU-fitted bitrate ([`Row::fit`]) the
 /// encoder can run at. Below it the encoder codes faster than the packets carry, so the
 /// unconsumed input grows every period (`codec-core.md` §8.8).
@@ -278,6 +292,25 @@ mod tests {
         }
         let r1_48k = params(STEREO_48K).unwrap();
         assert_eq!(r1_48k.variant, Variant::Cfg0);
+    }
+
+    #[test]
+    fn delays() {
+        let r2 = |profile, sample_rate| Config {
+            profile,
+            sample_rate,
+            level: DecoderLevel::R2,
+            ..STEREO_48K
+        };
+        let ll_r1 = Config {
+            profile: Profile::Ll,
+            ..STEREO_48K
+        };
+        assert_eq!(delay_frames(STEREO_48K), Ok(Some(90)));
+        assert_eq!(delay_frames(ll_r1), Ok(Some(66)));
+        assert_eq!(delay_frames(r2(Profile::Hq, 48_000)), Ok(Some(255)));
+        assert_eq!(delay_frames(r2(Profile::Hq, 96_000)), Ok(Some(255)));
+        assert_eq!(delay_frames(r2(Profile::Ll, 48_000)), Ok(None));
     }
 
     #[test]

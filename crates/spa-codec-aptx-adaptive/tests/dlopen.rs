@@ -347,7 +347,7 @@ fn init_and_encode_a_real_packet() {
         assert_eq!(c.abr_process.unwrap()(data, 0), 0);
         let mut delay = 99;
         c.get_delay.unwrap()(data, &raw mut delay, ptr::null_mut());
-        assert_eq!(delay, 0);
+        assert_eq!(delay, 90);
         c.deinit.unwrap()(data);
     }
 }
