@@ -284,6 +284,8 @@ fn check_alias(alias: &media_codec, owner: &media_codec) {
         abr_process,
         start_encode,
         encode,
+        reduce_bitpool,
+        increase_bitpool,
         get_delay
     );
     assert!(alias.decode.is_none());
@@ -888,4 +890,79 @@ fn init_returns_null_and_sets_errno_on_rejected_stream() {
     let data = init(c, &mut config, &info);
     assert!(data.is_null());
     assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(EINVAL));
+}
+
+/// `reduce_bitpool` / `increase_bitpool` through the C ABI, called between packets as
+/// `media-sink.c` does (after a send, before the next `start_encode`): they return the level
+/// that will run (spec §7L: floor 2, ceiling 4 for R1 HQ), and the RTP timestamp low 16 bits
+/// follow from the next packet: 0x02A0 at level 3, 0x0300 at 2, 0x0240 at 4. The SSRC
+/// doesn't change.
+#[test]
+fn bitpool_callbacks_step_the_level() {
+    let l = load();
+    let c = l.codec;
+    for codec in [l.codec, l.ll] {
+        assert!(codec.reduce_bitpool.is_some() && codec.increase_bitpool.is_some());
+    }
+    let mut config = PX7_S2E_CONFIG;
+    let info = validated_info(c, &config);
+    let data = init(c, &mut config, &info);
+    assert!(!data.is_null());
+    let reduce = c.reduce_bitpool.unwrap();
+    let increase = c.increase_bitpool.unwrap();
+    // SAFETY: data from init, valid until deinit.
+    unsafe {
+        let packet = |seq: u16| {
+            let mut out = [0u8; 1024];
+            let hdr = c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), seq, 0);
+            assert_eq!(hdr, 12);
+            let fields: [u8; 8] = out[4..12].try_into().unwrap();
+            // At most one 16 ms packet of 2 ms blocks.
+            let (written, _) = encode_until_flush(c, data, &mut out[12..], 8);
+            assert_eq!(written, 656);
+            fields
+        };
+        let ts = |low: u16| {
+            let [a, b] = low.to_be_bytes();
+            [0, 0, a, b, 0, 0, 0, 0xa3]
+        };
+        assert_eq!(packet(0), ts(0x02a0));
+        assert_eq!(reduce(data), 2);
+        assert_eq!(packet(1), ts(0x0300));
+        assert_eq!(reduce(data), 2);
+        assert_eq!(packet(2), ts(0x0300));
+        assert_eq!(increase(data), 3);
+        assert_eq!(packet(3), ts(0x02a0));
+        assert_eq!(increase(data), 4);
+        assert_eq!(increase(data), 4);
+        assert_eq!(packet(4), ts(0x0240));
+        assert_eq!(reduce(data), 3);
+        assert_eq!(packet(5), ts(0x02a0));
+        // media-sink keeps the block size it read at start; it divides every level's packet.
+        assert_eq!(c.get_block_size.unwrap()(data), BLOCK_SIZE);
+        c.deinit.unwrap()(data);
+    }
+}
+
+/// In LL on an R1 sink the rows don't vary by level: the callbacks change nothing and
+/// return level 3.
+#[test]
+fn bitpool_callbacks_in_r1_ll_change_nothing() {
+    let l = load();
+    let c = l.codec;
+    let props = init_props(c, Some(c"ll"));
+    let mut config = PX7_S2E_CONFIG;
+    let info = validated_info(c, &config);
+    let data = init_with_props(c, &mut config, &info, props);
+    assert!(!data.is_null());
+    // SAFETY: data and props from init and init_props.
+    unsafe {
+        for seq in 0..3 {
+            assert_eq!(c.reduce_bitpool.unwrap()(data), 3);
+            assert_eq!(c.increase_bitpool.unwrap()(data), 3);
+            assert_eq!(next_packet(c, data, props, false, seq), (348, LL_FIELDS));
+        }
+        c.deinit.unwrap()(data);
+        c.clear_props.unwrap()(props);
+    }
 }

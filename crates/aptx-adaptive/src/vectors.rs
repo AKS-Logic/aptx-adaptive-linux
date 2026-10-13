@@ -371,3 +371,97 @@ fn stream_ll_matches_parity() {
     check_stream_ll("c4_48k_i1_L3", DecoderLevel::R2, 48_000, 48);
     check_stream_ll("c4_44k_i1_L3", DecoderLevel::R2, 44_100, 44);
 }
+
+/// `tests/vectors/levels/`: mid-stream level changes (§7L) through [`crate::Stream`], R1 HQ
+/// index 0 from level 3. `k:L` asks for L between packets k−1 and k, so the request is made
+/// before the push that emits packet k−1. Checks the packets byte for byte and every `.sizes`
+/// line: bytes, forced, level, P and the deficit after the packet.
+fn check_levels(name: &str, rate: u32, chunk_frames: usize, map_1: bool, schedule: &[(usize, u8)]) {
+    check_levels_with(name, rate, chunk_frames, map_1, schedule, false);
+    check_levels_with(name, rate, chunk_frames, map_1, schedule, true);
+}
+
+/// With `now`, each request is made right after packet k−1 comes out and applied at once with
+/// [`crate::Stream::apply_level_now`], as the plugin does between packets: the output must be
+/// the same.
+fn check_levels_with(
+    name: &str,
+    rate: u32,
+    chunk_frames: usize,
+    map_1: bool,
+    schedule: &[(usize, u8)],
+    now: bool,
+) {
+    use crate::stream::table_row;
+    use crate::{Stream, packet_budget};
+    let dir = vectors("levels");
+    let pcm = read_s32(vectors("parity").join(format!("mix{rate}.s32le")));
+    let want = fs::read(dir.join(format!("{name}.bin"))).unwrap();
+    let want_sizes = fs::read_to_string(dir.join(format!("{name}.sizes"))).unwrap();
+    let config = cfg(Profile::Hq, DecoderLevel::R1, rate);
+    let row = table_row(config, packet_budget(895)).unwrap();
+    assert_eq!((row.bitrate, row.packet_bytes), (364_000, 656));
+    let mut s = Stream::with_core(Encoder::new(config, row.bitrate).unwrap(), config, row);
+    s.set_map_level_1(map_1);
+    let mut out = [0u8; 656];
+    let (mut got, mut sizes) = (Vec::new(), Vec::new());
+    for chunk in pcm.chunks(chunk_frames * 2) {
+        let n = sizes.len();
+        if !now && let Some(&(_, level)) = schedule.iter().find(|(k, _)| *k == n + 1) {
+            assert!(s.request_level(level), "{name}: request {level}");
+        }
+        // The level and P this packet is made with.
+        let (level, p) = (s.level(), s.samples_per_packet());
+        if let Some(len) = s.push(chunk, &mut out).unwrap() {
+            let mut packet = [0u8; 656];
+            crate::frame::swap16(&out[..len], &mut packet);
+            got.extend_from_slice(&packet);
+            sizes.push(format!("{n} {len} 1 {level} {p} {}", s.deficit()));
+            if now && let Some(&(_, level)) = schedule.iter().find(|(k, _)| *k == n + 1) {
+                assert!(s.request_level(level), "{name}: request {level}");
+                assert!(s.apply_level_now(), "{name}: apply {level}");
+            }
+        }
+    }
+    let name = &format!("{name}{}", if now { " (applied now)" } else { "" });
+    first_difference(name, 656, &got, &want);
+    let want_sizes: Vec<&str> = want_sizes.lines().collect();
+    // Every packet here is forced (the vectors say so); the loop doesn't report it.
+    assert!(want_sizes.iter().all(|l| l.split(' ').nth(2) == Some("1")));
+    assert_eq!(sizes, want_sizes, "{name}: sizes");
+}
+
+const LEVEL_SCHEDULE: [(usize, u8); 5] = [(10, 2), (20, 1), (30, 2), (40, 3), (50, 4)];
+
+#[test]
+fn levels_48k_ref() {
+    check_levels("lv_48k_ref", 48_000, 48, true, &LEVEL_SCHEDULE);
+}
+
+#[test]
+fn levels_48k_raw1() {
+    check_levels("lv_48k_raw1", 48_000, 48, false, &LEVEL_SCHEDULE);
+}
+
+#[test]
+fn levels_44k_ref() {
+    check_levels("lv_44k_ref", 44_100, 44, true, &LEVEL_SCHEDULE);
+}
+
+#[test]
+fn levels_48k_fast() {
+    let schedule = [
+        (1, 4),
+        (2, 3),
+        (3, 2),
+        (4, 3),
+        (5, 4),
+        (6, 2),
+        (7, 4),
+        (9, 3),
+        (11, 2),
+        (12, 4),
+        (13, 3),
+    ];
+    check_levels("lv_48k_fast", 48_000, 48, true, &schedule);
+}

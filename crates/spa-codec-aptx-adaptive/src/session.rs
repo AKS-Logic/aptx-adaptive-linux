@@ -8,6 +8,7 @@ use aptx_adaptive::{
     Config, Core, DecoderLevel, Encoder, Error, Profile, Row, Stream, packet_budget, table_row,
 };
 
+use std::fmt::Write as _;
 use std::io::Write as _;
 
 use crate::dev::{AnyCore, Options, Replay};
@@ -122,7 +123,18 @@ pub struct Session<C> {
     fade: Fade,
     /// Switch requests refused since the session started (reported in the drift line).
     refused: u32,
+    /// Whether `reduce_bitpool` / `increase_bitpool` change the level. Off for replay, whose
+    /// packets are what they are.
+    abr: bool,
+    /// Whether level changes are logged (off in unit tests).
+    log: bool,
+    /// The level and row bitrate last logged (or started with).
+    logged: (Profile, (u8, u32)),
 }
+
+/// `reduce_bitpool` never goes below this level (§7L); level 1 is treated as 2 anyway.
+const MIN_LEVEL: u8 = 2;
+const MAX_LEVEL: u8 = 7;
 
 fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
@@ -132,6 +144,30 @@ fn gcd(a: usize, b: usize) -> usize {
 fn link_row(level: DecoderLevel, profile: Profile, mtu: usize) -> Option<Row> {
     let row = table_row(config(level, profile), budget(mtu)).ok()?;
     (RTP_HEADER_LEN + row.packet_bytes <= mtu).then_some(row)
+}
+
+/// Every row a level change can reach from `row` (§7L): levels 2..=7 of `profile`'s table
+/// index with the same packet size.
+fn level_rows(level: DecoderLevel, profile: Profile, row: Row) -> impl Iterator<Item = Row> {
+    (MIN_LEVEL..=MAX_LEVEL).filter_map(move |l| {
+        aptx_adaptive::level_row(config(level, profile), row.packet_bytes, l)
+            .ok()
+            .filter(|r| r.packet_bytes == row.packet_bytes)
+    })
+}
+
+/// The info line for a level change, e.g. `aptx-adaptive: level 3 -> 2 (364k -> 318k)`.
+pub fn level_line(from: (u8, u32), to: (u8, u32)) -> crate::drift::LineBuf {
+    let mut line = crate::drift::LineBuf::new();
+    let _ = writeln!(
+        line,
+        "aptx-adaptive: level {} -> {} ({}k -> {}k)",
+        from.0,
+        to.0,
+        from.1 / 1000,
+        to.1 / 1000
+    );
+    line
 }
 
 impl Session<Encoder> {
@@ -184,6 +220,7 @@ impl Session<AnyCore> {
             s.rows[Profile::Ll.index()] = None;
             // The replayed packets are what they are.
             s.fade = Fade::Steady;
+            s.abr = false;
         }
         s.scmst = opts.scmst;
         s.drift_log = opts.drift_log;
@@ -207,11 +244,15 @@ impl<C: Core> Session<C> {
         let c = stream.config();
         let mut rows = Profile::ALL.map(|p| link_row(c.level, p, mtu));
         rows[c.profile.index()] = Some(stream.row());
-        let block = rows
+        // Every period a level change can reach too, in either profile.
+        let block = Profile::ALL
             .iter()
-            .flatten()
+            .zip(rows)
+            .filter_map(|(&p, r)| r.map(|r| (p, r)))
+            .flat_map(|(p, r)| std::iter::once(r).chain(level_rows(c.level, p, r)))
             .map(|r| r.interleaved_samples(c.sample_rate, c.channels.into()))
             .fold(0, gcd);
+        let (stream_level, stream_bitrate) = (stream.level(), stream.row().bitrate);
         Ok(Self {
             pcm: vec![0; block],
             stream,
@@ -223,7 +264,67 @@ impl<C: Core> Session<C> {
             target: c.profile,
             fade: Fade::StartMute(0),
             refused: 0,
+            abr: true,
+            log: !cfg!(test),
+            logged: (c.profile, (stream_level, stream_bitrate)),
         })
+    }
+
+    /// The quality level running now (§7L).
+    #[cfg(test)]
+    pub fn level(&self) -> u8 {
+        self.stream.level()
+    }
+
+    /// `reduce_bitpool` (`down`) or `increase_bitpool`: asks for the next level down (floor 2)
+    /// or up whose row has a different bitrate, from the next packet (§7L). Levels sharing a
+    /// row are stepped over (R1 HQ 4–7), so the ceiling is the last level with a new row: 4
+    /// on R1 HQ. A step onto a row with the same bitrate but another period (R2 LL index 2,
+    /// 3 → 4) is never taken. In R1 LL every level is the same row, so nothing changes.
+    /// Steps from a pending request, so repeated calls between packets keep stepping. During
+    /// an HQ↔LL switch the request waits and the switch's reset to level 3 drops it.
+    ///
+    /// Returns the level that will be running, like SBC's bitpool. Never allocates.
+    ///
+    /// # Errors
+    /// `Unsupported` for a replay session, which can't change level.
+    pub fn step_level(&mut self, down: bool) -> Result<u8, SessionError> {
+        if !self.abr {
+            return Err(SessionError::Unsupported);
+        }
+        let from = self
+            .stream
+            .pending_level()
+            .unwrap_or_else(|| self.stream.level());
+        let Some(cur) = self.stream.level_row(from) else {
+            return Ok(from);
+        };
+        let mut next = |l: u8| -> Option<Option<u8>> {
+            let row = self.stream.level_row(l)?;
+            if row.bitrate != cur.bitrate {
+                Some(Some(l))
+            } else if row.period_ms != cur.period_ms {
+                // §7L: equal bitrate, other period: P wouldn't follow the period byte.
+                Some(None)
+            } else {
+                None
+            }
+        };
+        let found = if down {
+            (MIN_LEVEL..from).rev().find_map(&mut next)
+        } else {
+            (from + 1..=MAX_LEVEL).find_map(&mut next)
+        };
+        let Some(l) = found.flatten().filter(|&l| self.stream.request_level(l)) else {
+            return Ok(from);
+        };
+        // media-sink calls this between packets, so the next packet already uses the new row
+        // (§7L "next packet boundary").
+        self.stream.hold_level(self.target != self.profile());
+        if self.stream.apply_level_now() {
+            self.log_level();
+        }
+        Ok(l)
     }
 
     /// Whether this link can run `profile`: the encoder has a row for it (R1 LL is config 0,
@@ -314,6 +415,19 @@ impl<C: Core> Session<C> {
         }
     }
 
+    /// Logs a level change at info: one write(2), no allocation, like the drift line. An
+    /// HQ↔LL switch (which resets the level to 3) isn't a level change and isn't logged here.
+    fn log_level(&mut self) {
+        let now = (self.stream.level(), self.stream.row().bitrate);
+        if now == self.logged.1 {
+            return;
+        }
+        if self.log && self.logged.0 == self.profile() {
+            let _ = std::io::stderr().write(level_line(self.logged.1, now).as_bytes());
+        }
+        self.logged = (self.profile(), now);
+    }
+
     /// Switch requests refused so far.
     #[cfg(test)]
     pub fn refused(&self) -> u32 {
@@ -356,8 +470,9 @@ impl<C: Core> Session<C> {
             .unwrap_or(0)
     }
 
-    /// The per-packet bitrate rule lives in the stream loop (spec §5 step 7). What a Linux
-    /// source should do with socket backlog is an open question, so it's only logged.
+    /// The per-packet bitrate rule lives in the stream loop (spec §5 step 7), and level
+    /// changes come from `reduce_bitpool` / `increase_bitpool` ([`Session::step_level`]), so
+    /// the backlog here is only logged.
     /// `media-sink.c` calls this right before each `send()`, which makes it the drift probe.
     pub fn abr_process(&mut self, unsent: usize) {
         let frames = self.packet_frames();
@@ -367,6 +482,7 @@ impl<C: Core> Session<C> {
             frames,
             self.drift_log,
             self.refused,
+            self.stream.level(),
         );
     }
 
@@ -421,7 +537,12 @@ impl<C: Core> Session<C> {
             *s = (i32::from_ne_bytes(*b) << 8) >> 8;
         }
         self.apply_fade();
+        // §7L: a level request waits while an HQ↔LL switch is in progress.
+        self.stream.hold_level(self.target != self.profile());
         let written = self.stream.push(&self.pcm, &mut dst[..room])?;
+        if written.is_some() {
+            self.log_level();
+        }
         Ok(EncodeResult {
             consumed: block,
             written: written.unwrap_or(0),
@@ -1036,6 +1157,179 @@ mod tests {
                 frame_type: 4,
             },
         );
+    }
+
+    /// `reduce_bitpool` / `increase_bitpool` on R1 HQ (§7L): one level per call between 2
+    /// and 4. 4–7 share a row, so 4 is the ceiling. Called between packets (as media-sink
+    /// does), the new row is used by the very next packet.
+    #[test]
+    fn level_steps_r1_hq() {
+        let mut s = session();
+        assert_eq!(s.step_level(true), Ok(2));
+        assert_eq!((s.level(), s.stream.samples_per_packet()), (2, 1536));
+        assert_eq!(s.step_level(true), Ok(2));
+        headers(&mut s, 1);
+        assert_eq!(s.step_level(false), Ok(3));
+        assert_eq!(s.step_level(false), Ok(4));
+        assert_eq!(s.step_level(false), Ok(4));
+        assert_eq!((s.level(), s.stream.samples_per_packet()), (4, 1152));
+        // Several steps between packets: each starts from the last, and the packet uses the
+        // last one.
+        assert_eq!(s.step_level(true), Ok(3));
+        assert_eq!(s.step_level(true), Ok(2));
+        assert_eq!(s.step_level(false), Ok(3));
+        headers(&mut s, 1);
+        assert_eq!((s.level(), s.stream.samples_per_packet()), (3, 1344));
+        // The 2 ms block divides every reachable period (12, 14, 16 and LL's 10 ms).
+        assert_eq!(s.block_size(), 96 * 2 * 4);
+    }
+
+    /// Mid-packet (part of a period fed) a step stays pending and is applied after the packet
+    /// that's in progress, in the §7K order.
+    #[test]
+    fn level_step_mid_packet_waits() {
+        let mut s = session();
+        let src = level_block(&s, 0);
+        let mut dst = vec![0u8; 2048];
+        assert!(!s.encode(&src, &mut dst).unwrap().flush);
+        assert_eq!(s.step_level(true), Ok(2));
+        assert_eq!((s.level(), s.stream.pending_level()), (3, Some(2)));
+        while !s.encode(&src, &mut dst).unwrap().flush {}
+        assert_eq!((s.level(), s.stream.samples_per_packet()), (2, 1536));
+    }
+
+    /// R1 LL: every level is the same row, so the callbacks report level 3 and change nothing.
+    #[test]
+    fn level_steps_r1_ll_do_nothing() {
+        let mut s = Session::new(DecoderLevel::R1, Profile::Ll, MTU).unwrap();
+        assert_eq!(s.step_level(true), Ok(3));
+        assert_eq!(s.step_level(false), Ok(3));
+        assert_eq!(s.stream.pending_level(), None);
+    }
+
+    /// R2 HQ index 1 (§4.1): 204k / 25 ms at level 2 up to 427k / 12 ms at 5, where 5–7
+    /// share a row. R2 LL index 1: 220k / 12 ms at 2, 270k / 10 ms from 3.
+    #[test]
+    fn level_steps_r2() {
+        let mut s = Session::new(DecoderLevel::R2, Profile::Hq, MTU).unwrap();
+        for want in [4, 5, 5] {
+            assert_eq!(s.step_level(false), Ok(want));
+        }
+        for want in [4, 3, 2, 2] {
+            assert_eq!(s.step_level(true), Ok(want));
+        }
+        assert_eq!(s.block_size(), 48 * 2 * 4);
+        let mut s = Session::new(DecoderLevel::R2, Profile::Ll, MTU).unwrap();
+        assert_eq!(s.step_level(false), Ok(3));
+        assert_eq!(s.step_level(true), Ok(2));
+    }
+
+    /// A replay session has no levels: `-ENOTSUP` like PipeWire's aptX.
+    #[test]
+    fn level_steps_refused_on_replay() {
+        let opts = Options {
+            replay: Some(vector("sine1k.r1.bin")),
+            ..Options::default()
+        };
+        let mut s = Session::open(DecoderLevel::R1, Profile::Hq, MTU, &opts).unwrap();
+        assert_eq!(s.step_level(true), Err(SessionError::Unsupported));
+        assert_eq!(s.stream.pending_level(), None);
+    }
+
+    /// §7L on air, on the real encoder: a reduce, then an increase, changes the RTP timestamp
+    /// low 16 bits from 0x02A0 (672) to 0x0300 (768) and back, each from the packet after the
+    /// call. SSRC, payload type and TTP-adjust bits stay, sequence numbers run on, and each
+    /// stretch's packets come every 14 ms or 16 ms of input.
+    #[test]
+    fn reduce_then_increase_on_air() {
+        let mut s = Session::new(DecoderLevel::R1, Profile::Hq, MTU).unwrap();
+        let sent = media_sink(&mut s, &sine_pcm(2 * 48_000), |s, n| match n {
+            20 => assert_eq!(s.step_level(true), Ok(2)),
+            40 => assert_eq!(s.step_level(false), Ok(3)),
+            _ => {}
+        });
+        let mut steps = Vec::new();
+        for (i, p) in sent.iter().enumerate() {
+            assert_eq!(p.len(), RTP_HEADER_LEN + 656, "packet {i}");
+            assert_eq!(p[..2], [0x80, 0x60]);
+            assert_eq!(p[2..4], (i as u16).to_be_bytes());
+            assert_eq!(p[4..6], [0, 0], "TTP adjust, packet {i}");
+            assert_eq!(p[8..12], [0, 0, 0, 0xa3], "SSRC, packet {i}");
+            let ts = u16::from_be_bytes([p[6], p[7]]);
+            if steps.last().is_none_or(|&(_, t)| t != ts) {
+                steps.push((i, ts));
+            }
+        }
+        // The call before packet n's header changes packet n's timestamp.
+        assert_eq!(steps, [(0, 0x02a0), (20, 0x0300), (40, 0x02a0)]);
+        assert_eq!(s.level(), 3);
+    }
+
+    /// §7K/§7L: a step during an HQ↔LL switch waits, and the switch's reset puts the level to
+    /// 3 and drops it.
+    #[test]
+    fn level_waits_for_switch() {
+        let mut s = session();
+        assert_eq!(s.step_level(false), Ok(4));
+        headers(&mut s, 1);
+        assert_eq!(s.level(), 4);
+        s.request(Profile::Ll).unwrap();
+        assert_eq!(s.step_level(true), Ok(3));
+        let src = level_block(&s, 0);
+        let mut dst = vec![0u8; 2048];
+        let mut hdr = [0u8; 64];
+        let mut levels = Vec::new();
+        for _ in 0..600 {
+            if s.encode(&src, &mut dst).unwrap().flush {
+                s.start_encode(&mut hdr, 0, 0).unwrap();
+                levels.push((s.profile(), s.level()));
+            }
+        }
+        // Level 4 throughout HQ despite the request; 3 from the reset on.
+        let ll = levels.iter().position(|l| l.0 == Profile::Ll).unwrap();
+        assert!(levels[..ll].iter().all(|&l| l == (Profile::Hq, 4)));
+        assert!(levels[ll..].iter().all(|&l| l == (Profile::Ll, 3)));
+        assert_eq!(s.stream.pending_level(), None);
+        // Back in HQ: level 3, 364k / 14 ms.
+        s.request(Profile::Hq).unwrap();
+        for _ in 0..600 {
+            if s.encode(&src, &mut dst).unwrap().flush {
+                s.start_encode(&mut hdr, 0, 0).unwrap();
+            }
+        }
+        assert_eq!((s.profile(), s.level()), (Profile::Hq, 3));
+        assert_eq!(s.stream.samples_per_packet(), 1344);
+    }
+
+    #[test]
+    fn level_log_line() {
+        let line = level_line((3, 364_000), (2, 318_000));
+        assert_eq!(
+            line.as_bytes(),
+            b"aptx-adaptive: level 3 -> 2 (364k -> 318k)\n"
+        );
+    }
+
+    /// A level change on the data thread doesn't allocate: the call, the packet that applies
+    /// it, and the log line.
+    #[test]
+    fn level_change_does_not_allocate() {
+        let mut s = Session::new(DecoderLevel::R1, Profile::Hq, MTU).unwrap();
+        s.log = true;
+        let src: Vec<u8> = sine_pcm(96);
+        let mut buf = vec![0u8; 2048];
+        for _ in 0..100 {
+            s.encode(&src, &mut buf).unwrap();
+        }
+        let count = crate::alloc_count::count(|| {
+            for down in [true, false, false, true] {
+                s.step_level(down).unwrap();
+                while !s.encode(&src, &mut buf).unwrap().flush {}
+                s.start_encode(&mut buf, 0, 0).unwrap();
+            }
+        });
+        assert_eq!(count, 0);
+        assert_eq!(s.level(), 3);
     }
 
     /// A refused request is counted, changes nothing and is reported as the running profile.

@@ -109,7 +109,18 @@ While audio plays, the plugin logs a line every 10 s:
 journalctl --user -u wireplumber -f | grep 'aptx-adaptive: drift'
 ```
 
-To silence it, set `APTX_ADAPTIVE_DRIFT_LOG=0` in WirePlumber's service environment. If a mode switch was refused (e.g. low latency when the link's MTU is too small for it), the line ends with `refused mode switches N`.
+To silence it, set `APTX_ADAPTIVE_DRIFT_LOG=0` in WirePlumber's service environment. The line includes the current quality level (`level 3`). If a mode switch was refused (e.g. low latency when the link's MTU is too small for it), the line ends with `refused mode switches N`.
+
+## adaptive bitrate
+
+In HQ mode the plugin changes the quality level as the link allows. When PipeWire can't send a packet because the socket is full, it asks the codec to back off (at most every ½ s), and the plugin drops one level. After a second with nothing queued, PipeWire asks it to go up again, and the plugin goes up one level. On a Px7 S2e (R1) the levels are 2 (318 kbps, 16 ms), 3 (364 kbps, 14 ms, the default) and 4 (427 kbps, 12 ms). The change applies from the next packet with no gap or fade. Switching between HQ and low latency puts the level back to 3. Low latency on an R1 headset has one bitrate at every level, so it never changes.
+
+Each change is logged once:
+
+```sh
+journalctl --user -u wireplumber -f | grep 'aptx-adaptive: level'
+# aptx-adaptive: level 3 -> 2 (364k -> 318k)
+```
 
 To confirm the headset's latency target is right, run `sudo btmon` and start playback. The headset's AVDTP Delay Report after Start should read 200.0 ms. If it reads 0 ms, expect stutter after a minute or two.
 

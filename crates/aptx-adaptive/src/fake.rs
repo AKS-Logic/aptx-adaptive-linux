@@ -85,6 +85,10 @@ impl Core for Fake {
         self.bitrates.push(bps);
     }
 
+    fn period_changed(&mut self, samples: usize) {
+        self.capacity = samples;
+    }
+
     fn reset(&mut self, config: Config, row: &Row) -> Result<()> {
         self.capacity = row.interleaved_samples(config.sample_rate, config.channels.into());
         self.buffered = 0;
