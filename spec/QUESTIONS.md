@@ -372,3 +372,7 @@ Questions, all **answered** by `a2dp-integration.md` §7L.1:
 ## LL row larger than the packet budget (open, 2026-10-13)
 
 §7J and §7L.1 say LL rows are never capped, but not what a source does when the LL packet (348 bytes on R1) exceeds the budget (L2CAP MTU − 20 < 348). We refuse LL: R1 `open` fails with NoSpace, and R2 stays in HQ. Does the reference refuse, clip, or do something else? Not reachable on real links (MTU ≥ 672).
+
+## adaptive bitrate live (2026-10-13 13:14, after #25)
+
+HQ on the Px7: 1 s after start PipeWire's `increase_bitpool` stepped the level 3 → 4 (364k → 427k, 12 ms). It held at 4 for minutes with no backlog growth, and drift settled as normal. Walking around the apartment never backed the socket up enough for `reduce_bitpool`, so the step down is covered only by the synthetic tests and vectors. Note: on a clean link this sits at L4, not the reference's L3 start, because PipeWire raises the level whenever there's been no backlog for a second.
