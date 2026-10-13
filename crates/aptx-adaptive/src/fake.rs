@@ -28,7 +28,7 @@ pub struct Fake {
 /// As for [`table_row`].
 pub fn stream(config: Config, budget: usize) -> Result<Stream<Fake>> {
     let row = table_row(config, budget)?;
-    Ok(Stream::with_core(Fake::new(config, row), config, row))
+    Ok(Stream::with_core(Fake::new(config, row), config, row).with_budget(budget))
 }
 
 impl Fake {
@@ -83,6 +83,10 @@ impl Core for Fake {
 
     fn set_bitrate(&mut self, bps: u32) {
         self.bitrates.push(bps);
+    }
+
+    fn period_changed(&mut self, samples: usize) {
+        self.capacity = samples;
     }
 
     fn reset(&mut self, config: Config, row: &Row) -> Result<()> {

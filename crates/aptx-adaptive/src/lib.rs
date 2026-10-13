@@ -14,8 +14,8 @@ use std::fmt;
 use codec::packetiser::Packetiser;
 use codec::{Params, Variant, alloc};
 
-pub use stream::{Core, Stream, table_row};
-pub use tables::{DecoderLevel, Profile, Row, packet_budget};
+pub use stream::{Core, Stream, table_row, table_row_at_level};
+pub use tables::{DecoderLevel, Profile, Row, capped_bitrate, packet_budget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
@@ -139,7 +139,8 @@ pub fn delay_frames(config: Config) -> Result<Option<u32>> {
 /// As for [`Encoder::new`].
 pub fn min_packet_bytes(config: Config, period_ms: u32) -> Result<usize> {
     let lo = u64::from(min_bitrate(config)?);
-    // Inverse of `Row::fit`: size·8000/period − 25000 ≥ lo.
+    // Inverse of `Row::fit` (the integer form equals its float32 one while positive):
+    // size·8000/period − 25000 ≥ lo.
     let bytes = ((lo + 25_000) * u64::from(period_ms)).div_ceil(8000);
     Ok((bytes as usize).next_multiple_of(4))
 }
@@ -508,8 +509,8 @@ mod tests {
             packet_bytes: 656,
             cfg: 1,
         };
-        assert!(row.fit(need).bitrate >= min_bitrate(STEREO_48K).unwrap());
-        assert!(row.fit(need - 4).bitrate < min_bitrate(STEREO_48K).unwrap());
+        assert!(row.fit(Profile::Hq, need).bitrate >= min_bitrate(STEREO_48K).unwrap());
+        assert!(row.fit(Profile::Hq, need - 4).bitrate < min_bitrate(STEREO_48K).unwrap());
     }
 
     #[test]

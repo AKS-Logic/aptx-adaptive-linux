@@ -33,6 +33,9 @@ pub trait Core {
     fn reset(&mut self, _config: Config, _row: &Row) -> Result<()> {
         Err(Error::UnsupportedConfig)
     }
+    /// The loop's period is now `samples` interleaved samples per packet (a level change,
+    /// §7L). The encoder doesn't care; a stand-in that buffers one period does.
+    fn period_changed(&mut self, _samples: usize) {}
 }
 
 /// Above this many interleaved samples of deficit the bitrate drops by 25%.
@@ -53,6 +56,23 @@ pub struct Stream<C> {
     window: Vec<u8>,
     consumed: usize,
     deficit: i64,
+    /// The link's packet budget, which other levels' rows are capped to (§7J, §7L.1 item 3:
+    /// from the budget before rounding). [`Stream::with_core`] assumes the starting row's
+    /// packet size; [`Stream::new`] and [`Stream::with_budget`] set the real one.
+    budget: usize,
+    /// Quality level of `row` (§7L).
+    level: u8,
+    /// The last level request, applied after the next packet (§7L).
+    pending: Option<u8>,
+    /// While set, a pending request waits (an HQ↔LL switch is in progress, §7L).
+    hold: bool,
+    /// The last value given to the core's set-bitrate, or the create bitrate.
+    bitrate: u32,
+    /// Row, P, level and `bitrate` as they were before the last packet's level and bitrate
+    /// step, for [`Stream::apply_level_now`].
+    before_step: (Row, usize, u8, u32),
+    /// §7L / §8.2: a request for level 1 is treated as 2. Off only for the raw-row vectors.
+    map_level_1: bool,
 }
 
 impl Stream<Encoder> {
@@ -64,7 +84,7 @@ impl Stream<Encoder> {
     pub fn new(config: Config, budget: usize) -> Result<Self> {
         let row = table_row(config, budget)?;
         let core = Encoder::new(config, row.bitrate)?;
-        Ok(Self::with_core(core, config, row))
+        Ok(Self::with_core(core, config, row).with_budget(budget))
     }
 }
 
@@ -75,11 +95,21 @@ impl Stream<Encoder> {
 /// fitted row's bitrate is below what the encoder runs at, which would grow the backlog every
 /// period (`codec-core.md` §8.8, [`crate::min_packet_bytes`]).
 pub fn table_row(config: Config, budget: usize) -> Result<Row> {
+    table_row_at_level(config, budget, DEFAULT_QUALITY)
+}
+
+/// [`table_row`] for quality `level`. HQ rows are capped to `budget` (§7J, recomputed per
+/// level, §7L.1); LL rows never are, so one that doesn't fit is refused.
+///
+/// # Errors
+/// As for [`table_row`], `UnsupportedConfig` for a level outside 1..=7, and
+/// `PacketTooSmall` for an LL row bigger than `budget`.
+pub fn table_row_at_level(config: Config, budget: usize, level: u8) -> Result<Row> {
     let index = tables::index(config.profile, config.level, Link::default());
-    let row = tables::row(config.profile, index, DEFAULT_QUALITY)
+    let row = tables::row(config.profile, index, level)
         .ok_or(Error::UnsupportedConfig)?
-        .fit(budget);
-    if row.bitrate < crate::min_bitrate(config)? {
+        .fit(config.profile, budget);
+    if row.packet_bytes > budget || row.bitrate < crate::min_bitrate(config)? {
         return Err(Error::PacketTooSmall);
     }
     Ok(row)
@@ -90,21 +120,31 @@ impl<C: Core> Stream<C> {
         // A core that can't prepare fails on its first packet instead, with the same error.
         let _ = core.prepare(&row);
         let pcm = Vec::with_capacity(PCM_CAPACITY);
+        let samples_per_packet =
+            row.interleaved_samples(config.sample_rate, config.channels.into());
         Self {
             core,
             config,
             row,
-            samples_per_packet: row.interleaved_samples(config.sample_rate, config.channels.into()),
+            samples_per_packet,
             pcm,
             window: vec![0; crate::MAX_PACKET + WINDOW_SLACK],
             consumed: 0,
             deficit: 0,
+            budget: row.packet_bytes,
+            level: DEFAULT_QUALITY,
+            pending: None,
+            hold: false,
+            bitrate: row.bitrate,
+            before_step: (row, samples_per_packet, DEFAULT_QUALITY, row.bitrate),
+            map_level_1: true,
         }
     }
 
-    /// Switches to `config` and `row` in place (§7K): resets the core and zeroes the loop
-    /// counters. Queued input is kept. No allocation, given a core whose reset doesn't
-    /// allocate. On error nothing changes.
+    /// Switches to `config` and `row` in place (§7K): resets the core, zeroes the loop
+    /// counters, sets the level to 3 and drops any pending or held level request. Queued input
+    /// is kept. No allocation, given a core whose reset doesn't allocate. On error nothing
+    /// changes.
     ///
     /// # Errors
     /// Whatever the core's reset returns.
@@ -116,7 +156,113 @@ impl<C: Core> Stream<C> {
             row.interleaved_samples(config.sample_rate, config.channels.into());
         self.consumed = 0;
         self.deficit = 0;
+        // The budget is the link's, so it stays; it only has to hold the new row.
+        self.budget = self.budget.max(row.packet_bytes);
+        // §7K: a switch resets the level to 3; a request that waited for it is dropped.
+        self.level = DEFAULT_QUALITY;
+        self.pending = None;
+        self.bitrate = row.bitrate;
+        self.before_step = (row, self.samples_per_packet, DEFAULT_QUALITY, row.bitrate);
         Ok(())
+    }
+
+    /// The link's packet budget (from [`crate::packet_budget`]), which the starting row was
+    /// fitted to. Other levels' HQ rows are capped to it.
+    #[must_use]
+    pub fn with_budget(mut self, budget: usize) -> Self {
+        self.budget = budget.max(self.row.packet_bytes);
+        self
+    }
+
+    /// See [`Stream::with_budget`].
+    #[must_use]
+    pub fn budget(&self) -> usize {
+        self.budget
+    }
+
+    /// The quality level the stream runs at (§7L).
+    #[must_use]
+    pub fn level(&self) -> u8 {
+        self.level
+    }
+
+    /// The level request waiting for the next packet, if any.
+    #[must_use]
+    pub fn pending_level(&self) -> Option<u8> {
+        self.pending
+    }
+
+    /// The row for quality `level` on this stream's table index, fitted like the starting
+    /// row. `None` if the encoder can't run it in place: no such level, a bitrate below the
+    /// encoder's floor, or a different packet size (fixed until a reset).
+    #[must_use]
+    pub fn level_row(&self, level: u8) -> Option<Row> {
+        let row = table_row_at_level(self.config, self.budget, level).ok()?;
+        (row.packet_bytes == self.row.packet_bytes).then_some(row)
+    }
+
+    /// Asks for quality `level` from the next packet boundary (§7L, §8.2): 0 and values above
+    /// 7 are ignored, 1 is treated as 2, and the last request before a packet wins. Returns
+    /// whether the request was stored. Never allocates.
+    pub fn request_level(&mut self, level: u8) -> bool {
+        let level = match level {
+            1 if self.map_level_1 => 2,
+            0 | 8.. => return false,
+            l => l,
+        };
+        if self.level_row(level).is_none() {
+            return false;
+        }
+        self.pending = Some(level);
+        true
+    }
+
+    /// While `hold` is set, a pending level request waits (§7L: during an HQ↔LL switch). A
+    /// request still held when [`Stream::reset`] runs is dropped: the switch runs level 3.
+    /// If the switch is called off instead, release the hold and it applies after the next
+    /// packet.
+    pub fn hold_level(&mut self, hold: bool) {
+        self.hold = hold;
+    }
+
+    /// Test only: a request for level 1 uses the level 1 row, not level 2's
+    /// (`tests/vectors/levels/` `lv_48k_raw1`).
+    #[cfg(test)]
+    pub(crate) fn set_map_level_1(&mut self, on: bool) {
+        self.map_level_1 = on;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deficit(&self) -> i64 {
+        self.deficit
+    }
+
+    /// §7L: the pending level's row takes effect at once, but only if its bitrate differs from
+    /// the last one given to set-bitrate are the bitrate and the period P changed. The deficit
+    /// and the encoder state carry over.
+    fn apply_level(&mut self) {
+        if self.hold {
+            return;
+        }
+        let Some(level) = self.pending.take() else {
+            return;
+        };
+        let Some(row) = self.level_row(level) else {
+            return;
+        };
+        self.level = level;
+        self.row = row;
+        if row.bitrate != self.bitrate {
+            self.set_bitrate(row.bitrate);
+            self.samples_per_packet =
+                row.interleaved_samples(self.config.sample_rate, self.config.channels.into());
+            self.core.period_changed(self.samples_per_packet);
+        }
+    }
+
+    fn set_bitrate(&mut self, bps: u32) {
+        self.bitrate = bps;
+        self.core.set_bitrate(bps);
     }
 
     #[must_use]
@@ -189,15 +335,43 @@ impl<C: Core> Stream<C> {
             self.deficit = 0;
         }
 
+        self.after_packet();
+        Ok(Some(written))
+    }
+
+    /// §7K order after the deficit update: the level change, then the bitrate step on the
+    /// (new) row.
+    fn after_packet(&mut self) {
+        self.before_step = (self.row, self.samples_per_packet, self.level, self.bitrate);
+        self.apply_level();
         // §7J: the 25 % drop clamps at the encoder's floor (200 kbps in stereo).
         let table = self.row.bitrate;
         let floor = crate::min_bitrate(self.config).unwrap_or(0);
-        self.core.set_bitrate(if self.deficit > DEFICIT_LIMIT {
+        self.set_bitrate(if self.deficit > DEFICIT_LIMIT {
             (table - table / 4).max(floor.min(table))
         } else {
             table
         });
-        Ok(Some(written))
+    }
+
+    /// At a packet boundary (nothing consumed since the last packet), applies a pending level
+    /// now, exactly as if it had been pending when that packet came out: same deficit, same
+    /// "current bitrate", and the bitrate step re-run on the new row. So a request made
+    /// between packets takes effect from the very next packet. Otherwise it stays pending for
+    /// the next packet. Returns whether it was applied.
+    pub fn apply_level_now(&mut self) -> bool {
+        if self.consumed != 0 || self.hold || self.pending.is_none() {
+            return false;
+        }
+        // Set-bitrate starts the rate control afresh, so redoing the step from the value it
+        // replaced leaves the core as if the level had been applied with the packet.
+        let row_changed = self.before_step.1 != self.samples_per_packet;
+        (self.row, self.samples_per_packet, self.level, self.bitrate) = self.before_step;
+        if row_changed {
+            self.core.period_changed(self.samples_per_packet);
+        }
+        self.after_packet();
+        true
     }
 }
 
@@ -475,6 +649,134 @@ mod tests {
             assert!(blocks <= all && all - blocks < 128, "{blocks} of {all}");
             assert!(frames.iter().all(|f| f.bits.len() == 8));
         }
+    }
+
+    /// Pushes one period and returns the packet size, the level and P it was made with.
+    fn packet(s: &mut Stream<Fake>) -> (usize, u8, usize) {
+        let (level, p) = (s.level(), s.samples_per_packet());
+        let mut out = [0; 656];
+        let n = s.push(&vec![0; p], &mut out).unwrap().unwrap();
+        (n, level, p)
+    }
+
+    /// §7L requests: 0 and > 7 ignored, 1 → 2, the last one before a packet wins, applied
+    /// after the next packet with its bitrate set before the per-packet step.
+    #[test]
+    fn level_request_semantics() {
+        let mut s = px7();
+        assert!(!s.request_level(0));
+        assert!(!s.request_level(8));
+        assert!(!s.request_level(255));
+        assert_eq!(s.pending_level(), None);
+        assert!(s.request_level(1));
+        assert_eq!(s.pending_level(), Some(2));
+        assert!(s.request_level(4));
+        assert!(s.request_level(2));
+        // Nothing changes before a packet.
+        assert_eq!((s.level(), s.samples_per_packet()), (3, 1344));
+        assert_eq!(packet(&mut s), (656, 3, 1344));
+        assert_eq!(
+            (s.level(), s.samples_per_packet(), s.pending_level()),
+            (2, 1536, None)
+        );
+        // Row bitrate, then the per-packet step on it.
+        assert_eq!(s.core().bitrates, [318_000, 318_000]);
+        assert_eq!(packet(&mut s), (656, 2, 1536));
+        assert_eq!(s.core().bitrates, [318_000, 318_000, 318_000]);
+        assert_eq!(s.deficit, 0);
+    }
+
+    /// §7L rule 4: a row with the bitrate already set calls nothing and leaves P alone. R1 HQ
+    /// levels 4–7 share a row, so 4 → 5 is that case.
+    #[test]
+    fn equal_bitrate_keeps_p() {
+        let mut s = px7();
+        s.request_level(4);
+        packet(&mut s);
+        assert_eq!((s.level(), s.samples_per_packet()), (4, 1152));
+        let calls = s.core().bitrates.len();
+        s.request_level(5);
+        assert_eq!(packet(&mut s), (656, 4, 1152));
+        assert_eq!((s.level(), s.samples_per_packet()), (5, 1152));
+        // Only the per-packet step.
+        assert_eq!(s.core().bitrates.len(), calls + 1);
+        // Against a ¾-reduced bitrate the same row isn't equal: it's set again.
+        let mut s = px7();
+        s.core.early.extend([(0, 1000), (1, 1688)]);
+        let mut out = [0; 656];
+        s.push(&[0; 1344], &mut out).unwrap();
+        assert_eq!(s.core().bitrates, [273_000]);
+        s.request_level(3);
+        assert_eq!(s.push(&[0; 1344], &mut out).unwrap(), Some(656));
+        assert_eq!(s.core().bitrates, [273_000, 364_000, 364_000]);
+    }
+
+    /// §7L: the deficit carries straight over a level change.
+    #[test]
+    fn deficit_carries_over() {
+        let mut s = px7();
+        s.core.early.extend([(0, 1000), (1, 1880)]);
+        s.request_level(2);
+        let mut out = [0; 656];
+        s.push(&[0; 1344], &mut out).unwrap();
+        assert_eq!((s.deficit, s.samples_per_packet()), (344, 1536));
+        // Row bitrate, then ¾ of it for the deficit.
+        assert_eq!(s.core().bitrates, [318_000, 238_500]);
+        // Due at 1536 + 344.
+        assert_eq!(s.push(&[0; 1535], &mut out).unwrap(), None);
+        assert_eq!(s.push(&[0; 1], &mut out).unwrap(), Some(656));
+        assert_eq!(s.deficit, 0);
+    }
+
+    /// §7L: a request waits while held (an HQ↔LL switch), and a reset puts the level back to 3
+    /// and drops it.
+    #[test]
+    fn level_waits_for_switch_and_reset_restores_3() {
+        let mut s = px7();
+        s.hold_level(true);
+        s.request_level(4);
+        packet(&mut s);
+        assert_eq!((s.level(), s.pending_level()), (3, Some(4)));
+        s.hold_level(false);
+        packet(&mut s);
+        assert_eq!(s.level(), 4);
+        s.request_level(2);
+        let row = table_row(PX7, packet_budget(895)).unwrap();
+        s.reset(PX7, row).unwrap();
+        assert_eq!(
+            (s.level(), s.pending_level(), s.samples_per_packet()),
+            (3, None, 1344)
+        );
+    }
+
+    /// R1 LL row 0 is the same at every level: a request is stored and applied, but the
+    /// bitrate is equal so nothing is called and P stays.
+    #[test]
+    fn ll_r1_levels_change_nothing() {
+        let ll = Config {
+            profile: Profile::Ll,
+            ..PX7
+        };
+        let mut s = fake::stream(ll, packet_budget(895)).unwrap();
+        assert!(s.request_level(4));
+        s.push(&[0; 960], &mut [0; 348]).unwrap();
+        assert_eq!((s.level(), s.samples_per_packet()), (4, 960));
+        assert_eq!(s.core().bitrates, [265_000]);
+    }
+
+    /// The other levels are fitted to the starting packet size, so a small MTU caps them the
+    /// same way (§7J: same period, lower bitrate).
+    #[test]
+    fn level_rows_fit_the_budget() {
+        let mut s = fake::stream(PX7, 600).unwrap();
+        assert_eq!(s.row().packet_bytes, 600);
+        let r4 = s.level_row(4).unwrap();
+        assert_eq!((r4.packet_bytes, r4.period_ms), (600, 12));
+        assert_eq!(r4.bitrate, 600 * 8000 / 12 - 25_000);
+        s.request_level(4);
+        let mut out = [0; 600];
+        s.push(&[0; 1344], &mut out).unwrap();
+        assert_eq!(s.samples_per_packet(), 1152);
     }
 
     #[test]

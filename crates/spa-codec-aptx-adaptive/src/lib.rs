@@ -117,8 +117,8 @@ const fn codec(mode: slot::DefaultMode, owner: Option<slot::Slot>) -> media_code
         start_decode: None,
         decode: None,
         produce_plc: None,
-        reduce_bitpool: None,
-        increase_bitpool: None,
+        reduce_bitpool: Some(codec_reduce_bitpool),
+        increase_bitpool: Some(codec_increase_bitpool),
         set_log: None,
         get_delay: Some(codec_get_delay),
     }
@@ -594,6 +594,32 @@ unsafe extern "C" fn codec_abr_process(data: *mut c_void, unsent: usize) -> c_in
     // SAFETY: PipeWire passes the pointer from init.
     unsafe { session(data) }.abr_process(unsent);
     0
+}
+
+/// `media-sink.c` calls this when a send hits `EAGAIN`, at most every ½ s, and only logs the result.
+/// One level down from the next packet (§7L); returns the level that will run, or `-ENOTSUP`
+/// for a replay session (the convention of SBC, LDAC and aptX in PipeWire).
+unsafe extern "C" fn codec_reduce_bitpool(data: *mut c_void) -> c_int {
+    // SAFETY: PipeWire passes the pointer from init.
+    unsafe { step_level(data, true) }
+}
+
+/// Called after a send with an empty socket queue, at most every 1 s since the last change. One
+/// level up, otherwise as [`codec_reduce_bitpool`].
+unsafe extern "C" fn codec_increase_bitpool(data: *mut c_void) -> c_int {
+    // SAFETY: PipeWire passes the pointer from init.
+    unsafe { step_level(data, false) }
+}
+
+/// # Safety
+/// As for [`session`].
+unsafe fn step_level(data: *mut c_void, down: bool) -> c_int {
+    // SAFETY: caller contract; PipeWire passes the pointer from init, as to every other
+    // session callback.
+    match unsafe { session(data) }.step_level(down) {
+        Ok(l) => c_int::from(l),
+        Err(e) => session_err(e),
+    }
 }
 
 unsafe extern "C" fn codec_start_encode(

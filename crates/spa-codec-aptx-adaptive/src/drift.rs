@@ -62,6 +62,8 @@ pub struct Report {
     /// HQ/LL switch requests refused since the stream started (logged when non-zero; the
     /// data thread doesn't log them itself).
     pub refused_switches: u32,
+    /// The quality level running when the line is logged (§7L), if known.
+    pub level: Option<u8>,
 }
 
 impl fmt::Display for Report {
@@ -78,6 +80,9 @@ impl fmt::Display for Report {
         )?;
         if let Some(d) = self.drift_ms {
             write!(f, ", audio ahead {d:+.1} ms")?;
+        }
+        if let Some(l) = self.level {
+            write!(f, ", level {l}")?;
         }
         if self.refused_switches > 0 {
             write!(f, ", refused mode switches {}", self.refused_switches)?;
@@ -171,11 +176,12 @@ impl Drift {
             drift_ms,
             backlog: (b.min, (b.sum / b.n.max(1)) as usize, b.max),
             refused_switches: 0,
+            level: None,
         })
     }
 
-    /// [`Self::on_send`], with the report (plus `refused` mode switches) written to stderr
-    /// (the service's journal) unless `log` is off.
+    /// [`Self::on_send`], with the report (plus `refused` mode switches and the running `level`)
+    /// written to stderr (the service's journal) unless `log` is off.
     pub fn on_send_log(
         &mut self,
         now: Instant,
@@ -183,11 +189,13 @@ impl Drift {
         frames: u64,
         log: bool,
         refused: u32,
+        level: u8,
     ) {
         if let Some(mut r) = self.on_send(now, unsent, frames)
             && log
         {
             r.refused_switches = refused;
+            r.level = Some(level);
             let mut line = LineBuf::new();
             let _ = writeln!(line, "{r}");
             // One write(2), so the line can't interleave with other threads' output. Unbuffered
@@ -198,20 +206,20 @@ impl Drift {
 }
 
 /// A fixed stack buffer for one log line; output past its end is dropped.
-struct LineBuf {
+pub struct LineBuf {
     buf: [u8; 320],
     len: usize,
 }
 
 impl LineBuf {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             buf: [0; 320],
             len: 0,
         }
     }
 
-    fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
     }
 }
@@ -300,6 +308,7 @@ mod tests {
             drift_ms: Some(-0.5),
             backlog: (0, 312, 1312),
             refused_switches: 0,
+            level: None,
         };
         assert_eq!(
             r.to_string(),
@@ -310,6 +319,7 @@ mod tests {
             drift_ms: None,
             backlog: (0, 0, 0),
             refused_switches: 0,
+            level: None,
         };
         assert_eq!(
             r.to_string(),
@@ -326,6 +336,7 @@ mod tests {
             drift_ms: Some(-1e9),
             backlog: (usize::MAX, usize::MAX, usize::MAX),
             refused_switches: u32::MAX,
+            level: Some(u8::MAX),
         };
         let mut line = LineBuf::new();
         assert!(writeln!(line, "{r}").is_ok());
