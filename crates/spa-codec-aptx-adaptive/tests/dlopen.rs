@@ -196,6 +196,8 @@ fn caps_round_trip() {
     let n = unsafe { c.fill_caps.unwrap()(c, 0, ptr::null(), caps.as_mut_ptr()) };
     assert_eq!(n as usize, CAPS_LEN);
     assert_eq!(caps[..6], VENDOR_HEADER);
+    // Source type 2 at 48 kHz, R1 layout (end marker at body 15/16).
+    assert_eq!((caps[6], caps[15], caps[16]), (0x12, 0x00, 0xaa));
 
     let (n, config) = select(c, &PX7_S2E);
     assert_eq!(n as usize, PX7_S2E.len());
@@ -322,6 +324,54 @@ fn init_and_encode_a_real_packet() {
         let mut delay = 99;
         c.get_delay.unwrap()(data, &raw mut delay, ptr::null_mut());
         assert_eq!(delay, 0);
+        c.deinit.unwrap()(data);
+    }
+}
+
+/// An R2.1 sink gets a config the plugin can stream: the R2 HQ level-3 row (19 ms, 912 samples
+/// per channel, spec §4.1 idx 1) and the config 3 bitstream.
+#[test]
+fn r2_config_streams() {
+    let l = load();
+    let c = l.codec;
+    let mut caps = [0u8; CAPS_LEN];
+    caps[..6].copy_from_slice(&VENDOR_HEADER);
+    caps[6..26].copy_from_slice(&[
+        0x19, 0x0a, 0x50, 0x64, 0x64, 0x64, 0xff, 0xff, 0x00, 0x01, 0x03, 0x00, 0x00, 0x0f, 0x02,
+        0x03, 0x03, 0x03, 0x00, 0xaa,
+    ]);
+    let (n, mut config) = select(c, &caps);
+    assert_eq!(n as usize, CAPS_LEN);
+    assert_eq!(config[15], 1, "R2 extension");
+    let info = validated_info(c, &config);
+    let data = init(c, &mut config, &info);
+    assert!(!data.is_null());
+
+    // SAFETY: data from init, valid until deinit.
+    unsafe {
+        let block = c.get_block_size.unwrap()(data);
+        assert_eq!(block, 912 * 2 * 4);
+        let mut out = [0u8; 1024];
+        assert_eq!(
+            c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), 1, 0),
+            12
+        );
+        assert_eq!(out[4..12], [0, 0, 0x03, 0x90, 0, 0, 0, 0xa3]);
+        let pcm = vec![0u8; block as usize];
+        let (mut written, mut flush) = (0usize, 0);
+        let res = c.encode.unwrap()(
+            data,
+            pcm.as_ptr().cast(),
+            pcm.len(),
+            out.as_mut_ptr().add(12).cast(),
+            out.len() - 12,
+            &raw mut written,
+            &raw mut flush,
+        );
+        assert_eq!(res, block);
+        assert_eq!((written, flush), (656, 1));
+        // Swapped config 3 packet: 00 83 a1 .. (spec §3.2).
+        assert_eq!((out[12] & 0x7f, out[13], out[15]), (0x03, 0x00, 0xa1));
         c.deinit.unwrap()(data);
     }
 }
