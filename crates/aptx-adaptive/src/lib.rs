@@ -85,8 +85,10 @@ impl fmt::Debug for Encoder {
     }
 }
 
-/// The bitstream variant for a config (`codec-core.md` §1): HQ at 88.2/96 kHz is config 3
-/// whatever the decoder level; LL there isn't allowed.
+/// The bitstream variant for a config (`codec-core.md` §1, §10.D, §10.F): HQ at 88.2/96 kHz
+/// is config 3 whatever the decoder level; LL there isn't allowed. LL with an R2 sink is
+/// config 4. `Profile::Ll` with an R1 sink is the low-power config 1 (create profile 1); the
+/// reference source runs an R1 sink in LL with the HQ encoder (config 0) instead.
 fn params(config: Config) -> Result<Params> {
     let high_rate = match config.sample_rate {
         44_100 | 48_000 => false,
@@ -97,8 +99,8 @@ fn params(config: Config) -> Result<Params> {
         (Profile::Hq, _, true) | (Profile::Hq, DecoderLevel::R2, false) => Variant::Cfg3,
         (Profile::Hq, DecoderLevel::R1, false) => Variant::Cfg0,
         (Profile::Ll, DecoderLevel::R1, false) => Variant::Cfg1,
-        // Config 4 (R2 LL) isn't specified, and LL is 44.1/48 kHz only.
-        (Profile::Ll, _, _) => return Err(Error::UnsupportedConfig),
+        (Profile::Ll, DecoderLevel::R2, false) => Variant::Cfg4,
+        (Profile::Ll, _, true) => return Err(Error::UnsupportedConfig),
     };
     Ok(Params {
         variant,
@@ -130,8 +132,8 @@ pub fn min_packet_bytes(config: Config, period_ms: u32) -> Result<usize> {
 
 impl Encoder {
     /// # Errors
-    /// `UnsupportedConfig` for anything but stereo configs 0, 1 and 3 at their sample rates,
-    /// or a zero bitrate.
+    /// `UnsupportedConfig` for anything but stereo configs 0, 1, 3 and 4 at their sample
+    /// rates, or a zero bitrate.
     pub fn new(config: Config, bitrate: u32) -> Result<Self> {
         if config.channels != 2 || bitrate == 0 {
             return Err(Error::UnsupportedConfig);
@@ -232,6 +234,7 @@ mod tests {
             Config {
                 profile: Profile::Ll,
                 level: DecoderLevel::R2,
+                sample_rate: 88_200,
                 ..STEREO_48K
             },
             Config {

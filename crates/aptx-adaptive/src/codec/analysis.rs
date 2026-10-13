@@ -3,7 +3,7 @@
 #![expect(clippy::many_single_char_names, reason = "names follow the spec")]
 
 use super::arith::{add, r23, r64, sat24, sat64, sub};
-use super::tables::{DCT, FRONTEND, INNER_12, INNER_16, OUTER_12, OUTER_16, PROTO_256};
+use super::tables::{DCT, FRONTEND, INNER_12, INNER_16, OUTER_12, OUTER_16, PROTO_128, PROTO_256};
 
 /// One two-band stage of the tree QMF (§3.1). Index 0 of each delay line is the newest sample.
 #[derive(Debug, Clone, Copy)]
@@ -74,7 +74,9 @@ impl Tree4 {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Cosine8 {
-    /// Index m is the sample of age m.
+    /// 256 taps, or 128 for config 4 (§10.F).
+    proto: &'static [i32],
+    /// Index m is the sample of age m; only the first `proto.len()` are used.
     hist: [i32; 256],
 }
 
@@ -83,13 +85,17 @@ fn dct_mul(v: i32, k: i32) -> i32 {
 }
 
 impl Cosine8 {
-    pub fn new() -> Self {
-        Self { hist: [0; 256] }
+    pub fn new(taps128: bool) -> Self {
+        Self {
+            proto: if taps128 { &PROTO_128 } else { &PROTO_256 },
+            hist: [0; 256],
+        }
     }
 
     /// Eight samples in time order to eight subband values (§3.2).
     pub fn block(&mut self, s: &[i32], out: &mut [i32]) {
-        self.hist.copy_within(0..248, 8);
+        let taps = self.proto.len();
+        self.hist.copy_within(0..taps - 8, 8);
         for m in 0..8 {
             self.hist[m] = s[7 - m];
         }
@@ -97,10 +103,9 @@ impl Cosine8 {
         let mut u = [0i32; 16];
         for (i, u) in u.iter_mut().enumerate() {
             let mut acc = 0i64;
-            for k in 0..16 {
-                let m = i + 16 * k;
-                acc =
-                    acc.wrapping_sub(i64::from(PROTO_256[m]).wrapping_mul(i64::from(self.hist[m])));
+            for m in (i..taps).step_by(16) {
+                acc = acc
+                    .wrapping_sub(i64::from(self.proto[m]).wrapping_mul(i64::from(self.hist[m])));
             }
             *u = r64(i128::from(acc.wrapping_mul(64)));
         }

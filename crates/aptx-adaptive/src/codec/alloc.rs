@@ -16,7 +16,7 @@ const NCH: u32 = CHANNELS as u32;
 #[must_use]
 pub fn bitrate_range(params: Params) -> (u32, u32) {
     match params.variant {
-        Variant::Cfg0 | Variant::Cfg1 => (100_000 * NCH, 300_000 * NCH),
+        Variant::Cfg0 | Variant::Cfg1 | Variant::Cfg4 => (100_000 * NCH, 300_000 * NCH),
         Variant::Cfg3 => (90_000, 500_000 * NCH),
     }
 }
@@ -26,6 +26,7 @@ fn pool_rate(params: Params, target: u32) -> u32 {
     let (lo, hi) = match params.variant {
         Variant::Cfg0 | Variant::Cfg1 => (100_000 * NCH, 350_000 * NCH),
         Variant::Cfg3 => (90_000, 550_000 * NCH),
+        Variant::Cfg4 => (100_000 * NCH, 210_000 * NCH),
     };
     target.clamp(lo, hi)
 }
@@ -38,7 +39,7 @@ pub fn pool(params: Params, target: u32) -> u32 {
     (r / fs * s + (r % fs) * s / fs) as u32
 }
 
-/// Per-band ceilings for clamped rate `r` (§8.3).
+/// Per-band ceilings for clamped rate `r` (§8.3, config 4's tonal table from §10.F).
 fn max_bits(params: Params, r: u32, tonal: bool) -> &'static [u8] {
     let pick = |ladder: &[(u32, &'static [u8])], top: &'static [u8]| {
         ladder
@@ -54,6 +55,7 @@ fn max_bits(params: Params, r: u32, tonal: bool) -> &'static [u8] {
             ],
             &MAX_BITS_4BAND_MAX,
         ),
+        (_, false) if tonal && params.variant == Variant::Cfg4 => &MAX_BITS_8BAND_420,
         (_, false) if tonal => &MAX_BITS_8BAND_MAX,
         (_, true) if tonal => &MAX_BITS_8BAND_96K_MAX,
         (_, false) => pick(
@@ -260,7 +262,7 @@ pub fn allocate(params: Params, target: u32, nominal: u32, x: &[i32], out: &mut 
     let mut alloc = [0i32; MAX_WIDTH];
     let alloc = &mut alloc[..w];
     distribute(s, bits as i32, need, maxb, sl, alloc);
-    if params.variant == Variant::Cfg3 {
+    if params.escapes() {
         digital_black(sf, maxb, s, alternate, alloc);
     }
     for (b, &v) in out.iter_mut().zip(alloc.iter()) {
@@ -335,6 +337,10 @@ mod tests {
         variant: Variant::Cfg3,
         ..CFG0
     };
+    const CFG4: Params = Params {
+        variant: Variant::Cfg4,
+        ..CFG0
+    };
     const CFG3_96K: Params = Params {
         variant: Variant::Cfg3,
         sample_rate: 96_000,
@@ -348,6 +354,8 @@ mod tests {
         // Clamped to 350000·2.
         assert_eq!(pool(CFG0, 2_000_000), pool(CFG0, 700_000));
         assert_eq!(pool(CFG3, 1), pool(CFG3, 90_000));
+        // Config 4 caps the pool at 210000·2 (§10.F).
+        assert_eq!(pool(CFG4, 600_000), pool(CFG4, 420_000));
     }
 
     #[test]
@@ -358,6 +366,8 @@ mod tests {
         assert_eq!(max_bits(CFG0, 370_000, false), MAX_BITS_4BAND_MAX);
         assert_eq!(max_bits(CFG3, 420_000, false), MAX_BITS_8BAND_520);
         assert_eq!(max_bits(CFG3, 250_000, true), MAX_BITS_8BAND_MAX);
+        assert_eq!(max_bits(CFG4, 250_000, true), MAX_BITS_8BAND_420);
+        assert_eq!(max_bits(CFG4, 420_000, false), MAX_BITS_8BAND_520);
         assert_eq!(max_bits(CFG3_96K, 420_000, false), MAX_BITS_8BAND_96K_500);
         assert_eq!(max_bits(CFG3_96K, 820_000, false), MAX_BITS_8BAND_96K_MAX);
     }
