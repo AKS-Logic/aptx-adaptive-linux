@@ -380,3 +380,11 @@ Originally:
 ## adaptive bitrate live (2026-10-13 13:14, after #25)
 
 HQ on the Px7: 1 s after start PipeWire's `increase_bitpool` stepped the level 3 → 4 (364k → 427k, 12 ms). It held at 4 for minutes with no backlog growth, and drift settled as normal. Walking around the apartment never backed the socket up enough for `reduce_bitpool`, so the step down is covered only by the synthetic tests and vectors. Note: on a clean link this sits at L4, not the reference's L3 start, because PipeWire raises the level whenever there's been no backlog for a second.
+
+## aptX slot live (2026-10-14, after #26)
+
+Installed with `APTX_ADAPTIVE_SLOT=aptx`, default `ll`. The plugin logged "aptX passthrough: 6 codecs from /usr/lib/spa-0.2/bluez5/libspa-codec-bluez5-aptx.so".
+- **Host connect on the Px7:** `a2dp-sink` = "aptX Adaptive (Low Latency)" became active, with `api.bluez5.codec = aptx_adaptive_ll` and quality 1. The `aptx_hd` and `aptx` profiles are gone from the card.
+- **Profile switches:** LL → HQ (`aptx_adaptive`) → LL worked.
+- **Guard:** it didn't fire. That's expected on a host-initiated connect.
+- **Not yet tested live:** the headset choosing aptX HD itself, since the Px7 doesn't reconnect by itself here.
