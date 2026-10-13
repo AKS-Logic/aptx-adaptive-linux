@@ -600,20 +600,22 @@ unsafe extern "C" fn codec_abr_process(data: *mut c_void, unsent: usize) -> c_in
 /// One level down from the next packet (§7L); returns the level that will run, or `-ENOTSUP`
 /// for a replay session (the convention of SBC, LDAC and aptX in PipeWire).
 unsafe extern "C" fn codec_reduce_bitpool(data: *mut c_void) -> c_int {
-    step_level(data, true)
+    // SAFETY: PipeWire passes the pointer from init.
+    unsafe { step_level(data, true) }
 }
 
 /// Called after a send with an empty socket queue, at most every 1 s since the last change. One
 /// level up, otherwise as [`codec_reduce_bitpool`].
 unsafe extern "C" fn codec_increase_bitpool(data: *mut c_void) -> c_int {
-    step_level(data, false)
+    // SAFETY: PipeWire passes the pointer from init.
+    unsafe { step_level(data, false) }
 }
 
-fn step_level(data: *mut c_void, down: bool) -> c_int {
-    if data.is_null() {
-        return -EINVAL;
-    }
-    // SAFETY: PipeWire passes the pointer from init.
+/// # Safety
+/// As for [`session`].
+unsafe fn step_level(data: *mut c_void, down: bool) -> c_int {
+    // SAFETY: caller contract; PipeWire passes the pointer from init, as to every other
+    // session callback.
     match unsafe { session(data) }.step_level(down) {
         Ok(l) => c_int::from(l),
         Err(e) => session_err(e),

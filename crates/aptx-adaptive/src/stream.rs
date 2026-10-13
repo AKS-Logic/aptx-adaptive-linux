@@ -56,7 +56,9 @@ pub struct Stream<C> {
     window: Vec<u8>,
     consumed: usize,
     deficit: i64,
-    /// The packet budget other levels' rows are fitted to: the starting row's packet size.
+    /// The link's packet budget, which other levels' rows are capped to (§7J, §7L.1 item 3:
+    /// from the budget before rounding). [`Stream::with_core`] assumes the starting row's
+    /// packet size; [`Stream::new`] and [`Stream::with_budget`] set the real one.
     budget: usize,
     /// Quality level of `row` (§7L).
     level: u8,
@@ -82,7 +84,7 @@ impl Stream<Encoder> {
     pub fn new(config: Config, budget: usize) -> Result<Self> {
         let row = table_row(config, budget)?;
         let core = Encoder::new(config, row.bitrate)?;
-        Ok(Self::with_core(core, config, row))
+        Ok(Self::with_core(core, config, row).with_budget(budget))
     }
 }
 
@@ -93,19 +95,21 @@ impl Stream<Encoder> {
 /// fitted row's bitrate is below what the encoder runs at, which would grow the backlog every
 /// period (`codec-core.md` §8.8, [`crate::min_packet_bytes`]).
 pub fn table_row(config: Config, budget: usize) -> Result<Row> {
-    level_row(config, budget, DEFAULT_QUALITY)
+    table_row_at_level(config, budget, DEFAULT_QUALITY)
 }
 
-/// [`table_row`] for quality `level`.
+/// [`table_row`] for quality `level`. HQ rows are capped to `budget` (§7J, recomputed per
+/// level, §7L.1); LL rows never are, so one that doesn't fit is refused.
 ///
 /// # Errors
-/// As for [`table_row`], and `UnsupportedConfig` for a level outside 1..=7.
-pub fn level_row(config: Config, budget: usize, level: u8) -> Result<Row> {
+/// As for [`table_row`], `UnsupportedConfig` for a level outside 1..=7, and
+/// `PacketTooSmall` for an LL row bigger than `budget`.
+pub fn table_row_at_level(config: Config, budget: usize, level: u8) -> Result<Row> {
     let index = tables::index(config.profile, config.level, Link::default());
     let row = tables::row(config.profile, index, level)
         .ok_or(Error::UnsupportedConfig)?
-        .fit(budget);
-    if row.bitrate < crate::min_bitrate(config)? {
+        .fit(config.profile, budget);
+    if row.packet_bytes > budget || row.bitrate < crate::min_bitrate(config)? {
         return Err(Error::PacketTooSmall);
     }
     Ok(row)
@@ -137,9 +141,10 @@ impl<C: Core> Stream<C> {
         }
     }
 
-    /// Switches to `config` and `row` in place (§7K): resets the core and zeroes the loop
-    /// counters. Queued input is kept. No allocation, given a core whose reset doesn't
-    /// allocate. On error nothing changes.
+    /// Switches to `config` and `row` in place (§7K): resets the core, zeroes the loop
+    /// counters, sets the level to 3 and drops any pending or held level request. Queued input
+    /// is kept. No allocation, given a core whose reset doesn't allocate. On error nothing
+    /// changes.
     ///
     /// # Errors
     /// Whatever the core's reset returns.
@@ -151,13 +156,28 @@ impl<C: Core> Stream<C> {
             row.interleaved_samples(config.sample_rate, config.channels.into());
         self.consumed = 0;
         self.deficit = 0;
-        self.budget = row.packet_bytes;
+        // The budget is the link's, so it stays; it only has to hold the new row.
+        self.budget = self.budget.max(row.packet_bytes);
         // §7K: a switch resets the level to 3; a request that waited for it is dropped.
         self.level = DEFAULT_QUALITY;
         self.pending = None;
         self.bitrate = row.bitrate;
         self.before_step = (row, self.samples_per_packet, DEFAULT_QUALITY, row.bitrate);
         Ok(())
+    }
+
+    /// The link's packet budget (from [`crate::packet_budget`]), which the starting row was
+    /// fitted to. Other levels' HQ rows are capped to it.
+    #[must_use]
+    pub fn with_budget(mut self, budget: usize) -> Self {
+        self.budget = budget.max(self.row.packet_bytes);
+        self
+    }
+
+    /// See [`Stream::with_budget`].
+    #[must_use]
+    pub fn budget(&self) -> usize {
+        self.budget
     }
 
     /// The quality level the stream runs at (§7L).
@@ -177,7 +197,7 @@ impl<C: Core> Stream<C> {
     /// encoder's floor, or a different packet size (fixed until a reset).
     #[must_use]
     pub fn level_row(&self, level: u8) -> Option<Row> {
-        let row = level_row(self.config, self.budget, level).ok()?;
+        let row = table_row_at_level(self.config, self.budget, level).ok()?;
         (row.packet_bytes == self.row.packet_bytes).then_some(row)
     }
 
@@ -197,7 +217,10 @@ impl<C: Core> Stream<C> {
         true
     }
 
-    /// While `hold` is set, a pending level request waits (§7L: during an HQ↔LL switch).
+    /// While `hold` is set, a pending level request waits (§7L: during an HQ↔LL switch). A
+    /// request still held when [`Stream::reset`] runs is dropped: the switch runs level 3.
+    /// If the switch is called off instead, release the hold and it applies after the next
+    /// packet.
     pub fn hold_level(&mut self, hold: bool) {
         self.hold = hold;
     }

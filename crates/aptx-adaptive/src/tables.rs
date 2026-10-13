@@ -54,25 +54,38 @@ impl Row {
         (u64::from(self.period_ms) * u64::from(rate) * u64::from(channels) / 1000) as usize
     }
 
-    /// Rounds the packet size down to a multiple of 4 and fits it in `budget` (§4). The
-    /// recomputed bitrate is the spec's "roughly" formula.
+    /// Rounds the packet size down to a multiple of 4 and, for an HQ row, fits it in `budget`
+    /// (§4, §7J, §7L.1 item 3): the packet becomes the budget rounded down to a multiple of
+    /// 4, the period stays, and the bitrate is [`capped_bitrate`] of the unrounded budget.
+    /// LL rows are never capped; one that doesn't fit is left for the caller to refuse.
     #[must_use]
-    pub fn fit(self, budget: usize) -> Self {
+    pub fn fit(self, profile: Profile, budget: usize) -> Self {
         let size = self.packet_bytes & !3;
-        if size <= budget {
+        if size <= budget || profile == Profile::Ll {
             return Self {
                 packet_bytes: size,
                 ..self
             };
         }
-        let size = budget & !3;
-        let bits_per_s = size as u64 * 8 * 1000 / u64::from(self.period_ms);
         Self {
-            packet_bytes: size,
-            bitrate: (bits_per_s as u32).saturating_sub(25_000),
+            packet_bytes: budget & !3,
+            bitrate: capped_bitrate(budget, self.period_ms),
             ..self
         }
     }
+}
+
+/// The §7J MTU-cap bitrate exactly as the reference computes it (§7L.1 item 3), in single
+/// precision: trunc(float32(budget·8000 / `period_ms`) − 25000.0). Negative results (a budget
+/// far below anything the encoder can run) become 0.
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "single precision is the spec; budgets (≤ 2008) and periods (≤ 50) are exact in it"
+)]
+pub fn capped_bitrate(budget: usize, period_ms: u32) -> u32 {
+    let per_s = (budget as f32 * 8000.0) / period_ms as f32;
+    (per_s - 25_000.0).trunc().max(0.0) as u32
 }
 
 /// Packet budget for a link MTU: room for the 8-byte header, clamped to 128..=2008 (§2), then
@@ -314,14 +327,55 @@ mod tests {
 
     #[test]
     fn fit_keeps_rows_that_fit() {
-        assert_eq!(PX7.fit(656), PX7);
+        assert_eq!(PX7.fit(Profile::Hq, 656), PX7);
     }
 
+    /// §7J: the bitrate comes from the budget before rounding (498, not 496); the period
+    /// stays.
     #[test]
     fn fit_shrinks_packet_and_bitrate() {
-        let r = PX7.fit(498);
+        let r = PX7.fit(Profile::Hq, 498);
         assert_eq!(r.packet_bytes, 496);
-        assert_eq!(r.bitrate, 496 * 8000 / 14 - 25_000);
+        assert_eq!(r.bitrate, 498 * 8000 / 14 - 25_000);
+        assert_ne!(r.bitrate, 496 * 8000 / 14 - 25_000);
         assert_eq!(r.period_ms, 14);
+    }
+
+    /// §7L.1 item 3: LL rows are never capped.
+    #[test]
+    fn fit_leaves_ll_rows() {
+        let ll = row(Profile::Ll, 2, 1).unwrap();
+        assert_eq!(ll.fit(Profile::Ll, 400), ll);
+    }
+
+    /// The float32 cap against the integer form ⌊budget·8000 / period⌋ − 25000, for every
+    /// budget [`packet_budget`] can give (128..=1032, and up to 2008 before the packet-header
+    /// clamp) and every period in the tables. They never differ while the result is positive:
+    /// budget·8000 < 2^24 is exact in float32 and the division is correctly rounded, so the
+    /// quotient q = n + k/p (0 ≤ k < p) lands within q·2^-24 < 8000·2097/p·2^-24 < 1/p of
+    /// itself and never rounds across an integer; subtracting 25000 is then exact. They can
+    /// only differ below 0 (trunc vs floor), which is clamped to 0 here and is far under any
+    /// encoder's floor, so `PacketTooSmall` rejects it either way.
+    #[test]
+    fn capped_bitrate_float32_matches_integer() {
+        let periods: Vec<u32> = HQ
+            .iter()
+            .chain(&LL)
+            .flatten()
+            .map(|r| r.period_ms)
+            .collect();
+        for budget in 12..=2008 {
+            for &p in &periods {
+                let int = (budget as u64 * 8000 / u64::from(p)) as i64 - 25_000;
+                let f = capped_bitrate(budget, p);
+                if int >= 0 {
+                    assert_eq!(i64::from(f), int, "budget {budget} period {p}");
+                } else {
+                    assert_eq!(f, 0);
+                }
+            }
+        }
+        // The Px7 at a 600-byte MTU (budget 588) on its 12 ms level-4 row.
+        assert_eq!(capped_bitrate(588, 12), 367_000);
     }
 }

@@ -126,8 +126,6 @@ pub struct Session<C> {
     /// Whether `reduce_bitpool` / `increase_bitpool` change the level. Off for replay, whose
     /// packets are what they are.
     abr: bool,
-    /// Whether level changes are logged (off in unit tests).
-    log: bool,
     /// The level and row bitrate last logged (or started with).
     logged: (Profile, (u8, u32)),
 }
@@ -135,6 +133,8 @@ pub struct Session<C> {
 /// `reduce_bitpool` never goes below this level (§7L); level 1 is treated as 2 anyway.
 const MIN_LEVEL: u8 = 2;
 const MAX_LEVEL: u8 = 7;
+/// §7K: the level every stream starts at and every HQ↔LL switch resets to.
+const DEFAULT_LEVEL: u8 = 3;
 
 fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
@@ -148,9 +148,14 @@ fn link_row(level: DecoderLevel, profile: Profile, mtu: usize) -> Option<Row> {
 
 /// Every row a level change can reach from `row` (§7L): levels 2..=7 of `profile`'s table
 /// index with the same packet size.
-fn level_rows(level: DecoderLevel, profile: Profile, row: Row) -> impl Iterator<Item = Row> {
+fn level_rows(
+    level: DecoderLevel,
+    profile: Profile,
+    row: Row,
+    budget: usize,
+) -> impl Iterator<Item = Row> {
     (MIN_LEVEL..=MAX_LEVEL).filter_map(move |l| {
-        aptx_adaptive::level_row(config(level, profile), row.packet_bytes, l)
+        aptx_adaptive::table_row_at_level(config(level, profile), budget, l)
             .ok()
             .filter(|r| r.packet_bytes == row.packet_bytes)
     })
@@ -213,7 +218,10 @@ impl Session<AnyCore> {
                 AnyCore::Replay(replay)
             }
         };
-        let mut s = Self::with_stream(Stream::with_core(core, config, row), mtu)?;
+        let mut s = Self::with_stream(
+            Stream::with_core(core, config, row).with_budget(budget(mtu)),
+            mtu,
+        )?;
         if opts.replay.is_some() {
             // Whole packets per block, as before, and no switching.
             s.pcm = vec![0; s.stream.samples_per_packet()];
@@ -249,7 +257,7 @@ impl<C: Core> Session<C> {
             .iter()
             .zip(rows)
             .filter_map(|(&p, r)| r.map(|r| (p, r)))
-            .flat_map(|(p, r)| std::iter::once(r).chain(level_rows(c.level, p, r)))
+            .flat_map(|(p, r)| std::iter::once(r).chain(level_rows(c.level, p, r, stream.budget())))
             .map(|r| r.interleaved_samples(c.sample_rate, c.channels.into()))
             .fold(0, gcd);
         let (stream_level, stream_bitrate) = (stream.level(), stream.row().bitrate);
@@ -265,7 +273,6 @@ impl<C: Core> Session<C> {
             fade: Fade::StartMute(0),
             refused: 0,
             abr: true,
-            log: !cfg!(test),
             logged: (c.profile, (stream_level, stream_bitrate)),
         })
     }
@@ -281,8 +288,12 @@ impl<C: Core> Session<C> {
     /// row are stepped over (R1 HQ 4–7), so the ceiling is the last level with a new row: 4
     /// on R1 HQ. A step onto a row with the same bitrate but another period (R2 LL index 2,
     /// 3 → 4) is never taken. In R1 LL every level is the same row, so nothing changes.
-    /// Steps from a pending request, so repeated calls between packets keep stepping. During
-    /// an HQ↔LL switch the request waits and the switch's reset to level 3 drops it.
+    /// Steps from a pending request, so repeated calls between packets keep stepping.
+    ///
+    /// During an HQ↔LL switch the request is held, not applied (§7L), and the switch's
+    /// in-place reset drops it and runs level 3 (§7K), so 3 is returned. That assumes the
+    /// switch completes: if it's reversed before its reset there is no reset, and the held
+    /// request applies after the next packet once the switch is over.
     ///
     /// Returns the level that will be running, like SBC's bitpool. Never allocates.
     ///
@@ -315,16 +326,28 @@ impl<C: Core> Session<C> {
         } else {
             (from + 1..=MAX_LEVEL).find_map(&mut next)
         };
-        let Some(l) = found.flatten().filter(|&l| self.stream.request_level(l)) else {
+        let stored = found.flatten().filter(|&l| self.stream.request_level(l));
+        if self.hold_level_if_switching() {
+            // The switch's reset will run level 3 and drop the held request.
+            return Ok(DEFAULT_LEVEL);
+        }
+        let Some(l) = stored else {
             return Ok(from);
         };
         // media-sink calls this between packets, so the next packet already uses the new row
-        // (§7L "next packet boundary").
-        self.stream.hold_level(self.target != self.profile());
+        // (§7L "next packet boundary", §7L.1 item 1).
         if self.stream.apply_level_now() {
             self.log_level();
         }
         Ok(l)
+    }
+
+    /// §7L: a level request waits while an HQ↔LL switch is in progress. Returns whether one
+    /// is.
+    fn hold_level_if_switching(&mut self) -> bool {
+        let switching = self.target != self.profile();
+        self.stream.hold_level(switching);
+        switching
     }
 
     /// Whether this link can run `profile`: the encoder has a row for it (R1 LL is config 0,
@@ -422,7 +445,8 @@ impl<C: Core> Session<C> {
         if now == self.logged.1 {
             return;
         }
-        if self.log && self.logged.0 == self.profile() {
+        // Unit tests write nothing: this goes straight to fd 2, past the test harness.
+        if !cfg!(test) && self.logged.0 == self.profile() {
             let _ = std::io::stderr().write(level_line(self.logged.1, now).as_bytes());
         }
         self.logged = (self.profile(), now);
@@ -537,8 +561,7 @@ impl<C: Core> Session<C> {
             *s = (i32::from_ne_bytes(*b) << 8) >> 8;
         }
         self.apply_fade();
-        // §7L: a level request waits while an HQ↔LL switch is in progress.
-        self.stream.hold_level(self.target != self.profile());
+        self.hold_level_if_switching();
         let written = self.stream.push(&self.pcm, &mut dst[..room])?;
         if written.is_some() {
             self.log_level();
@@ -1265,8 +1288,8 @@ mod tests {
         assert_eq!(s.level(), 3);
     }
 
-    /// §7K/§7L: a step during an HQ↔LL switch waits, and the switch's reset puts the level to
-    /// 3 and drops it.
+    /// §7K/§7L: a step during an HQ↔LL switch is held, the switch's reset drops it and runs
+    /// level 3, and the call says so: 3, not the level it would have stepped to.
     #[test]
     fn level_waits_for_switch() {
         let mut s = session();
@@ -1274,7 +1297,10 @@ mod tests {
         headers(&mut s, 1);
         assert_eq!(s.level(), 4);
         s.request(Profile::Ll).unwrap();
+        assert_eq!(s.step_level(false), Ok(3));
         assert_eq!(s.step_level(true), Ok(3));
+        assert_eq!(s.stream.pending_level(), Some(3));
+        assert_eq!(s.level(), 4);
         let src = level_block(&s, 0);
         let mut dst = vec![0u8; 2048];
         let mut hdr = [0u8; 64];
@@ -1301,6 +1327,20 @@ mod tests {
         assert_eq!(s.stream.samples_per_packet(), 1344);
     }
 
+    /// A switch reversed before its reset has no reset: the held step applies once the
+    /// switch is over.
+    #[test]
+    fn held_level_applies_when_switch_reverses() {
+        let mut s = session();
+        s.request(Profile::Ll).unwrap();
+        assert_eq!(s.step_level(true), Ok(3));
+        headers(&mut s, 1);
+        assert_eq!((s.level(), s.stream.pending_level()), (3, Some(2)));
+        s.request(Profile::Hq).unwrap();
+        headers(&mut s, 1);
+        assert_eq!((s.level(), s.stream.pending_level()), (2, None));
+    }
+
     #[test]
     fn level_log_line() {
         let line = level_line((3, 364_000), (2, 318_000));
@@ -1311,11 +1351,10 @@ mod tests {
     }
 
     /// A level change on the data thread doesn't allocate: the call, the packet that applies
-    /// it, and the log line.
+    /// it, and formatting the log line (unit tests don't write it).
     #[test]
     fn level_change_does_not_allocate() {
         let mut s = Session::new(DecoderLevel::R1, Profile::Hq, MTU).unwrap();
-        s.log = true;
         let src: Vec<u8> = sine_pcm(96);
         let mut buf = vec![0u8; 2048];
         for _ in 0..100 {
@@ -1327,6 +1366,7 @@ mod tests {
                 while !s.encode(&src, &mut buf).unwrap().flush {}
                 s.start_encode(&mut buf, 0, 0).unwrap();
             }
+            std::hint::black_box(level_line((3, 364_000), (2, 318_000)));
         });
         assert_eq!(count, 0);
         assert_eq!(s.level(), 3);
