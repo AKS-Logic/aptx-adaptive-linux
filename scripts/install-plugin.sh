@@ -6,6 +6,9 @@
 #   scripts/install-plugin.sh               install or update
 #   scripts/install-plugin.sh --uninstall   remove the plugin and every drop-in we write
 #
+# --uninstall removes directories the install created only if they're empty, and leaves
+# ~/.local/lib and ${XDG_CONFIG_HOME:-~/.config}/systemd/user in place.
+#
 # Needs cargo, pkg-config with libspa-0.2, and python3 (not for --uninstall).
 # CARGO_FEATURES (optional) is passed to cargo build --features, e.g. dev-replay.
 # APTX_ADAPTIVE_SLOT (optional, default ldac) picks the codec id the plugin claims
@@ -61,6 +64,7 @@ case ${1-} in
 "") ;;
 *)
 	echo "usage: $0 [--uninstall]" >&2
+	echo '  --uninstall leaves ~/.local/lib and ${XDG_CONFIG_HOME:-~/.config}/systemd/user in place' >&2
 	exit 2
 	;;
 esac

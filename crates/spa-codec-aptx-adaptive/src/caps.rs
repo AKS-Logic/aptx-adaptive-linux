@@ -22,6 +22,7 @@ const RATE_48K: u8 = 0x10;
 
 /// Byte 6 bits 0..2: independent flags (§7J). 0x01 is the sink's own and never sent.
 const SOURCE_TYPE_MASK: u8 = 0x07;
+const SOURCE_TYPE_SINK: u8 = 0x01;
 /// The sink times playback itself. A host encoder always sends this, never the sink's bits
 /// (§7E, §7J).
 pub const SOURCE_TYPE_HOST: u8 = 0x02;
@@ -48,6 +49,7 @@ const TTP_DEFAULTS: [u8; 6] = [0x50, 0x64, 0x64, 0x64, 0xff, 0xff];
 /// Our features word, the public R2.0 value (§1.2): no TWM, split TX/ACK or 2.2 codec, and no
 /// RSSI or ELL adjustment. In a configuration its low byte becomes ours & the sink's (§7J).
 const FEATURES_R2_0: u32 = 0x0F00_0000;
+const FEATURES_LOW_BYTE: u32 = 0xff;
 
 /// Body 8..16 for an R1 source (§1.4): TTP defaults, reserved, end marker.
 const R1_DATA: [u8; 9] = {
@@ -118,8 +120,13 @@ impl<'a> Caps<'a> {
 
     /// The R2 features word. Only meaningful at [`DecoderLevel::R2`].
     fn features(self) -> u32 {
-        let tail = &self.0[FEATURES..];
-        u32::from_le_bytes(*tail.first_chunk().expect("caps are CAPS_LEN bytes"))
+        let b = self.0;
+        u32::from_le_bytes([
+            b[FEATURES],
+            b[FEATURES + 1],
+            b[FEATURES + 2],
+            b[FEATURES + 3],
+        ])
     }
 }
 
@@ -147,7 +154,7 @@ pub fn fill_caps() -> Vec<u8> {
 }
 
 /// Picks 48 kHz and one 2-channel mode and puts `source_type` (normally [`SOURCE_TYPE_HOST`])
-/// in byte 6 bits 0..2 (§7E). Then, per §7J:
+/// in byte 6 bits 1..2 (§7E); the sink flag 0x01 is always cleared. Then, per §7J:
 /// - an R2 sink gets our own block ([`r2_data`]), with the features low byte set to ours & the
 ///   sink's;
 /// - an R1 sink gets its own body 8..25 back, except that with [`SOURCE_TYPE_HOST`] a zero
@@ -168,17 +175,18 @@ pub fn select_config(bytes: &[u8], source_type: u8) -> Result<Vec<u8>, CapsError
         .into_iter()
         .find(|m| caps.channel_modes() & m != 0)
         .ok_or(CapsError::Unsupported)?;
-    let source_type = source_type & SOURCE_TYPE_MASK;
+    let source_type = source_type & SOURCE_TYPE_MASK & !SOURCE_TYPE_SINK;
     let rate = RATE_48K | source_type;
     let config = match caps.decoder_level() {
         DecoderLevel::R2 => {
             // Our low byte is 0, so the AND is always 0; that's what §7J asks for.
-            let features = FEATURES_R2_0 & !0xff | FEATURES_R2_0 & caps.features() & 0xff;
+            let features = (FEATURES_R2_0 & !FEATURES_LOW_BYTE)
+                | (FEATURES_R2_0 & caps.features() & FEATURES_LOW_BYTE);
             element(bytes.len(), rate, mode, &r2_data(features))
         }
         DecoderLevel::R1 => {
             let mut c = element(bytes.len(), rate, mode, &caps.0[APTX_DATA..R2_DATA_END]);
-            if source_type == SOURCE_TYPE_HOST {
+            if source_type & SOURCE_TYPE_HOST != 0 {
                 for (i, default) in TARGET_LATENCY_DEFAULTS {
                     if c[i] == 0 {
                         c[i] = default;
@@ -306,8 +314,8 @@ mod tests {
         assert_eq!(select_config_host(&PX7_S2E[..39]), Err(CapsError::Invalid));
     }
 
-    /// §7J: an R2 sink gets our block, not its own, whatever TTP bytes and setup preferences it
-    /// lists. Our features low byte is 0, so the AND is too.
+    /// §7J: an R2 sink gets our block, not its own, whatever TTP bytes (here a zero HQ byte)
+    /// and setup preferences it lists. Our features low byte is 0, so the AND is too.
     #[test]
     fn r2_select_config_sends_own_block() {
         let mut caps = r2_caps(0x0F00_0017);
@@ -427,6 +435,10 @@ mod tests {
         let mut caps = PX7_S2E;
         caps[RATES] = 0x17;
         assert_eq!(select_config(&caps, 2).unwrap()[RATES], 0x12);
+        // The sink flag 0x01 is never sent; the host bit is tested on its own (§7J).
+        let config = select_config(&PX7_S2E, 0x03).unwrap();
+        assert_eq!(config[RATES], 0x12);
+        assert_eq!(config, PX7_S2E_CONFIG);
     }
 
     /// §7G: with source type 2 a zero latency byte gets a default; others are echoed.
@@ -448,9 +460,6 @@ mod tests {
             select_config_host(&caps).unwrap()[8..14],
             [0x50, 0x22, 0x33, 0x44, 0, 0x22]
         );
-        let mut r2 = r2_caps(0x0F00_0003);
-        r2[10] = 0;
-        assert_eq!(select_config_host(&r2).unwrap()[10], 0x64);
     }
 
     /// Source type 0 echoes the sink's bytes, zeros included.

@@ -2,7 +2,7 @@
 //! `codec_order` ranks it (`docs/adr/0002-codec-autoselect.md`).
 //!
 //! `APTX_ADAPTIVE_SLOT=ldac|lc3plus_hr`, set by `scripts/install-plugin.sh` in the
-//! wireplumber/pipewire drop-ins. Read in every build.
+//! wireplumber/pipewire drop-ins. Not a dev switch: it's read with or without `dev-replay`.
 
 use std::ffi::OsString;
 

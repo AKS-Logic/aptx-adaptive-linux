@@ -66,13 +66,13 @@ Conclusion: the chime doesn't separate layouts. It seems tied to the restart and
 
 ## todo once audio works
 
-- Make aptX Adaptive the default for aptX Adaptive sinks locally. A WirePlumber rule that sets the device's default profile to `a2dp-sink-aptx_adaptive`, installed by `scripts/install-plugin.sh`, is enough. Upstreaming is parked; the patch is on branch `upstream-adr` (PR #5, closed).
+- **Superseded by `docs/adr/0002-codec-autoselect.md`:** a WirePlumber rule can't do it; the LDAC slot does. Originally: make aptX Adaptive the default for aptX Adaptive sinks locally. A WirePlumber rule that sets the device's default profile to `a2dp-sink-aptx_adaptive`, installed by `scripts/install-plugin.sh`, is enough. Upstreaming is parked; the patch is on branch `upstream-adr` (PR #5, closed).
 
 ## live test round 3: ttp-clock (2026-10-12)
 
 - btmon confirms the on-air RTP: `80 60 seq seq <ts BE> 00 00 00 ae`, with the timestamp stepping by 14000 (0x36b0) per packet from 0. AVDTP Start was accepted, the headset stayed connected through 12 s of streaming, and played **silence**.
 - ttp-clock with PT 0: inconclusive. The headset was already dropping the link repeatedly.
-- The repeated drops came from WirePlumber saving `a2dp-sink-aptx_adaptive` as the device's default profile, so every reconnect went straight into a non-working stream. Switching back to `a2dp-sink` (aptX HD) fixed it. **Live tests must restore `a2dp-sink` when they finish.** The install script should never leave aptX Adaptive as the saved default until it works.
+- The repeated drops came from WirePlumber saving `a2dp-sink-aptx_adaptive` as the device's default profile, so every reconnect went straight into a non-working stream. Switching back to `a2dp-sink` (aptX HD) fixed it. **Live tests must restore `a2dp-sink` when they finish.** ~~The install script should never leave aptX Adaptive as the saved default until it works.~~ Superseded: the LDAC slot makes aptX Adaptive the default by design (`docs/adr/0002-codec-autoselect.md`).
 - An advancing µs timestamp alone doesn't fix the silence.
 
 ## live test round 4: §7C layout, fair test (2026-10-12)
@@ -289,6 +289,7 @@ Resolved by `codec-core.md` §10 (2026-10-13): config 4 (§10.F; "from codec-cor
 6. **Config 4 not covered:** 88.2/96 kHz (encoder accepts, source never creates), mono, and the split-TX LL rows. Also, is config 4's 4-bit allocation header ever given the "+4" bit that configs 0/1 have for channel config 2?
 7. **§8.6 step 5.4 top-up** (digital-black total of 1 to 6): still not shown to fire in any vector, including the alternate-flag rows where channel 1 is zeroed. Is it reachable?
 8. **Config 4 at most 9 bits per band** is stated for "any rate a source can reach (target ≤ 5/4 × 320000)". With `max_bits_8band_420` as the tonal override and the non-tonal chain capped at that rate, confirm the bound also holds for mono (r = 2R) if mono is ever used.
+   - **Answered by `codec-core.md` §10.K:** the reference doesn't cap; it gives a band 10 bits and produces an undecodable packet. Forcing the 420 table is the correct rule. Originally: **deviation from the literal §8.3 chain:** for config 4 we also use `max_bits_8band_420` (all 9s) once the target reaches 420000, i.e. nominal ≥ 336000 after the 5/4 scaling, instead of letting the non-tonal chain go on to `max_bits_8band_520` and the max table. Config 4 has no allocation escapes, so bands over 9 bits couldn't be coded. Does the reference allocate more than 9 bits there (and if so, how is it coded), or does it cap it some other way?
 9. **The three-quarter cut (§10.H)** has no verified effect on any byte. For HQ rows above 266666 bps with an under-feeding caller it would act; is there a vector for that, or should the plugin just never under-feed?
 10. `codec-core.md` §8 still lists "five more HQ table rows" and "five LL table rows" checked without clean-side vectors. Are those the same runs now shipped in `tests/vectors/parity/`, or different ones?
 
@@ -300,7 +301,7 @@ Resolved by `codec-core.md` §10 (2026-10-13): config 4 (§10.F; "from codec-cor
 - Question: should a source endpoint advertise the R2 extension? If so, is it safe against R1 sinks that configure from our caps?
 - Limitation: PipeWire's `validate_config` and `init` only get the configuration bytes, not the remote endpoint's caps, so the decoder level can only come from the config's extension byte (body 15). A sink-initiated config that wrongly carries 1 there would get R2. With R1 caps advertised this shouldn't happen. Is there a rule for a sink-chosen config that disagrees with the sink's own caps?
 - Question: §7J says a source always sends its own source type, but a sink-initiated stream (the sink sends SetConfiguration to our endpoint) could carry 0. `validate_config` accepts it and we stream with the host (type 2) RTP rules anyway, since we can't produce link-clock timestamps. Should it be rejected instead, or is accepting right?
-- Question: the features word above byte 0. We send 0x0F in byte 3 like every public word; is that right for a source, and should bytes 1..2 (RSSI / ELL adjust) be zero?
+- Question: bytes 1..3 of the features word. We send 0x0F in byte 3 like every public word; is that right for a source, and should bytes 1..2 (RSSI / ELL adjust) be zero?
 
 ## codec switch chime on connect: aptX Adaptive configured first (2026-10-13, clean side)
 
