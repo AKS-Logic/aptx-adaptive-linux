@@ -29,7 +29,11 @@ pub const MAX_WIDTH: usize = MAX_SUBBANDS * CHANNELS;
 pub enum Variant {
     /// R1 HQ.
     Cfg0,
-    /// R1 LL, "low-power" mode.
+    /// Create profile 1, "low-power" mode. No sink gets it (§10.D); only tests build it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "only the config 1 vector tests create it")
+    )]
     Cfg1,
     /// R2 HQ.
     Cfg3,

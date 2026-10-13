@@ -85,10 +85,11 @@ impl fmt::Debug for Encoder {
     }
 }
 
-/// The bitstream variant for a config (`codec-core.md` §1, §10.D, §10.F): HQ at 88.2/96 kHz
-/// is config 3 whatever the decoder level; LL there isn't allowed. LL with an R2 sink is
-/// config 4. `Profile::Ll` with an R1 sink is the low-power config 1 (create profile 1); the
-/// reference source runs an R1 sink in LL with the HQ encoder (config 0) instead.
+/// The bitstream variant for a config (`codec-core.md` §1, §10.D, §10.F,
+/// `a2dp-integration.md` §7J): HQ at 88.2/96 kHz is config 3 whatever the decoder level; LL
+/// there isn't allowed. An R1 sink gets config 0 in both modes (in LL on the LL table row,
+/// with the LL loop), and an R2 sink in LL gets config 4. The low-power config 1 (create
+/// profile 1) is never given to a sink, so it's only reachable from tests.
 fn params(config: Config) -> Result<Params> {
     let high_rate = match config.sample_rate {
         44_100 | 48_000 => false,
@@ -97,8 +98,7 @@ fn params(config: Config) -> Result<Params> {
     };
     let variant = match (config.profile, config.level, high_rate) {
         (Profile::Hq, _, true) | (Profile::Hq, DecoderLevel::R2, false) => Variant::Cfg3,
-        (Profile::Hq, DecoderLevel::R1, false) => Variant::Cfg0,
-        (Profile::Ll, DecoderLevel::R1, false) => Variant::Cfg1,
+        (_, DecoderLevel::R1, false) => Variant::Cfg0,
         (Profile::Ll, DecoderLevel::R2, false) => Variant::Cfg4,
         (Profile::Ll, _, true) => return Err(Error::UnsupportedConfig),
     };
@@ -125,6 +125,7 @@ pub fn min_bitrate(config: Config) -> Result<u32> {
 pub fn delay_frames(config: Config) -> Result<Option<u32>> {
     Ok(match params(config)?.variant {
         Variant::Cfg0 => Some(90),
+        // Unreachable from `params`, kept for completeness.
         Variant::Cfg1 => Some(66),
         Variant::Cfg3 => Some(255),
         Variant::Cfg4 => None,
@@ -146,17 +147,35 @@ pub fn min_packet_bytes(config: Config, period_ms: u32) -> Result<usize> {
 
 impl Encoder {
     /// # Errors
-    /// `UnsupportedConfig` for anything but stereo configs 0, 1, 3 and 4 at their sample
-    /// rates, or a zero bitrate.
+    /// `UnsupportedConfig` for anything but stereo configs 0, 3 and 4 at their sample rates,
+    /// or a zero bitrate.
     pub fn new(config: Config, bitrate: u32) -> Result<Self> {
+        Self::with_params(config, params(config)?, bitrate)
+    }
+
+    fn with_params(config: Config, params: Params, bitrate: u32) -> Result<Self> {
         if config.channels != 2 || bitrate == 0 {
             return Err(Error::UnsupportedConfig);
         }
         Ok(Self {
-            params: params(config)?,
+            params,
             bitrate,
             packetiser: None,
         })
+    }
+
+    /// The low-power config 1 encoder (create profile 1, `codec-core.md` §10.D), which no sink
+    /// gets from a source; only for the config 1 vectors. 44.1/48 kHz only.
+    #[cfg(test)]
+    pub(crate) fn low_power(config: Config, bitrate: u32) -> Result<Self> {
+        if !matches!(config.sample_rate, 44_100 | 48_000) {
+            return Err(Error::UnsupportedConfig);
+        }
+        let params = Params {
+            variant: Variant::Cfg1,
+            sample_rate: config.sample_rate,
+        };
+        Self::with_params(config, params, bitrate)
     }
 
     fn packetiser(&mut self, window: &[u8]) -> Result<&mut Packetiser> {
@@ -294,6 +313,21 @@ mod tests {
         assert_eq!(r1_48k.variant, Variant::Cfg0);
     }
 
+    /// §10.D / §7J: an R1 sink in LL gets config 0, an R2 sink config 4.
+    #[test]
+    fn ll_variants() {
+        for sample_rate in [44_100, 48_000] {
+            let ll = |level| Config {
+                profile: Profile::Ll,
+                sample_rate,
+                level,
+                ..STEREO_48K
+            };
+            assert_eq!(params(ll(DecoderLevel::R1)).unwrap().variant, Variant::Cfg0);
+            assert_eq!(params(ll(DecoderLevel::R2)).unwrap().variant, Variant::Cfg4);
+        }
+    }
+
     #[test]
     fn delays() {
         let r2 = |profile, sample_rate| Config {
@@ -307,7 +341,7 @@ mod tests {
             ..STEREO_48K
         };
         assert_eq!(delay_frames(STEREO_48K), Ok(Some(90)));
-        assert_eq!(delay_frames(ll_r1), Ok(Some(66)));
+        assert_eq!(delay_frames(ll_r1), Ok(Some(90)));
         assert_eq!(delay_frames(r2(Profile::Hq, 48_000)), Ok(Some(255)));
         assert_eq!(delay_frames(r2(Profile::Hq, 96_000)), Ok(Some(255)));
         assert_eq!(delay_frames(r2(Profile::Ll, 48_000)), Ok(None));
