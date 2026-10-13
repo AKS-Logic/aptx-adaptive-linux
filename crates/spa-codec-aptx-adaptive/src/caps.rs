@@ -66,6 +66,10 @@ const fn r2_data(features: u32) -> [u8; R2_DATA_END - APTX_DATA] {
     ]
 }
 
+/// With source type 2 the LL0 target latency (body 8, ms) is raised to at least 80 ms, to
+/// absorb host and link jitter (§7H).
+const LL0_MIN: u8 = 0x50;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapsError {
     /// Too short or malformed (`-EINVAL`).
@@ -147,7 +151,8 @@ pub fn fill_caps() -> Vec<u8> {
 /// - an R2 sink gets our own block ([`r2_data`]), with the features low byte set to ours & the
 ///   sink's;
 /// - an R1 sink gets its own body 8..25 back, except that with [`SOURCE_TYPE_HOST`] a zero
-///   target latency byte gets a default (§7G), and 26..39 zeroed.
+///   target latency byte gets a default (§7G) and LL0 is raised to at least 80 ms
+///   (§7H), and 26..39 zeroed.
 ///
 /// The result is as long as `caps`, with any bytes past [`CAPS_LEN`] zeroed, because PipeWire
 /// only offers the codec when the lengths match.
@@ -179,6 +184,7 @@ pub fn select_config(bytes: &[u8], source_type: u8) -> Result<Vec<u8>, CapsError
                         c[i] = default;
                     }
                 }
+                c[8] = c[8].max(LL0_MIN);
             }
             c
         }
@@ -427,15 +433,20 @@ mod tests {
     #[test]
     fn select_config_replaces_zero_latency() {
         let config = select_config_host(&PX7_S2E).unwrap();
-        assert_eq!(config[8..14], [0x37, 0x6a, 0x64, 0xaf, 0x64, 0x4b]);
+        // LL0 55 ms is raised to 80 (§7H).
+        assert_eq!(config[8..14], [0x50, 0x6a, 0x64, 0xaf, 0x64, 0x4b]);
+        let mut caps = PX7_S2E;
+        caps[8] = 0x60;
+        assert_eq!(select_config_host(&caps).unwrap()[8], 0x60);
         let mut caps = PX7_S2E;
         caps[8..14].copy_from_slice(&[0, 0, 0, 0, 0, 0x22]);
         let config = select_config_host(&caps).unwrap();
         assert_eq!(config[8..14], [0x50, 0x64, 0x64, 0x64, 0, 0x22]);
         caps[8..12].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        // Non-zero bytes are echoed, except LL0 under 80 ms (§7H).
         assert_eq!(
             select_config_host(&caps).unwrap()[8..14],
-            [0x11, 0x22, 0x33, 0x44, 0, 0x22]
+            [0x50, 0x22, 0x33, 0x44, 0, 0x22]
         );
         let mut r2 = r2_caps(0x0F00_0003);
         r2[10] = 0;

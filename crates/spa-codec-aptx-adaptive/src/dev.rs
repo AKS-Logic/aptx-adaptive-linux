@@ -339,6 +339,19 @@ impl Core for AnyCore {
             Self::Replay(c) => c.set_bitrate(bps),
         }
     }
+    fn prepare(&mut self, row: &aptx_adaptive::Row) -> CoreResult<()> {
+        match self {
+            Self::Encoder(c) => Core::prepare(c, row),
+            Self::Replay(_) => Ok(()),
+        }
+    }
+    /// The replay file holds one profile's packets, so it can't reset to another.
+    fn reset(&mut self, config: aptx_adaptive::Config, row: &aptx_adaptive::Row) -> CoreResult<()> {
+        match self {
+            Self::Encoder(c) => Core::reset(c, config, row),
+            Self::Replay(_) => Err(aptx_adaptive::Error::UnsupportedConfig),
+        }
+    }
 }
 
 #[cfg(test)]

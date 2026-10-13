@@ -4,6 +4,9 @@
 //! and `0002-codec-autoselect.md`). This file is only the C ABI glue; codec behaviour lives in
 //! `caps` and `session`.
 
+#[cfg(test)]
+#[path = "../../aptx-adaptive/tests/support/alloc_count.rs"]
+mod alloc_count;
 mod caps;
 mod dev;
 mod drift;
@@ -12,6 +15,7 @@ mod ffi;
 mod fixtures;
 mod ids;
 mod pod;
+mod props;
 mod session;
 mod slot;
 
@@ -28,6 +32,7 @@ use ffi::{
     spa_bluez5_codec_a2dp, spa_callbacks, spa_dict, spa_dict_item, spa_handle, spa_handle_factory,
     spa_interface, spa_interface_info, spa_pod, spa_pod_builder, spa_support,
 };
+use props::Props;
 use session::{Session, SessionError};
 
 // A panic in any extern "C" fn below aborts the process instead of unwinding into PipeWire;
@@ -74,13 +79,13 @@ const CODEC: media_codec = media_codec {
     get_metadata: None,
     free_config_data: None,
     caps_preference_cmp: None,
-    init_props: None,
-    clear_props: None,
-    enum_props: None,
-    set_props: None,
+    init_props: Some(codec_init_props),
+    clear_props: Some(codec_clear_props),
+    enum_props: Some(codec_enum_props),
+    set_props: Some(codec_set_props),
     init: Some(codec_init),
     deinit: Some(codec_deinit),
-    update_props: None,
+    update_props: Some(codec_update_props),
     get_block_size: Some(codec_get_block_size),
     get_interval: Some(codec_get_interval),
     abr_process: Some(codec_abr_process),
@@ -311,13 +316,132 @@ unsafe extern "C" fn codec_validate_config(
     }
 }
 
+/// Looks `key` up in a settings dict.
+///
+/// # Safety
+/// `dict` must be null or a valid `spa_dict` whose strings are NUL-terminated.
+unsafe fn dict_lookup<'a>(dict: *const spa_dict, key: &str) -> Option<&'a str> {
+    // SAFETY: caller contract.
+    let d = unsafe { dict.as_ref() }?;
+    if d.items.is_null() {
+        return None;
+    }
+    // SAFETY: a spa_dict holds n_items items.
+    let items = unsafe { slice::from_raw_parts(d.items, d.n_items as usize) };
+    items.iter().find_map(|it| {
+        if it.key.is_null() || it.value.is_null() {
+            return None;
+        }
+        // SAFETY: caller contract.
+        let (k, v) = unsafe { (CStr::from_ptr(it.key), CStr::from_ptr(it.value)) };
+        (k.to_bytes() == key.as_bytes())
+            .then(|| v.to_str().ok())
+            .flatten()
+    })
+}
+
+/// # Safety
+/// `props` must be null or come from `codec_init_props` and not have been cleared.
+/// `set_props` runs on the main thread and `update_props` on the data thread; [`Props`] is
+/// atomics only, so a shared reference is all either needs.
+unsafe fn shared_props<'a>(props: *mut c_void) -> Option<&'a Props> {
+    // SAFETY: caller contract.
+    unsafe { props.cast::<Props>().as_ref() }
+}
+
+unsafe extern "C" fn codec_init_props(
+    _codec: *const media_codec,
+    _flags: u32,
+    settings: *const spa_dict,
+) -> *mut c_void {
+    // SAFETY: PipeWire passes the device settings dict or null.
+    let mode = unsafe { dict_lookup(settings, props::MODE_SETTING) };
+    let (p, msg) = Props::from_setting(mode);
+    if let Some(msg) = msg {
+        let _ = writeln!(std::io::stderr(), "{msg}");
+    }
+    Box::into_raw(Box::new(p)).cast()
+}
+
+unsafe extern "C" fn codec_clear_props(props: *mut c_void) {
+    if !props.is_null() {
+        // SAFETY: props came from Box::into_raw in codec_init_props.
+        drop(unsafe { Box::from_raw(props.cast::<Props>()) });
+    }
+}
+
+unsafe extern "C" fn codec_enum_props(
+    props: *mut c_void,
+    _settings: *const spa_dict,
+    id: u32,
+    idx: u32,
+    builder: *mut spa_pod_builder,
+    param: *mut *mut spa_pod,
+) -> c_int {
+    // SAFETY: PipeWire passes the pointer from init_props.
+    let Some(props) = (unsafe { shared_props(props) }) else {
+        return -EINVAL;
+    };
+    let pod = match props.enum_param(id, idx) {
+        Err(()) => return -ENOENT,
+        Ok(None) => return 0,
+        Ok(Some(pod)) => pod,
+    };
+    if builder.is_null() || param.is_null() {
+        return -EINVAL;
+    }
+    // SAFETY: builder checked non-null and owned by the caller for this call.
+    match unsafe { builder_append(builder, &pod) } {
+        Ok(pod) => {
+            // SAFETY: param checked non-null.
+            unsafe { *param = pod };
+            1
+        }
+        Err(e) => e,
+    }
+}
+
+unsafe extern "C" fn codec_set_props(props: *mut c_void, param: *const spa_pod) -> c_int {
+    // SAFETY: PipeWire passes the pointer from init_props.
+    let Some(props) = (unsafe { shared_props(props) }) else {
+        return -EINVAL;
+    };
+    // SAFETY: a non-null param is a whole pod: an 8-byte header and `size` bytes of body.
+    let pod = unsafe { param.as_ref() }
+        .map(|h| unsafe { bytes(param.cast(), h.size as usize + size_of::<spa_pod>()) });
+    let pod = match pod {
+        None => None,
+        Some(Some(b)) => Some(b),
+        Some(None) => return -EINVAL,
+    };
+    c_int::from(props.set(pod))
+}
+
+/// Runs on the data thread between packets: no allocation, no locks, no logging. A refused
+/// request is counted by the session (and shows in the drift line), and Props then reports
+/// the profile actually running.
+unsafe extern "C" fn codec_update_props(data: *mut c_void, props: *mut c_void) -> c_int {
+    // SAFETY: PipeWire passes the pointers from init and init_props.
+    let (Some(props), false) = (unsafe { shared_props(props) }, data.is_null()) else {
+        return 0;
+    };
+    // SAFETY: PipeWire passes the pointer from init.
+    let s = unsafe { session(data) };
+    let res = s.request(props.wanted());
+    props.report(s.target(), s.can_run(aptx_adaptive::Profile::Ll));
+    match res {
+        Ok(()) => 0,
+        Err(e) => session_err(e),
+    }
+}
+
 unsafe extern "C" fn codec_init(
     _codec: *const media_codec,
     _flags: u32,
     config: *mut c_void,
     config_size: usize,
     info: *const spa_audio_info,
-    _props: *mut c_void,
+    props: *mut c_void,
     mtu: usize,
 ) -> *mut c_void {
     let res = (|| {
@@ -343,7 +467,23 @@ unsafe extern "C" fn codec_init(
         if let Some(msg) = opts.describe(var) {
             let _ = writeln!(std::io::stderr(), "{msg}");
         }
-        Session::open(level, mtu, &opts).map_err(session_err)
+        // SAFETY: PipeWire passes the pointer from init_props, or null.
+        let props = unsafe { shared_props(props) };
+        let wanted = props.map_or(aptx_adaptive::Profile::Hq, Props::wanted);
+        let s: Session<dev::AnyCore> =
+            Session::open(level, wanted, mtu, &opts).map_err(session_err)?;
+        if s.profile() != wanted {
+            // init runs on the main thread, so this can be logged.
+            let _ = writeln!(
+                std::io::stderr(),
+                "aptx-adaptive: this link can't run {wanted:?}; starting in {:?}",
+                s.profile()
+            );
+        }
+        if let Some(p) = props {
+            p.report(s.profile(), s.can_run(aptx_adaptive::Profile::Ll));
+        }
+        Ok::<_, c_int>(s)
     })();
     match res {
         Ok(s) => Box::into_raw(Box::new(s)).cast(),
