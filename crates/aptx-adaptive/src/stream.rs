@@ -284,10 +284,11 @@ mod tests {
         assert!(table_row(PX7, need - 4).is_err());
     }
 
-    /// Config 1 (960-sample period) fed 1344 samples a call for 30 s, draining with empty
-    /// pushes: the queue stays under two periods. LL drops the deficit (`codec-core.md`
-    /// §10.C), so a packet that took more than a period isn't made up for and there are fewer
-    /// packets than periods, never more.
+    /// An R1 sink in LL (config 0 on the LL row, 960-sample period, `codec-core.md` §10.D) fed
+    /// 1344 samples a call for 30 s, draining with empty pushes: the queue stays under two
+    /// periods. LL drops the deficit (§10.C), so a packet that took more than a period isn't
+    /// made up for: there are never more packets than periods, and never fewer than one per
+    /// push.
     #[test]
     fn oversized_pushes_stay_bounded_when_drained() {
         let config = Config {
@@ -310,7 +311,7 @@ mod tests {
         }
         assert!(most < 2 * 960, "queue reached {most}");
         assert!(
-            packets <= fed / 960 && packets >= fed / 1344,
+            packets <= fed / 960 && packets >= fed / chunk.len(),
             "{packets} packets for {fed}"
         );
     }

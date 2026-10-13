@@ -449,10 +449,16 @@ mod tests {
             variant: Variant::Cfg3,
             ..CFG0
         };
+        let cfg4 = Params {
+            variant: Variant::Cfg4,
+            ..CFG0
+        };
         for (params, len, bitrate) in [
             (CFG0, 656, 364_000),
             (CFG0, 64, 364_000),
             (cfg3, 128, 270_000),
+            (cfg4, 348, 270_000),
+            (cfg4, 64, 600_000),
         ] {
             let mut p = Packetiser::new(params, len, bitrate);
             let caps = |p: &Packetiser| {
