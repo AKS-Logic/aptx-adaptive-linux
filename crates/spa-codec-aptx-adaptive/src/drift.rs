@@ -1,4 +1,4 @@
-//! Clock drift instrumentation and the optional §7F TTP adjustment.
+//! Clock drift instrumentation.
 //!
 //! With source type 2 the sink advances its time-to-play purely by the sample count in each
 //! packet (spec §7F). If the host audio clock that paces our encoding runs faster or slower than
@@ -9,107 +9,21 @@
 //! `APTX_ADAPTIVE_DRIFT_LOG=0` silences it). The sink's Delay Report isn't visible to a
 //! `media_codec` (only `media-sink.c` sees the transport), so it isn't used.
 //!
-//! The timestamp's high 16 bits are a signed latency adjustment in ms (§7F). Per §7G a source
-//! shouldn't correct drift: with a proper target latency the sink does it itself, and a non-zero
-//! adjust changes the target and makes the sink speed up or slow down. So the adjust is
-//! [`TtpAdjust::Off`] (0) unless a `dev-replay` build sets
-//! `APTX_ADAPTIVE_TTP_ADJUST=off|fixed:<ms>|auto`.
+//! It's only a diagnostic. The sink corrects drift itself, so a source sends a TTP adjust of 0
+//! (§7G, §7H).
 
-use std::ffi::OsStr;
 use std::fmt::{self, Write as _};
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
-pub const TTP_ADJUST_VAR: &str = "APTX_ADAPTIVE_TTP_ADJUST";
 /// `APTX_ADAPTIVE_DRIFT_LOG=0` silences the drift line, in every build.
 pub const DRIFT_LOG_VAR: &str = "APTX_ADAPTIVE_DRIFT_LOG";
 
-/// How often a drift line is logged and the auto controller steps.
+/// How often a drift line is logged.
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// A pause in sending longer than this restarts the measurement (and the auto adjust).
+/// A pause in sending longer than this restarts the measurement.
 const GAP: Duration = Duration::from_secs(1);
-
-/// The §7F timestamp: `adjust_ms << 16 | samples per channel in the packet`.
-pub fn ttp_timestamp(adjust_ms: i16, frames: u16) -> u32 {
-    (u32::from(adjust_ms.cast_unsigned()) << 16) | u32::from(frames)
-}
-
-/// What goes in the timestamp's high 16 bits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TtpAdjust {
-    /// 0, the default. Keep it: a source shouldn't correct drift (§7G).
-    #[default]
-    Off,
-    /// DEV ONLY. A constant, in signed ms.
-    Fixed(i16),
-    /// DEV ONLY. Follows the measured drift, see [`Auto`].
-    Auto,
-}
-
-impl TtpAdjust {
-    /// Parses `off`, `fixed:<signed ms>` or `auto`.
-    ///
-    /// # Errors
-    /// A message for anything else.
-    pub fn parse(v: &OsStr) -> Result<Self, String> {
-        let bad = || {
-            format!(
-                "{TTP_ADJUST_VAR}={} is not off, fixed:<ms> or auto",
-                v.display()
-            )
-        };
-        match v.to_str().ok_or_else(bad)? {
-            "off" => Ok(Self::Off),
-            "auto" => Ok(Self::Auto),
-            s => s
-                .strip_prefix("fixed:")
-                .and_then(|n| n.parse::<i16>().ok())
-                .map(Self::Fixed)
-                .ok_or_else(bad),
-        }
-    }
-}
-
-/// The auto TTP adjust controller, stepped once per [`REPORT_INTERVAL`].
-///
-/// Input: `drift_ms`, how far the audio we've sent has run ahead of `CLOCK_MONOTONIC` since the
-/// measurement settled (positive = host audio clock fast). Assuming the sink's clock tracks
-/// `CLOCK_MONOTONIC` to well under that, it is how much the sink's buffered latency has grown,
-/// so the adjust that re-centres it is `-drift_ms`: a fast source gets a negative adjust.
-/// UNCERTAIN: how the sink reacts to a change is still open (`spec/QUESTIONS.md`).
-///
-/// Algorithm: the target is `-drift_ms`. Each step moves the
-/// adjust by at most 1 ms towards the target, and only if the target is more than
-/// [`Auto::DEADBAND_MS`] away. So stepping from `a` to `a + 1` needs a target above `a + 1.5`,
-/// and stepping back needs one below `a - 0.5`: jitter under 2 ms around a boundary can't make
-/// it flap. At most 1 ms per report, so at most ±1 ms per 10 s, and the adjust is clamped to
-/// ±[`Auto::LIMIT_MS`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Auto {
-    adjust_ms: i16,
-}
-
-impl Auto {
-    pub const LIMIT_MS: i16 = 50;
-    pub const DEADBAND_MS: f64 = 1.5;
-
-    pub fn adjust_ms(self) -> i16 {
-        self.adjust_ms
-    }
-
-    pub fn step(&mut self, drift_ms: f64) -> i16 {
-        let target = if drift_ms.is_nan() { 0.0 } else { -drift_ms };
-        let err = target - f64::from(self.adjust_ms);
-        if err > Self::DEADBAND_MS {
-            self.adjust_ms += 1;
-        } else if err < -Self::DEADBAND_MS {
-            self.adjust_ms -= 1;
-        }
-        self.adjust_ms = self.adjust_ms.clamp(-Self::LIMIT_MS, Self::LIMIT_MS);
-        self.adjust_ms
-    }
-}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Backlog {
@@ -145,8 +59,6 @@ pub struct Report {
     /// controller; without, it's `TIOCOUTQ`, socket memory in use (kernel `skb` accounting, so
     /// larger than the payload). The plugin can't tell which, hence "PipeWire unsent".
     pub backlog: (usize, usize, usize),
-    /// The adjust in use, `None` when it's off.
-    pub adjust_ms: Option<i16>,
     /// HQ/LL switch requests refused since the stream started (logged when non-zero; the
     /// data thread doesn't log them itself).
     pub refused_switches: u32,
@@ -167,9 +79,6 @@ impl fmt::Display for Report {
         if let Some(d) = self.drift_ms {
             write!(f, ", audio ahead {d:+.1} ms")?;
         }
-        if let Some(a) = self.adjust_ms {
-            write!(f, ", ttp adjust {a:+} ms")?;
-        }
         if self.refused_switches > 0 {
             write!(f, ", refused mode switches {}", self.refused_switches)?;
         }
@@ -177,7 +86,7 @@ impl fmt::Display for Report {
     }
 }
 
-/// Measures the host audio clock and backlog, and owns the TTP adjust.
+/// Measures the host audio clock and backlog.
 ///
 /// Fed from `abr_process`, which `media-sink.c` calls in `send_buffer` right before each
 /// `send()`, so the clock is read at the moment of each send (what a btmon capture measures).
@@ -190,8 +99,6 @@ impl fmt::Display for Report {
 #[derive(Debug, Clone)]
 pub struct Drift {
     rate: u32,
-    mode: TtpAdjust,
-    auto: Auto,
     anchor: Option<Instant>,
     last: Option<Instant>,
     frames: u64,
@@ -203,11 +110,9 @@ pub struct Drift {
 }
 
 impl Drift {
-    pub fn new(rate: u32, mode: TtpAdjust) -> Self {
+    pub fn new(rate: u32) -> Self {
         Self {
             rate,
-            mode,
-            auto: Auto::default(),
             anchor: None,
             last: None,
             frames: 0,
@@ -218,17 +123,8 @@ impl Drift {
         }
     }
 
-    /// The §7F adjust for the next packet, in ms.
-    pub fn adjust_ms(&self) -> i16 {
-        match self.mode {
-            TtpAdjust::Off => 0,
-            TtpAdjust::Fixed(ms) => ms,
-            TtpAdjust::Auto => self.auto.adjust_ms(),
-        }
-    }
-
     fn restart(&mut self, now: Instant) {
-        *self = Self::new(self.rate, self.mode);
+        *self = Self::new(self.rate);
         self.anchor = Some(now);
         self.next_report = Some(now + REPORT_INTERVAL);
     }
@@ -269,15 +165,11 @@ impl Drift {
             }
         };
         self.min_ahead = f64::INFINITY;
-        if let (TtpAdjust::Auto, Some(d)) = (self.mode, drift_ms) {
-            self.auto.step(d);
-        }
         let b = std::mem::take(&mut self.backlog);
         Some(Report {
             ppm,
             drift_ms,
             backlog: (b.min, (b.sum / b.n.max(1)) as usize, b.max),
-            adjust_ms: (self.mode != TtpAdjust::Off).then(|| self.adjust_ms()),
             refused_switches: 0,
         })
     }
@@ -337,72 +229,6 @@ impl fmt::Write for LineBuf {
 mod tests {
     use super::*;
 
-    #[test]
-    fn timestamp_with_adjust() {
-        assert_eq!(ttp_timestamp(0, 672), 0x0000_02a0);
-        let ts = ttp_timestamp(-3, 672);
-        assert_eq!(ts >> 16, 0xfffd);
-        assert_eq!(ts & 0xffff, 672);
-        assert_eq!(ts.to_be_bytes(), [0xff, 0xfd, 0x02, 0xa0]);
-        assert_eq!(ttp_timestamp(50, 672), 0x0032_02a0);
-        assert_eq!(ttp_timestamp(i16::MIN, 0), 0x8000_0000);
-    }
-
-    #[test]
-    fn parses_mode() {
-        let p = |s: &str| TtpAdjust::parse(OsStr::new(s));
-        assert_eq!(p("off"), Ok(TtpAdjust::Off));
-        assert_eq!(p("auto"), Ok(TtpAdjust::Auto));
-        assert_eq!(p("fixed:-3"), Ok(TtpAdjust::Fixed(-3)));
-        assert_eq!(p("fixed:+12"), Ok(TtpAdjust::Fixed(12)));
-        for bad in ["", "on", "fixed:", "fixed:x", "fixed:40000", "-3"] {
-            assert!(p(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn auto_steps_one_ms_against_drift() {
-        let mut a = Auto::default();
-        // Source fast: sink latency grows, adjust goes negative.
-        assert_eq!(a.step(10.0), -1);
-        assert_eq!(a.step(10.0), -2);
-        assert_eq!(a.step(-10.0), -1);
-        assert_eq!(a.step(-10.0), 0);
-        assert_eq!(a.step(-10.0), 1);
-    }
-
-    #[test]
-    fn auto_clamps() {
-        let mut a = Auto::default();
-        for _ in 0..200 {
-            a.step(1000.0);
-        }
-        assert_eq!(a.adjust_ms(), -Auto::LIMIT_MS);
-        for _ in 0..200 {
-            a.step(f64::NEG_INFINITY);
-        }
-        assert_eq!(a.adjust_ms(), Auto::LIMIT_MS);
-        a.step(f64::NAN);
-        assert_eq!(a.adjust_ms(), Auto::LIMIT_MS - 1);
-    }
-
-    #[test]
-    fn auto_hysteresis() {
-        let mut a = Auto::default();
-        // Inside the deadband: hold.
-        for d in [1.4, -1.4, 0.9, -0.5] {
-            assert_eq!(a.step(d), 0);
-        }
-        assert_eq!(a.step(1.6), -1);
-        // Jitter around the new step doesn't bring it back...
-        for d in [0.0, 1.2, -0.4, 2.4, 0.6] {
-            assert_eq!(a.step(d), -1, "{d}");
-        }
-        // ...a real swing does.
-        assert_eq!(a.step(-0.6), 0);
-        assert_eq!(a.step(2.6), -1);
-    }
-
     /// Sends a 672-frame packet every `period` for `secs`, like media-sink's flush timer.
     fn run(d: &mut Drift, t0: Instant, period: Duration, secs: u64) -> Vec<Report> {
         let n = Duration::from_secs(secs).as_nanos() / period.as_nanos();
@@ -413,47 +239,37 @@ mod tests {
 
     #[test]
     fn exact_clock_is_zero_ppm() {
-        let mut d = Drift::new(48_000, TtpAdjust::Off);
+        let mut d = Drift::new(48_000);
         let r = run(&mut d, Instant::now(), Duration::from_millis(14), 31);
         assert_eq!(r.len(), 3);
         assert_eq!(r[0].ppm, None);
         let (min, avg, max) = r[0].backlog;
         assert_eq!((min, max), (0, 1312));
         assert!((650..=660).contains(&avg), "{avg}");
-        assert_eq!(r[0].adjust_ms, None);
         for x in &r[1..] {
             assert!(x.ppm.unwrap().abs() < 0.1, "{x:?}");
         }
-        assert_eq!(d.adjust_ms(), 0);
     }
 
     /// The capture's case: the host sends audio 80 ppm faster than real time, so packets of
     /// 14 ms of audio go out every 14 ms / 1.00008.
     #[test]
-    fn fast_host_clock_measures_and_auto_goes_negative() {
+    fn fast_host_clock_measures() {
         let period = Duration::from_nanos((14_000_000.0 / 1.000_08_f64).round() as u64);
-        let mut d = Drift::new(48_000, TtpAdjust::Auto);
+        let mut d = Drift::new(48_000);
         let r = run(&mut d, Instant::now(), period, 101);
         assert_eq!(r.len(), 10);
         let last = r.last().unwrap();
         assert!((last.ppm.unwrap() - 80.0).abs() < 2.0, "{last:?}");
         assert!(last.to_string().contains("host clock +80."), "{last}");
-        // 90 s at 80 ppm = 7.2 ms; the controller follows at 1 ms per report, from the
-        // second report on, and holds within the deadband.
+        // 90 s at 80 ppm = 7.2 ms.
         assert!((last.drift_ms.unwrap() - 7.2).abs() < 0.3, "{last:?}");
-        let adj: Vec<i16> = r.iter().map(|x| x.adjust_ms.unwrap()).collect();
-        assert!(
-            adj.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] <= 1),
-            "{adj:?}"
-        );
-        assert!((-7..=-4).contains(&adj[9]), "{adj:?}");
-        assert_eq!(d.adjust_ms(), adj[9]);
     }
 
     /// Sends jittered by up to ±1 ms (timer wakeups) don't bias the estimate.
     #[test]
     fn jitter_doesnt_bias() {
-        let mut d = Drift::new(48_000, TtpAdjust::Off);
+        let mut d = Drift::new(48_000);
         let t0 = Instant::now() + Duration::from_millis(5);
         let mut reports = Vec::new();
         for i in 0..(41_000 / 14) {
@@ -468,20 +284,13 @@ mod tests {
 
     #[test]
     fn gap_restarts() {
-        let mut d = Drift::new(48_000, TtpAdjust::Auto);
+        let mut d = Drift::new(48_000);
         let t0 = Instant::now();
         let period = Duration::from_millis(13);
-        run(&mut d, t0, period, 60);
-        assert_ne!(d.adjust_ms(), 0);
+        let r = run(&mut d, t0, period, 60);
+        assert!(r.last().unwrap().ppm.is_some());
         let r = run(&mut d, t0 + Duration::from_secs(70), period, 11);
-        assert_eq!(d.adjust_ms(), 0);
         assert_eq!(r[0].ppm, None);
-    }
-
-    #[test]
-    fn fixed_adjust() {
-        let d = Drift::new(48_000, TtpAdjust::Fixed(-3));
-        assert_eq!(d.adjust_ms(), -3);
     }
 
     #[test]
@@ -490,7 +299,6 @@ mod tests {
             ppm: Some(-12.34),
             drift_ms: Some(-0.5),
             backlog: (0, 312, 1312),
-            adjust_ms: None,
             refused_switches: 0,
         };
         assert_eq!(
@@ -501,12 +309,11 @@ mod tests {
             ppm: None,
             drift_ms: None,
             backlog: (0, 0, 0),
-            adjust_ms: Some(2),
             refused_switches: 0,
         };
         assert_eq!(
             r.to_string(),
-            "aptx-adaptive: drift: host clock settling, backlog (PipeWire unsent) 0/0/0 bytes (min/avg/max), ttp adjust +2 ms"
+            "aptx-adaptive: drift: host clock settling, backlog (PipeWire unsent) 0/0/0 bytes (min/avg/max)"
         );
         let r = Report {
             refused_switches: 3,
@@ -518,7 +325,6 @@ mod tests {
             ppm: Some(-1e9),
             drift_ms: Some(-1e9),
             backlog: (usize::MAX, usize::MAX, usize::MAX),
-            adjust_ms: Some(i16::MIN),
             refused_switches: u32::MAX,
         };
         let mut line = LineBuf::new();

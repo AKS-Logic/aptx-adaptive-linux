@@ -12,6 +12,8 @@ Anything marked **UNCERTAIN** was inferred and has not been confirmed by running
 
 ## 0. Big picture
 
+> **Superseded** by §7D–§7K (verified 2026-10-13). Kept as history; don't implement from it.
+
 On a reference Android source the flow is:
 
 1. The Bluetooth host negotiates the over-the-air (OTA) codec capability element (§1).
@@ -432,6 +434,8 @@ Configuration: 48 kHz stereo, HQ, table index 0 at level 3, 364 kbps, 14 ms peri
 
 ## 7. Output framing: 8-byte header plus swapped payload
 
+> **Superseded** by §7D–§7K (verified 2026-10-13). Kept as history; don't implement from it.
+
 For each packet, the encoder stage outputs **8 header bytes** followed by the encoder packet, byte-swapped in 16-bit units (bytes 2k and 2k+1 exchanged).
 
 | byte | contents |
@@ -547,6 +551,8 @@ None of this sideband exists unless the Bluetooth controller supplies it. Recomm
 
 ## 7A. Transport re-check after the first live test (2026-10-12)
 
+> **Superseded** by §7D–§7K (verified 2026-10-13). Kept as history; don't implement from it.
+
 This supersedes §7 where they disagree. None of it has been verified over the air.
 
 ### 7A.1 What the source does to each codec packet
@@ -587,6 +593,8 @@ This supersedes §7 where they disagree. None of it has been verified over the a
 
 ## 7B. RTP timestamp and payload type (receiver analysis, 2026-10-12)
 
+> **Superseded** by §7D–§7K (verified 2026-10-13). Kept as history; don't implement from it.
+
 From analysing a newer-generation receiver of the same vendor's codec. That receiver can't decode R1/R2 bitstreams, so this is inferred for the Px7 S2e, not proven:
 
 - RTP header: 12 bytes, no CSRCs, then the swapped payload. The first payload byte is the frame type. That rules out putting the 8-byte header after the RTP header.
@@ -600,6 +608,8 @@ From analysing a newer-generation receiver of the same vendor's codec. That rece
 - Payload type: that receiver only accepts **0**. The earlier PT 0 live test kept the constant timestamp, so it didn't rule PT 0 out.
 
 ## 7C. Packet layout reconsidered (2026-10-12)
+
+> **Superseded** by §7D–§7K (verified 2026-10-13). Kept as history; don't implement from it.
 
 New analysis questions §7A/§7B. The best available evidence for an aptX Adaptive stream over ordinary Bluetooth from a vendor source is a **normal** RTP header followed by the 8-byte header, then the payload:
 

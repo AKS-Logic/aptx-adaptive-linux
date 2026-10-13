@@ -346,3 +346,8 @@ With the A2DP-1.3 bluetoothd (so the Px7 offers Delay Reporting) and the merged 
 - **HQ after Start: Delay Report 200.0 ms.** That's the HQ byte `0x64` × 2 ms per §7G.
 
 So the sink's active target matches what we send in both modes.
+
+## cleanup: superseded framings and dev switches removed (2026-10-13)
+
+- Gone, per §7D–§7K: the `header-in-rtp`, `header-in-rtp-swapped`, `header-after-rtp` and `ttp-clock-offset` framings with `APTX_ADAPTIVE_FRAMING`, the 8-byte header, and `APTX_ADAPTIVE_TS`, `APTX_ADAPTIVE_SOURCE_TYPE`, `APTX_ADAPTIVE_PT`, `APTX_ADAPTIVE_NOSWAP`, `APTX_ADAPTIVE_SSRC` and `APTX_ADAPTIVE_TTP_ADJUST` (with the `auto` drift controller). Notes above that mention them are history.
+- Kept: `APTX_ADAPTIVE_REPLAY` and `APTX_ADAPTIVE_SCMST[_BYTE]` (dev-replay builds), `APTX_ADAPTIVE_DRIFT_LOG` and the drift line (every build). `scripts/dev-replay.sh [vector|path|--no-replay]`.

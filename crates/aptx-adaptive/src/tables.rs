@@ -24,15 +24,6 @@ impl Profile {
     pub fn from_index(i: usize) -> Option<Self> {
         Self::ALL.get(i).copied()
     }
-
-    /// Header byte 7 (§4.3).
-    #[must_use]
-    pub fn mode_byte(self) -> u8 {
-        match self {
-            Self::Hq => 0xAE,
-            Self::Ll => 0xAD,
-        }
-    }
 }
 
 /// Decoder compatibility level (§1.3). Changes the bitstream.
@@ -52,20 +43,11 @@ pub struct Row {
     pub period_ms: u32,
     pub samples_per_channel: u32,
     pub packet_bytes: usize,
-    /// Header byte 3.
+    /// The packet-size class (§7J), the same for R1 and R2.
     pub cfg: u8,
 }
 
 impl Row {
-    /// Header byte 2.
-    ///
-    /// # Panics
-    /// If the period is over 63 ms, which no table row is.
-    #[must_use]
-    pub fn period_byte(&self) -> u8 {
-        u8::try_from(self.period_ms * 4).expect("table periods are at most 50 ms")
-    }
-
     /// Interleaved samples consumed per packet (§4.3).
     #[must_use]
     pub fn interleaved_samples(&self, rate: u32, channels: u32) -> usize {
@@ -253,7 +235,6 @@ mod tests {
         assert_eq!(idx, 0);
         let r = row(Profile::Hq, idx, DEFAULT_QUALITY).unwrap();
         assert_eq!(r, PX7);
-        assert_eq!(r.period_byte(), 0x38);
         assert_eq!(r.interleaved_samples(48_000, 2), 1344);
     }
 
