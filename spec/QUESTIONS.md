@@ -351,3 +351,7 @@ So the sink's active target matches what we send in both modes.
 
 - Gone, per §7D–§7K: the `header-in-rtp`, `header-in-rtp-swapped`, `header-after-rtp` and `ttp-clock-offset` framings with `APTX_ADAPTIVE_FRAMING`, the 8-byte header, and `APTX_ADAPTIVE_TS`, `APTX_ADAPTIVE_SOURCE_TYPE`, `APTX_ADAPTIVE_PT`, `APTX_ADAPTIVE_NOSWAP`, `APTX_ADAPTIVE_SSRC` and `APTX_ADAPTIVE_TTP_ADJUST` (with the `auto` drift controller). Notes above that mention them are history.
 - Kept: `APTX_ADAPTIVE_REPLAY` and `APTX_ADAPTIVE_SCMST[_BYTE]` (dev-replay builds), `APTX_ADAPTIVE_DRIFT_LOG` and the drift line (every build). `scripts/dev-replay.sh [vector|path|--no-replay]`.
+
+## LL default profile live (2026-10-13, after #24)
+
+Installed with `APTX_ADAPTIVE_DEFAULT_MODE=ll` (ldac slot). On reconnect: one SetConfiguration after the new ACL connection, then Open and Start, with no reconfigure. Active profile `a2dp-sink` = "aptX Adaptive (Low Latency)", and `a2dp-sink-aptx_adaptive` (HQ) is listed. All packets were 360 bytes (`… 01 e0 … a1`). Only the normal connect chime. KDE lists both profiles.
