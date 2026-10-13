@@ -777,3 +777,48 @@ Checked against primary sources. This supersedes §5 and §8 where they differ.
 - The RSSI caps apply in **HQ**, not LL: level ≤ 3 for dual mono or TWS; otherwise ≤ 3 when RSSI < −60 dBm and ≤ 4 when RSSI < −55 dBm. LL has no cap.
 - Level 1 is treated as 2. Level 0 is accepted but maps to an unused row, so a source should ignore it.
 - **The default level is 3 for HQ and LL**, and it's reset to 3 on every switch. R1 sink at level 3: HQ 364 kbps / 14 ms; LL 265 kbps / 10 ms at every level.
+
+## 7L. Mid-stream level change (verified 2026-10-13)
+
+Checked against primary sources and reproduced byte for byte (`tests/vectors/levels/`). This extends §7K "Levels" and §8.2.
+
+**Request.** A level request is checked first:
+- values above 7 are ignored, 0 is ignored, and 1 becomes 2;
+- in HQ the caps from §7K apply.
+
+It's then stored as **pending**. If several requests arrive between two packets, only the last counts.
+
+**Applying it.** A pending request is applied once per emitted packet, in the §7K order: after the packet's deficit update, before the per-packet bitrate step. While an HQ↔LL switch is in progress it waits; the switch resets the level to 3 anyway.
+1. Look up the row for the new level in the same table index (§4.1/§4.2).
+2. From that row, take the period byte, the cfg byte, the packet size and the period at once.
+3. If the row bitrate differs from the encoder's current bitrate (the last value given to set-bitrate, which may be the ¾-reduced one):
+   - set the bitrate to the row bitrate;
+   - switch the loop's period P (samples per packet) to the new row's.
+4. If they're equal, nothing is called and **P is not changed**.
+5. The per-packet bitrate step then runs on the new row bitrate (¾ of it if the deficit is over 96).
+
+**What doesn't happen:** no re-create, reset or re-init, and no fade. The deficit and all encoder state carry straight across, including the previous pool used for frame sizing. The change takes effect from the next packet.
+
+**On air:**
+- The RTP timestamp low 16 bits follow the samples per channel of the new period from the next packet (§7F).
+- The SSRC, payload type and TTP-adjust bits don't change.
+- The sink isn't told anything; the frames describe their own bitrate.
+
+**R1 sink, HQ (table index 0):**
+
+| level | rate / period / samples per channel |
+|---|---|
+| 2 | 318k / 16 ms / 768 |
+| 3 | 364k / 14 ms / 672 |
+| 4–7 | 427k / 12 ms / 576 |
+
+- The packet is 656 bytes at every level.
+- Level 1 (281k / 18 ms) is encodable but the reference never reaches it.
+- **R1 LL is the same at every level, so adaptive bitrate is HQ-only for R1 sinks.**
+- Some R2 LL rows vary. On R2 LL table index 2, levels 3↔4 have equal bitrates but different periods. By rule 4 the period byte changes but P doesn't. Avoid that step rather than copy it.
+
+**Pacing:** the reference has no minimum interval, hysteresis or step limit; any pacing comes from whoever sends the request. For a host source:
+- map PipeWire's `reduce_bitpool` to level −1 (floor 2) and `increase_bitpool` to level +1 (ceiling 4 on R1 HQ);
+- apply the change at the next packet boundary.
+
+PipeWire's own back-off (½ s between reductions, 1 s of no backlog before an increase) is pacing enough.
