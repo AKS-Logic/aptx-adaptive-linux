@@ -142,4 +142,6 @@ HD is configured on connect. Pick the a2dp-sink-aptx_adaptive profile by hand (p
 or pactl set-card-profile); each switch makes the headset chime.
 EOF
 fi
-echo 'If monitor.bluez.properties sets bluez5.codecs, it must include "aptx_adaptive".'
+echo 'Low latency is the a2dp-sink-aptx_adaptive_ll profile (KDE, pavucontrol, pactl).'
+echo 'If monitor.bluez.properties sets bluez5.codecs, it must include "aptx_adaptive", and'
+echo '"aptx_adaptive_ll" for the low-latency profile.'

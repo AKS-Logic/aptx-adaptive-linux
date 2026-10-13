@@ -1,8 +1,8 @@
 //! PipeWire bluez5 media codec plugin for aptX Adaptive.
 //!
 //! Loaded in place of LC3plus HR, with the codec id from `slot` (see `docs/adr/0001-architecture.md`
-//! and `0002-codec-autoselect.md`). This file is only the C ABI glue; codec behaviour lives in
-//! `caps` and `session`.
+//! and `0002-codec-autoselect.md`), plus a low-latency alias entry (`0003-ll-profile.md`). This
+//! file is only the C ABI glue; codec behaviour lives in `caps` and `session`.
 
 #[cfg(test)]
 #[path = "../../aptx-adaptive/tests/support/alloc_count.rs"]
@@ -27,11 +27,12 @@ use std::sync::Once;
 
 use ffi::{
     A2DP_CODEC_VENDOR, A2DP_MAX_CAPS_SIZE, EINVAL, ENOENT, ENOSPC, ENOTSUP, MEDIA_CODEC_A2DP,
-    NEED_FLUSH_ALL, NEED_FLUSH_NO, SPA_MEDIA_SUBTYPE_RAW, SPA_MEDIA_TYPE_AUDIO,
-    SPA_VERSION_BLUEZ5_CODEC_MEDIA, SPA_VERSION_HANDLE, SPA_VERSION_HANDLE_FACTORY,
-    a2dp_vendor_codec_t, media_codec, media_codec_audio_info, spa_audio_info, spa_audio_info_raw,
-    spa_bluez5_codec_a2dp, spa_callbacks, spa_dict, spa_dict_item, spa_handle, spa_handle_factory,
-    spa_interface, spa_interface_info, spa_pod, spa_pod_builder, spa_support,
+    NEED_FLUSH_ALL, NEED_FLUSH_NO, SPA_BLUETOOTH_AUDIO_CODEC_MPEG, SPA_MEDIA_SUBTYPE_RAW,
+    SPA_MEDIA_TYPE_AUDIO, SPA_VERSION_BLUEZ5_CODEC_MEDIA, SPA_VERSION_HANDLE,
+    SPA_VERSION_HANDLE_FACTORY, a2dp_vendor_codec_t, media_codec, media_codec_audio_info,
+    spa_audio_info, spa_audio_info_raw, spa_bluez5_codec_a2dp, spa_callbacks, spa_dict,
+    spa_dict_item, spa_handle, spa_handle_factory, spa_interface, spa_interface_info, spa_pod,
+    spa_pod_builder, spa_support,
 };
 use props::Props;
 use session::{Session, SessionError};
@@ -67,7 +68,7 @@ const fn codec(slot: slot::Slot) -> media_codec {
         },
         name: ids::CODEC_NAME.as_ptr(),
         description: ids::CODEC_DESCRIPTION.as_ptr(),
-        endpoint_name: ptr::null(),
+        endpoint_name: ids::CODEC_NAME.as_ptr(),
         info: ptr::null(),
         send_buf_size: ids::SEND_BUF_SIZE,
         duplex_codec: ptr::null(),
@@ -103,12 +104,42 @@ const fn codec(slot: slot::Slot) -> media_codec {
     }
 }
 
+/// The low-latency entry, so it can be picked as a card profile (`docs/adr/0003-ll-profile.md`).
+/// It shares the main entry's endpoint: no `fill_caps`, so PipeWire registers no endpoint of
+/// its own and `bluetoothd` never picks it on connect. It's bound only when chosen as a profile (the
+/// SBC / SBC-XQ pattern). `bluez5-device.c` keys profiles by id, so it needs an id of its own
+/// that no stock plugin uses: MPEG. Only `id` and `fill_caps` affect PipeWire;
+/// everything else matches the main entry.
+const fn ll_codec() -> media_codec {
+    media_codec {
+        id: SPA_BLUETOOTH_AUDIO_CODEC_MPEG,
+        name: ids::LL_NAME.as_ptr(),
+        description: ids::LL_DESCRIPTION.as_ptr(),
+        fill_caps: None,
+        ..codec(slot::Slot::DEFAULT)
+    }
+}
+
 static CODEC_LDAC: SyncStatic<media_codec> = SyncStatic(codec(slot::Slot::Ldac));
 static CODEC_LC3PLUS_HR: SyncStatic<media_codec> = SyncStatic(codec(slot::Slot::Lc3plusHr));
-static CODECS_LDAC: SyncStatic<[*const media_codec; 2]> =
-    SyncStatic([&raw const CODEC_LDAC.0, ptr::null()]);
-static CODECS_LC3PLUS_HR: SyncStatic<[*const media_codec; 2]> =
-    SyncStatic([&raw const CODEC_LC3PLUS_HR.0, ptr::null()]);
+static CODEC_LL: SyncStatic<media_codec> = SyncStatic(ll_codec());
+static CODECS_LDAC: SyncStatic<[*const media_codec; 3]> =
+    SyncStatic([&raw const CODEC_LDAC.0, &raw const CODEC_LL.0, ptr::null()]);
+static CODECS_LC3PLUS_HR: SyncStatic<[*const media_codec; 3]> = SyncStatic([
+    &raw const CODEC_LC3PLUS_HR.0,
+    &raw const CODEC_LL.0,
+    ptr::null(),
+]);
+
+/// The mode a stream starts in when nothing else says: LL for the low-latency entry, HQ for
+/// the main one.
+fn entry_profile(codec: *const media_codec) -> aptx_adaptive::Profile {
+    if ptr::eq(codec, &raw const CODEC_LL.0) {
+        aptx_adaptive::Profile::Ll
+    } else {
+        aptx_adaptive::Profile::Hq
+    }
+}
 
 /// The codec list for the slot in `APTX_ADAPTIVE_SLOT`, read when the loader instantiates us.
 /// A bad value is logged once per library load.
@@ -343,17 +374,25 @@ unsafe fn shared_props<'a>(props: *mut c_void) -> Option<&'a Props> {
     unsafe { props.cast::<Props>().as_ref() }
 }
 
+/// The main entry starts in the mode from the device setting. The low-latency entry ignores it
+/// and starts in LL, since picking that profile is the user's choice.
 unsafe extern "C" fn codec_init_props(
-    _codec: *const media_codec,
+    codec: *const media_codec,
     _flags: u32,
     settings: *const spa_dict,
 ) -> *mut c_void {
-    // SAFETY: PipeWire passes the device settings dict or null.
-    let mode = unsafe { dict_lookup(settings, props::MODE_SETTING) };
-    let (p, msg) = Props::from_setting(mode);
-    if let Some(msg) = msg {
-        let _ = writeln!(std::io::stderr(), "{msg}");
-    }
+    let p = match entry_profile(codec) {
+        aptx_adaptive::Profile::Ll => Props::new(aptx_adaptive::Profile::Ll),
+        aptx_adaptive::Profile::Hq => {
+            // SAFETY: PipeWire passes the device settings dict or null.
+            let mode = unsafe { dict_lookup(settings, props::MODE_SETTING) };
+            let (p, msg) = Props::from_setting(mode);
+            if let Some(msg) = msg {
+                let _ = writeln!(std::io::stderr(), "{msg}");
+            }
+            p
+        }
+    };
     Box::into_raw(Box::new(p)).cast()
 }
 
@@ -430,7 +469,7 @@ unsafe extern "C" fn codec_update_props(data: *mut c_void, props: *mut c_void) -
 }
 
 unsafe extern "C" fn codec_init(
-    _codec: *const media_codec,
+    codec: *const media_codec,
     _flags: u32,
     config: *mut c_void,
     config_size: usize,
@@ -463,7 +502,7 @@ unsafe extern "C" fn codec_init(
         }
         // SAFETY: PipeWire passes the pointer from init_props, or null.
         let props = unsafe { shared_props(props) };
-        let wanted = props.map_or(aptx_adaptive::Profile::Hq, Props::wanted);
+        let wanted = props.map_or_else(|| entry_profile(codec), Props::wanted);
         let s: Session<dev::AnyCore> =
             Session::open(level, wanted, mtu, &opts).map_err(session_err)?;
         if s.profile() != wanted {

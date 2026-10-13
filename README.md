@@ -5,7 +5,7 @@ aptX Adaptive for Linux: a clean-room Rust encoder plus a PipeWire Bluetooth cod
 ## status
 
 - **Works:** Bowers & Wilkins Px7 S2e, high-quality mode, 48 kHz stereo (364 kbps).
-- **Untested:** low-latency mode on real hardware; every other headset.
+- **Untested:** low-latency mode on real hardware, including picking the low-latency profile in KDE/pavucontrol; every other headset.
 - **Not yet:** 44.1 or 96 kHz.
 
 Needs PipeWire 1.6.x. Design notes are in [docs/adr/](docs/adr/).
@@ -42,11 +42,24 @@ pactl list cards short          # find the bluez_card.… name
 pactl set-card-profile <card> a2dp-sink-aptx_adaptive
 ```
 
-If your WirePlumber config sets `bluez5.codecs`, add `"aptx_adaptive"` to it, or the codec won't show up.
+If your WirePlumber config sets `bluez5.codecs`, add `"aptx_adaptive"` and `"aptx_adaptive_ll"` to it, or the codec and its low-latency profile won't show up.
 
 ## HQ or low latency
 
-The default is HQ. To use low latency at runtime, set the codec's `quality` property on the Bluetooth output node (0 = HQ, 1 = low latency), the same way LDAC's quality is set:
+The default is HQ. Low latency is a separate card profile, so you can pick it anywhere profiles are listed:
+
+| profile (`pactl list cards`) | shown as |
+|---|---|
+| `a2dp-sink` (`a2dp-sink-aptx_adaptive` in the `lc3plus_hr` slot) | High Fidelity Playback (A2DP Sink, codec aptX Adaptive) |
+| `a2dp-sink-aptx_adaptive_ll` | High Fidelity Playback (A2DP Sink, codec aptX Adaptive (Low Latency)) |
+
+- **KDE:** System Settings → Sound, the "Profile:" box under the headset; or the tray's volume applet, right-click the headset → Profiles.
+- **pavucontrol:** Configuration tab, the headset's Profile list. The Codec list next to it shows "aptX Adaptive (Low Latency)" too.
+- **command line:** `pactl set-card-profile <card> a2dp-sink-aptx_adaptive_ll`
+
+WirePlumber remembers the profile per headset. Switching profile reconfigures the Bluetooth stream, so there's a gap of a second or two, and the Px7 S2e plays its chime. On connect the headset always starts in the main profile, so a saved low-latency profile costs one extra switch (and chime) each time. To start in low latency without that, use the `bluez5.a2dp.aptx-adaptive.mode` setting below instead. `pw-dump` shows the low-latency profile's codec id as `mpeg`; that's only a borrowed id, see [ADR 0003](docs/adr/0003-ll-profile.md).
+
+To switch without the reconfigure, set the codec's `quality` property on the Bluetooth output node (0 = HQ, 1 = low latency), the same way LDAC's quality is set. This works in either profile:
 
 ```sh
 id=$(pw-cli ls Node | awk '/^\tid /{id=$2} /node.name = "bluez_output\./{print id+0; exit}')
@@ -58,7 +71,7 @@ pw-cli enum-params "$id" Props                    # what's actually running
 
 You can also find the `bluez_output.…` node id with `wpctl status`. The audio fades out, goes silent for just under a second, and fades back in. The headset's latency mode changes during the silence.
 
-**A runtime choice doesn't survive a reconnect.** To start in low latency every time, add a WirePlumber drop-in, e.g. `~/.config/wireplumber/wireplumber.conf.d/aptx-adaptive.conf`, then run `systemctl --user restart wireplumber`:
+**A `quality` change doesn't survive a reconnect.** To start the main profile in low latency every time, add a WirePlumber drop-in, e.g. `~/.config/wireplumber/wireplumber.conf.d/aptx-adaptive.conf`, then run `systemctl --user restart wireplumber`:
 
 ```
 monitor.bluez.rules = [
@@ -69,7 +82,7 @@ monitor.bluez.rules = [
 ]
 ```
 
-Low latency works on both headset generations: the Px7 S2e (aptX Adaptive R1) gets 265 kbps, and newer (R2) headsets get the R2 low-latency codec at 270 kbps. pavucontrol and the KDE settings don't show per-codec properties for any codec, so there's no menu entry for this.
+Low latency works on both headset generations: the Px7 S2e (aptX Adaptive R1) gets 265 kbps, and newer (R2) headsets get the R2 low-latency codec at 270 kbps. GUIs don't show per-codec properties for any codec; the `quality` switch is `pw-cli` only.
 
 ## check it's working
 

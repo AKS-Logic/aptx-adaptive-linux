@@ -20,10 +20,11 @@ use std::sync::OnceLock;
 use ffi::{
     A2DP_CODEC_VENDOR, A2DP_MAX_CAPS_SIZE, EINVAL, ENOENT, ENOTSUP, MEDIA_CODEC_A2DP,
     SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_FORMAT_S24_32_LE,
-    SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR, SPA_BLUETOOTH_AUDIO_CODEC_LDAC, SPA_MEDIA_SUBTYPE_RAW,
-    SPA_MEDIA_TYPE_AUDIO, SPA_PARAM_ENUM_FORMAT, SPA_PARAM_PROP_INFO, SPA_PARAM_PROPS,
-    SPA_PROP_QUALITY, SPA_TYPE_INT, SPA_TYPE_OBJECT, SPA_TYPE_OBJECT_PROP_INFO,
-    SPA_TYPE_OBJECT_PROPS, SPA_VERSION_BLUEZ5_CODEC_MEDIA, SPA_VERSION_HANDLE_FACTORY, media_codec,
+    SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR, SPA_BLUETOOTH_AUDIO_CODEC_LDAC,
+    SPA_BLUETOOTH_AUDIO_CODEC_MPEG, SPA_MEDIA_SUBTYPE_RAW, SPA_MEDIA_TYPE_AUDIO,
+    SPA_PARAM_ENUM_FORMAT, SPA_PARAM_PROP_INFO, SPA_PARAM_PROPS, SPA_PROP_QUALITY, SPA_TYPE_INT,
+    SPA_TYPE_OBJECT, SPA_TYPE_OBJECT_PROP_INFO, SPA_TYPE_OBJECT_PROPS,
+    SPA_VERSION_BLUEZ5_CODEC_MEDIA, SPA_VERSION_HANDLE_FACTORY, media_codec,
     media_codec_audio_info, spa_audio_info, spa_bluez5_codec_a2dp, spa_dict, spa_dict_item,
     spa_handle, spa_handle_factory, spa_pod, spa_pod_builder,
 };
@@ -64,7 +65,10 @@ fn plugin_path() -> &'static PathBuf {
 struct Loaded {
     _lib: libloading::Library,
     _handle: Vec<u64>,
+    /// The main entry: HQ unless the device setting says LL.
     codec: &'static media_codec,
+    /// The low-latency alias on the same endpoint.
+    ll: &'static media_codec,
 }
 
 fn load() -> Loaded {
@@ -104,14 +108,15 @@ fn load() -> Loaded {
     let iface = unsafe { &*iface.cast::<spa_bluez5_codec_a2dp>() };
     assert_eq!(iface.iface.version, SPA_VERSION_BLUEZ5_CODEC_MEDIA);
     // SAFETY: NULL-terminated array of static codecs.
-    let codec = unsafe {
-        assert!((*iface.codecs.add(1)).is_null());
-        &**iface.codecs
+    let (codec, ll) = unsafe {
+        assert!((*iface.codecs.add(2)).is_null());
+        (&**iface.codecs, &**iface.codecs.add(1))
     };
     Loaded {
         _lib: lib,
         _handle: handle,
         codec,
+        ll,
     }
 }
 
@@ -197,14 +202,76 @@ fn codec_metadata() {
     unsafe {
         assert_eq!(CStr::from_ptr(c.name), ids::CODEC_NAME);
         assert_eq!(CStr::from_ptr(c.description), ids::CODEC_DESCRIPTION);
+        assert_eq!(CStr::from_ptr(c.endpoint_name), ids::CODEC_NAME);
     }
+    assert!(c.fill_caps.is_some());
     assert!(c.encode.is_some() && c.decode.is_none());
     // A bigger socket buffer than media-sink's 4 × MTU default, so a start-up stall doesn't drop packets.
     assert_eq!(c.send_buf_size, ids::SEND_BUF_SIZE);
     assert!(c.abr_process.is_some());
+    // The LL alias is the same in every slot.
+    check_ll_entry(l.ll, c);
     if std::env::var_os(SLOT_CHILD_VAR).is_some() {
         std::process::exit(SLOT_CHILD_OK);
     }
+}
+
+/// The low-latency entry is a shared-endpoint alias of `main`, like PipeWire's `sbc_xq`:
+/// - its own id (MPEG), so `bluez5-device.c` lists a separate profile for it;
+/// - no `fill_caps`, so `codec-loader.c` keeps it next to `main` and `bluez5-dbus.c` registers
+///   no second endpoint;
+/// - `main`'s endpoint name, so a `SetConfiguration` on that endpoint can bind to it.
+///
+/// Everything else matches `main`.
+fn check_ll_entry(ll: &media_codec, main: &media_codec) {
+    assert_eq!(ll.id, SPA_BLUETOOTH_AUDIO_CODEC_MPEG);
+    assert_ne!(ll.id, main.id);
+    assert!(ll.fill_caps.is_none());
+    // SAFETY: static strings.
+    unsafe {
+        assert_eq!(CStr::from_ptr(ll.name), ids::LL_NAME);
+        assert_eq!(CStr::from_ptr(ll.name), c"aptx_adaptive_ll");
+        assert_eq!(CStr::from_ptr(ll.description), ids::LL_DESCRIPTION);
+        assert_eq!(
+            CStr::from_ptr(ll.description),
+            c"aptX Adaptive (Low Latency)"
+        );
+        assert_eq!(CStr::from_ptr(ll.endpoint_name), ids::CODEC_NAME);
+    }
+    assert_eq!((ll.kind, ll.codec_id), (main.kind, main.codec_id));
+    let (vid, cid) = (ll.vendor.vendor_id, ll.vendor.codec_id);
+    assert_eq!((vid, cid), (ids::VENDOR_ID, ids::CODEC_ID));
+    assert_eq!(ll.send_buf_size, main.send_buf_size);
+    assert!(ll.duplex_codec.is_null() && !ll.stream_pkt);
+    // Same callbacks as the main entry.
+    let same = |a: Option<usize>, b: Option<usize>| a.is_some() && a == b;
+    macro_rules! same_fn {
+        ($($f:ident),*) => {$(
+            assert!(
+                same(ll.$f.map(|f| f as usize), main.$f.map(|f| f as usize)),
+                stringify!($f)
+            );
+        )*};
+    }
+    same_fn!(
+        select_config,
+        enum_config,
+        validate_config,
+        init_props,
+        clear_props,
+        enum_props,
+        set_props,
+        init,
+        deinit,
+        update_props,
+        get_block_size,
+        get_interval,
+        abr_process,
+        start_encode,
+        encode,
+        get_delay
+    );
+    assert!(ll.decode.is_none());
 }
 
 const SLOT_CHILD_VAR: &str = "APTX_ADAPTIVE_TEST_SLOT_CHILD";
@@ -653,6 +720,74 @@ fn r2_sink_runs_ll() {
         assert_eq!(out[12] & 0x7f, 4);
         c.deinit.unwrap()(data);
         c.clear_props.unwrap()(props);
+    }
+}
+
+/// The LL profile picks the same configuration as the main entry: PipeWire's support check
+/// (`media_codec_check_caps`) and the switch both call the alias's `select_config`, which must
+/// return the full caps size.
+#[test]
+fn ll_entry_selects_same_config() {
+    let l = load();
+    assert_eq!(select(l.ll, &PX7_S2E), select(l.codec, &PX7_S2E));
+    assert_eq!(select(l.ll, &PX7_S2E).0 as usize, PX7_S2E.len());
+}
+
+/// Created through the LL alias, the stream starts in LL even with `mode = hq` (or nothing)
+/// in the device settings, and the `quality` prop still switches it live. A reset goes back to
+/// LL, the profile's own mode.
+#[test]
+fn ll_entry_starts_in_ll_and_still_switches() {
+    let l = load();
+    let c = l.ll;
+    for mode in [None, Some(c"hq")] {
+        let props = init_props(c, mode);
+        assert_eq!(
+            enum_props(c, props, SPA_PARAM_PROPS, 0).1,
+            quality_props(1).to_vec()
+        );
+        // SAFETY: props from init_props.
+        unsafe { c.clear_props.unwrap()(props) };
+    }
+    let props = init_props(c, Some(c"hq"));
+    let mut config = PX7_S2E_CONFIG;
+    let info = validated_info(c, &config);
+    let data = init_with_props(c, &mut config, &info, props);
+    assert!(!data.is_null());
+    // SAFETY: data and props from init and init_props, valid until deinit / clear_props.
+    unsafe {
+        assert_eq!(c.get_interval.unwrap()(data), 10_000_000);
+        assert_eq!(next_packet(c, data, props, false, 0).1, LL_FIELDS);
+        let hq = quality_props(0);
+        assert_eq!(c.set_props.unwrap()(props, hq.as_ptr().cast()), 1);
+        assert_eq!(enum_props(c, props, SPA_PARAM_PROPS, 0).1, hq.to_vec());
+        let mut changed = true;
+        let mut fields = LL_FIELDS;
+        for seq in 1..60 {
+            fields = next_packet(c, data, props, changed, seq).1;
+            changed = false;
+        }
+        assert_eq!(fields, HQ_FIELDS);
+        assert_eq!(c.get_interval.unwrap()(data), 14_000_000);
+        assert_eq!(c.set_props.unwrap()(props, ptr::null()), 1);
+        assert_eq!(
+            enum_props(c, props, SPA_PARAM_PROPS, 0).1,
+            quality_props(1).to_vec()
+        );
+        c.deinit.unwrap()(data);
+        c.clear_props.unwrap()(props);
+    }
+    // No props at all: the alias still starts in LL, the main entry in HQ.
+    for (codec, interval) in [(l.ll, 10_000_000), (l.codec, 14_000_000)] {
+        let mut config = PX7_S2E_CONFIG;
+        let info = validated_info(codec, &config);
+        let data = init(codec, &mut config, &info);
+        assert!(!data.is_null());
+        // SAFETY: data from init.
+        unsafe {
+            assert_eq!(codec.get_interval.unwrap()(data), interval);
+            codec.deinit.unwrap()(data);
+        }
     }
 }
 

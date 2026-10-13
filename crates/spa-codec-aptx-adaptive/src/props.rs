@@ -54,6 +54,16 @@ pub struct Props {
 }
 
 impl Props {
+    /// Starting in `initial`, which is also what a reset goes back to.
+    pub fn new(initial: Profile) -> Self {
+        Self {
+            initial,
+            wanted: AtomicU8::new(to_u8(initial)),
+            running: AtomicU8::new(to_u8(initial)),
+            ll_offered: AtomicBool::new(true),
+        }
+    }
+
     /// From the [`MODE_SETTING`] value, if set. Unknown values are HQ, like LDAC's unknown
     /// quality falls back to its default; the message says why.
     pub fn from_setting(mode: Option<&str>) -> (Self, Option<String>) {
@@ -67,15 +77,7 @@ impl Props {
                 )),
             ),
         };
-        (
-            Self {
-                initial: p,
-                wanted: AtomicU8::new(to_u8(p)),
-                running: AtomicU8::new(to_u8(p)),
-                ll_offered: AtomicBool::new(true),
-            },
-            msg,
-        )
+        (Self::new(p), msg)
     }
 
     /// The profile asked for.
@@ -164,6 +166,22 @@ mod tests {
         let (p, msg) = Props::from_setting(Some("fast"));
         assert_eq!(p.wanted(), Profile::Hq);
         assert!(msg.unwrap().contains("fast"));
+    }
+
+    /// The low-latency profile's props: LL from the start, a reset goes back to LL, and HQ is
+    /// still one `set` away.
+    #[test]
+    fn starting_in_ll() {
+        let p = Props::new(Profile::Ll);
+        assert_eq!((p.wanted(), p.running()), (Profile::Ll, Profile::Ll));
+        assert_eq!(
+            p.enum_param(SPA_PARAM_PROPS, 0).unwrap().unwrap(),
+            quality(LL)
+        );
+        assert!(p.set(Some(&quality(HQ))));
+        assert_eq!(p.wanted(), Profile::Hq);
+        assert!(p.set(None));
+        assert_eq!(p.wanted(), Profile::Ll);
     }
 
     #[test]
