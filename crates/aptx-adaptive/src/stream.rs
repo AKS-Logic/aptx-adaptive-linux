@@ -1,6 +1,6 @@
 //! Per-packet loop (spec `a2dp-integration.md` §5) around an encoder core.
 
-use crate::frame::{self, HEADER_LEN};
+use crate::frame;
 use crate::tables::{self, DEFAULT_QUALITY, Link, Profile, Row};
 use crate::{Config, Encoder, Error, Progress, Result, WINDOW_SLACK};
 
@@ -133,12 +133,6 @@ impl<C: Core> Stream<C> {
     #[must_use]
     pub fn samples_per_packet(&self) -> usize {
         self.samples_per_packet
-    }
-
-    /// The 8-byte header for every packet of this stream (§7).
-    #[must_use]
-    pub fn header(&self) -> [u8; HEADER_LEN] {
-        frame::header(self.config.profile, &self.row)
     }
 
     /// Test only (or the `fake` feature, for other crates' tests).
@@ -297,7 +291,6 @@ mod tests {
         pcm[..2].copy_from_slice(&[0x12, 0x34]);
         assert_eq!(s.push(&pcm, &mut out).unwrap(), Some(656));
         assert_eq!(out[..2], [0x34, 0x12]);
-        assert_eq!(s.header(), [0x1F, 0x63, 0x38, 0x01, 0, 0, 0, 0xAE]);
     }
 
     #[test]
@@ -426,7 +419,7 @@ mod tests {
     };
 
     /// §4.2: an R1 sink's LL row is index 0, 265 kbps / 10 ms / 480 samples, 348-byte packets,
-    /// cfg 0; header `.. 28 00 00 00 00 ad`.
+    /// cfg 0.
     #[test]
     fn ll_r1_row() {
         let row = table_row(LL, packet_budget(895)).unwrap();
@@ -441,8 +434,6 @@ mod tests {
             }
         );
         assert_eq!(row.interleaved_samples(48_000, 2), 960);
-        let s = fake::stream(LL, packet_budget(895)).unwrap();
-        assert_eq!(s.header()[2..], [40, 0, 0, 0, 0, 0xAD]);
     }
 
     /// §7J: R1 LL is the config 0 (HQ) bitstream on the LL row. 1 s of 48 kHz noise and a

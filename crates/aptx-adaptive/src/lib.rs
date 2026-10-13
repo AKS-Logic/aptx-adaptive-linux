@@ -14,7 +14,6 @@ use std::fmt;
 use codec::packetiser::Packetiser;
 use codec::{Params, Variant, alloc};
 
-pub use frame::HEADER_LEN;
 pub use stream::{Core, Stream, table_row};
 pub use tables::{DecoderLevel, Profile, Row, packet_budget};
 
