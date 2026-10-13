@@ -36,7 +36,6 @@ use props::Props;
 use session::{Session, SessionError};
 use slot::{DefaultMode, Slot};
 
-/// Lets FFI structs holding raw pointers live in statics.
 #[repr(transparent)]
 struct SyncStatic<T>(T);
 // SAFETY: only used for immutable statics whose pointers lead to other statics or
@@ -384,7 +383,6 @@ unsafe fn shared_props<'a>(props: *mut c_void) -> Option<&'a Props> {
     unsafe { props.cast::<Props>().as_ref() }
 }
 
-/// Applies the device mode only to the HQ entry that owns the endpoint.
 unsafe extern "C" fn codec_init_props(
     codec: *const media_codec,
     _flags: u32,
@@ -459,7 +457,6 @@ unsafe extern "C" fn codec_set_props(props: *mut c_void, param: *const spa_pod) 
     c_int::from(props.set(pod))
 }
 
-/// Runs on the data thread between packets without allocation, locking, or logging.
 unsafe extern "C" fn codec_update_props(data: *mut c_void, props: *mut c_void) -> c_int {
     // SAFETY: PipeWire passes the pointers from init and init_props.
     let (Some(props), false) = (unsafe { shared_props(props) }, data.is_null()) else {
@@ -515,7 +512,6 @@ unsafe extern "C" fn codec_init(
         let s: Session<dev::AnyCore> =
             Session::open(level, wanted, mtu, &opts).map_err(session_err)?;
         if s.profile() != wanted {
-            // init runs on the main thread, so this can be logged.
             let _ = writeln!(
                 std::io::stderr(),
                 "aptx-adaptive: this link can't run {wanted:?}; starting in {:?}",
@@ -566,13 +562,11 @@ unsafe extern "C" fn codec_abr_process(data: *mut c_void, unsent: usize) -> c_in
     0
 }
 
-/// Reduces one level for the next packet (§7L); replay sessions return `-ENOTSUP`.
 unsafe extern "C" fn codec_reduce_bitpool(data: *mut c_void) -> c_int {
     // SAFETY: PipeWire passes the pointer from init.
     unsafe { step_level(data, true) }
 }
 
-/// Increases one level after a send with an empty socket queue, otherwise as [`codec_reduce_bitpool`].
 unsafe extern "C" fn codec_increase_bitpool(data: *mut c_void) -> c_int {
     // SAFETY: PipeWire passes the pointer from init.
     unsafe { step_level(data, false) }
@@ -770,7 +764,6 @@ static FACTORY: SyncStatic<spa_handle_factory> = SyncStatic(spa_handle_factory {
     enum_interface_info: Some(factory_enum_interface_info),
 });
 
-/// SPA plugin entry point.
 ///
 /// # Safety
 /// `factory` and `index` must be valid pointers.

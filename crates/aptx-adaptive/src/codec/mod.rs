@@ -19,15 +19,12 @@ use predict::Predictor;
 use quant::{Band, Mode};
 
 pub const CHANNELS: usize = 2;
-/// Most subbands per channel of any variant.
 pub const MAX_SUBBANDS: usize = 8;
-/// Most values per block.
 pub const MAX_WIDTH: usize = MAX_SUBBANDS * CHANNELS;
 
 /// The bitstream variant (§1). Config 2 (speech) isn't supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variant {
-    /// R1 HQ.
     Cfg0,
     /// Create profile 1, "low-power" mode. No sink gets it (§10.D); only tests build it.
     #[cfg_attr(
@@ -41,10 +38,8 @@ pub enum Variant {
     Cfg4,
 }
 
-/// What differs between variants.
 struct Descriptor {
     subbands: usize,
-    /// Packet byte 1 (§7.1).
     frame_type: u8,
     low_power: bool,
     /// 128-tap filterbank prototype instead of 256 (8 bands only).
@@ -107,7 +102,6 @@ impl Params {
         self.desc().subbands
     }
 
-    /// Values per block: subbands of both channels.
     pub fn width(self) -> usize {
         self.subbands() * CHANNELS
     }
@@ -164,7 +158,6 @@ struct Channel {
     seed: i32,
 }
 
-/// Signal-path state for both channels before packing.
 #[derive(Debug, Clone, Copy)]
 pub struct Engine {
     params: Params,

@@ -1,7 +1,6 @@
 //! Output framing (spec `a2dp-integration.md` §7D): the payload is byte-swapped in 16-bit
 //! units.
 
-/// Copies `src` into `dst` with each 16-bit pair swapped. A trailing odd byte is copied as is.
 pub fn swap16(src: &[u8], dst: &mut [u8]) {
     let dst = &mut dst[..src.len()];
     let (pairs, tail) = src.as_chunks::<2>();

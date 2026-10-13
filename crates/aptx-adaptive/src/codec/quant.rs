@@ -13,7 +13,6 @@ pub struct Band {
     step: i32,
     ld: i32,
     pub dith: i32,
-    /// Last reconstruction, which the low-power top band repeats.
     r: i32,
 }
 
@@ -28,7 +27,6 @@ impl Default for Band {
     }
 }
 
-/// What carries between bands within one block in low-power mode.
 #[derive(Debug, Clone, Copy)]
 pub enum Mode {
     Normal,
@@ -36,7 +34,6 @@ pub enum Mode {
 }
 
 impl Band {
-    /// Quantises `x` against prediction `p` with allocation `b`. Returns (q, r).
     pub fn quantise(&mut self, x: i32, p: i32, b: u8, mode: &mut Mode) -> (i32, i32) {
         if b == 0 {
             self.step = STEP_RESET;

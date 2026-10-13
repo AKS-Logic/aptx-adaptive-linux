@@ -7,10 +7,8 @@ pub enum Profile {
 }
 
 impl Profile {
-    /// Both profiles in [`Profile::index`] order.
     pub const ALL: [Self; 2] = [Self::Hq, Self::Ll];
 
-    /// Profile position in [`Profile::ALL`].
     #[must_use]
     pub fn index(self) -> usize {
         match self {
@@ -19,7 +17,6 @@ impl Profile {
         }
     }
 
-    /// Profile at an index returned by [`Profile::index`].
     #[must_use]
     pub fn from_index(i: usize) -> Option<Self> {
         Self::ALL.get(i).copied()
@@ -46,7 +43,6 @@ pub struct Row {
 }
 
 impl Row {
-    /// Interleaved samples consumed per packet (§4.3).
     #[must_use]
     pub fn interleaved_samples(&self, rate: u32, channels: u32) -> usize {
         (u64::from(self.period_ms) * u64::from(rate) * u64::from(channels) / 1000) as usize
@@ -91,7 +87,6 @@ pub fn packet_budget(mtu: usize) -> usize {
         .min(crate::MAX_PACKET)
 }
 
-/// Link state that picks the table index (§4.1, §4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -119,7 +114,6 @@ pub fn index(profile: Profile, level: DecoderLevel, link: Link) -> usize {
     }
 }
 
-/// The table row for a profile, index and quality level 1..=7.
 #[must_use]
 pub fn row(profile: Profile, index: usize, quality: u8) -> Option<Row> {
     if !(1..=MAX_QUALITY).contains(&quality) {
@@ -165,7 +159,6 @@ const fn p(bytes: usize, cfg: u8) -> Packet {
     Packet { bytes, cfg }
 }
 
-/// Packet size and cfg for levels 1..=2 and 3..=7.
 type Packets = [Packet; 2];
 
 const fn same(p: Packet) -> Packets {

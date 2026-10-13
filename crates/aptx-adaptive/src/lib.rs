@@ -55,7 +55,6 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// What one encode call did, in interleaved samples and bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Progress {
     pub consumed: usize,
@@ -71,7 +70,6 @@ pub const WINDOW_SLACK: usize = 64;
 pub struct Encoder {
     params: Params,
     bitrate: u32,
-    /// Built on the first call, once the packet size (the window) is known.
     packetiser: Option<Box<Packetiser>>,
 }
 
@@ -163,9 +161,6 @@ impl Encoder {
         })
     }
 
-    /// Builds the packet state for `packet_len`-byte packets now rather than on the first
-    /// call, so neither the first packet nor a later [`Encoder::reset`] allocates.
-    ///
     /// # Errors
     /// `WindowSize` unless `packet_len` is a multiple of 4 in 12..=[`MAX_PACKET`], or differs
     /// from the size already in use.
@@ -195,8 +190,6 @@ impl Encoder {
         Ok(())
     }
 
-    /// The low-power config 1 encoder (create profile 1, `codec-core.md` §10.D), which no sink
-    /// gets from a source; only for the config 1 vectors. 44.1/48 kHz only.
     #[cfg(test)]
     pub(crate) fn low_power(config: Config, bitrate: u32) -> Result<Self> {
         if !matches!(config.sample_rate, 44_100 | 48_000) {
@@ -222,13 +215,6 @@ impl Encoder {
         }
     }
 
-    /// Takes any amount of interleaved 24-bit PCM (sign-extended in `i32`). Writes at most one
-    /// packet into `window`, which is the table packet size plus [`WINDOW_SLACK`].
-    ///
-    /// Like the reference, this mostly leaves packets to [`Encoder::flush`]: it only writes one
-    /// when the frame-size rule closes the packet first (`codec-core.md` §8.1). Unconsumed
-    /// input must be passed again.
-    ///
     /// # Errors
     /// `WindowSize` unless the packet size is a multiple of 4 in 12..=[`MAX_PACKET`] bytes and
     /// the same on every call.
@@ -237,16 +223,12 @@ impl Encoder {
         Ok(Progress { consumed, written })
     }
 
-    /// Codes whatever is buffered and emits the packet currently being built.
-    ///
     /// # Errors
     /// As for [`Encoder::encode_packet`].
     pub fn flush(&mut self, window: &mut [u8]) -> Result<usize> {
         Ok(self.packetiser(window)?.flush(window))
     }
 
-    /// The set-bitrate operation: clamps to the encoder's range and resets its rate control
-    /// (§8.1a).
     pub fn set_bitrate(&mut self, bps: u32) {
         match &mut self.packetiser {
             Some(p) => p.set_bitrate(bps),
@@ -255,7 +237,6 @@ impl Encoder {
     }
 }
 
-/// The packet size a window is for.
 fn check_window(window: &[u8]) -> Result<usize> {
     check_window_len(window.len().saturating_sub(WINDOW_SLACK))
 }
@@ -458,7 +439,6 @@ mod tests {
         assert_eq!(out[..3], [0x00, 0x81, 84]);
     }
 
-    /// A reset gives the same packets as a new encoder, without a new allocation.
     #[test]
     fn reset_matches_new() {
         let ll = Config {

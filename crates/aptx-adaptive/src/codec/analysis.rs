@@ -57,7 +57,6 @@ impl Tree4 {
         }
     }
 
-    /// Four samples in time order to four subband values in the quantiser domain.
     pub fn block(&mut self, s: &[i32], out: &mut [i32]) {
         let (sum0, diff0) = self.outer.run(s[0], s[1]);
         let (sum1, diff1) = self.outer.run(s[2], s[3]);

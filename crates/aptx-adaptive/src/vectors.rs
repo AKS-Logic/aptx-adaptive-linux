@@ -149,7 +149,6 @@ const fn cfg(profile: Profile, level: DecoderLevel, sample_rate: u32) -> Config 
 
 struct Run {
     name: String,
-    /// Create profile 1: config 1 through the test-only constructor.
     low_power: bool,
     config: Config,
     bitrate: u32,

@@ -16,7 +16,6 @@ pub const SCMST_COPY_FREE: u8 = 0x02;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     pub replay: Option<PathBuf>,
-    /// The SCMS-T header byte to send after the RTP header, if any.
     pub scmst: Option<u8>,
     /// Log the drift line every 10 s. Not a dev switch: read in every build.
     pub drift_log: bool,
@@ -62,7 +61,6 @@ impl Options {
         })
     }
 
-    /// What to log at init: nothing unless something differs from a normal build.
     pub fn describe(&self, var: impl Fn(&str) -> Option<OsString>) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(p) = &self.replay {

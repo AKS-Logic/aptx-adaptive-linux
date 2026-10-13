@@ -18,7 +18,6 @@ const CHANNEL_MODES: usize = 7;
 const RATE_MASK: u8 = 0xF8;
 const RATE_48K: u8 = 0x10;
 
-/// Source type 2: the host times playback (§7E, §7J).
 pub const SOURCE_TYPE_HOST: u8 = 0x02;
 
 const CHANNEL_STEREO: u8 = 0x02;
@@ -28,7 +27,6 @@ const CHANNEL_MASK: u8 = 0x3F;
 const APTX_DATA: usize = 8;
 const EXT_VERSION: usize = 15;
 const FEATURES: usize = 16;
-/// End of the R2 extension block, including its end marker; R1 body 8..26 is echoed (§7J).
 const R2_DATA_END: usize = 26;
 
 const TARGET_LATENCY_DEFAULTS: [(usize, u8); 4] = [(8, 0x50), (9, 0x64), (10, 0x64), (11, 0x64)];
@@ -98,7 +96,6 @@ impl<'a> Caps<'a> {
         }
     }
 
-    /// The R2 features word. Only meaningful at [`DecoderLevel::R2`].
     fn features(self) -> u32 {
         let b = self.0;
         u32::from_le_bytes([
@@ -162,7 +159,6 @@ pub fn select_config(bytes: &[u8]) -> Result<Vec<u8>, CapsError> {
     Ok(config)
 }
 
-/// Checks a configuration and gives the decoder level the encoder needs.
 ///
 /// # Errors
 /// As for [`Caps::parse`], or `Invalid` unless it picks exactly 48 kHz and exactly one of
@@ -188,7 +184,6 @@ pub struct PcmStream {
     pub channels: u32,
 }
 
-/// Checks the stream PipeWire proposes matches what the configuration asks for.
 ///
 /// # Errors
 /// As for [`validate_config`], or `Invalid` on a mismatch.

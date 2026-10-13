@@ -57,11 +57,8 @@ fn reset_frames(rate: u32) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fade {
     Steady,
-    /// Start of stream: frames muted so far, then a fade-in.
     StartMute(u32),
-    /// Switch: the next frame of the fade-out.
     Out(u32),
-    /// Switch: silent frames so far. The encoder is reset in here.
     Silence(u32),
     In(u32),
 }
@@ -101,25 +98,19 @@ pub struct EncodeResult {
 
 pub struct Session<C> {
     stream: Stream<C>,
-    /// SCMS-T content protection byte between the RTP header and payload.
     scmst: Option<u8>,
-    /// What's left of the MTU after the SCMS-T byte.
     mtu: usize,
     /// One block of PCM, converted. The block stays the same size for the whole session
     /// (PipeWire reads it once per transport start), so it divides the packet of every
     /// profile we can switch to.
     pcm: Vec<i32>,
-    /// Drift instrumentation (see `drift`).
     drift: Drift,
-    /// Whether the drift line is logged.
     drift_log: bool,
     /// The table row for HQ and LL on this link, worked out at init so a switch only looks
     /// it up. `None` where the encoder can't run that profile here.
     rows: [Option<Row>; 2],
-    /// The profile asked for; differs from the running one during a switch.
     target: Profile,
     fade: Fade,
-    /// Switch requests refused since the session started (reported in the drift line).
     refused: u32,
     /// Whether `reduce_bitpool` / `increase_bitpool` change the level. Off for replay, whose
     /// packets are what they are.
@@ -270,7 +261,6 @@ impl<C: Core> Session<C> {
         })
     }
 
-    /// The quality level running now (§7L).
     #[cfg(test)]
     pub fn level(&self) -> u8 {
         self.stream.level()
@@ -345,7 +335,6 @@ impl<C: Core> Session<C> {
         self.rows[profile.index()].is_some()
     }
 
-    /// The profile being switched to, or the running one when no switch is in progress.
     pub fn target(&self) -> Profile {
         self.target
     }
@@ -378,7 +367,6 @@ impl<C: Core> Session<C> {
         Ok(())
     }
 
-    /// Applies the fade to the block just converted, a frame at a time.
     fn apply_fade(&mut self) {
         if self.fade == Fade::Steady {
             return;
@@ -439,17 +427,11 @@ impl<C: Core> Session<C> {
         self.logged = (self.profile(), now);
     }
 
-    /// Switch requests refused so far.
     #[cfg(test)]
     pub fn refused(&self) -> u32 {
         self.refused
     }
 
-    /// One block of interleaved `S24_32` PCM: the largest that divides the packet of every
-    /// profile the link can run (2 ms, 96 frames, for HQ 14 ms and LL 10 ms). PipeWire only
-    /// reads this when the transport starts, so it can't follow a profile switch; a block
-    /// that divides both keeps `media-sink.c`'s packet timing (blocks × block size) right
-    /// after one.
     pub fn block_size(&self) -> usize {
         self.pcm.len() * BYTES_PER_SAMPLE
     }
@@ -565,13 +547,10 @@ mod tests {
 
     const MTU: usize = 895;
 
-    /// One packet's worth of `S24_32` PCM.
     fn packet_size<C: Core>(s: &Session<C>) -> usize {
         s.stream.samples_per_packet() * BYTES_PER_SAMPLE
     }
 
-    /// Feeds `src` a block at a time, like `media-sink.c`, until a packet comes out. Returns
-    /// the bytes consumed in all and the packet.
     fn encode_packet<C: Core>(
         s: &mut Session<C>,
         src: &[u8],
@@ -596,7 +575,6 @@ mod tests {
         session_with(MTU, budget(MTU))
     }
 
-    /// A fake session without the start-of-stream fade, so packets carry the input as is.
     fn session_with(mtu: usize, budget: usize) -> Session<Fake> {
         let stream = fake::stream(config(DecoderLevel::R1, Profile::Hq), budget).unwrap();
         let mut s = Session::with_stream(stream, mtu).unwrap();
@@ -604,7 +582,6 @@ mod tests {
         s
     }
 
-    /// Sends `n` packets and returns their RTP headers.
     fn headers(s: &mut Session<Fake>, n: usize) -> Vec<[u8; 12]> {
         let src = vec![0u8; packet_size(s)];
         let mut buf = vec![0u8; 2048];
@@ -645,7 +622,6 @@ mod tests {
         }
     }
 
-    /// The §7F timestamp is the packet's own sample count per channel, not a fixed 672.
     #[test]
     fn samples_per_packet_follows_packet() {
         for budget in [MTU, 600, 400] {
@@ -684,7 +660,6 @@ mod tests {
         );
     }
 
-    /// The SCMS-T byte goes right after the RTP header and comes out of the MTU budget.
     #[test]
     fn scmst_byte_after_rtp_header() {
         let path = vector("sine1k.r1.bin");
@@ -830,7 +805,6 @@ mod tests {
             assert_eq!(p.len(), header + 656);
             assert_eq!(p[2..4], (i as u16).to_be_bytes());
             assert!(p.len() <= MTU);
-            // The fake writes the low byte of each packet's first sample pair, swapped.
             let first = (i * 672) as u8;
             assert_eq!(p[header..header + 2], [first, first]);
         }
@@ -902,21 +876,17 @@ mod tests {
     fn ll_fits_the_mtu() {
         let s = Session::new(DecoderLevel::R1, Profile::Ll, 360).unwrap();
         assert_eq!(s.stream.row().packet_bytes, 348);
-        // R2 LL is config 4 on LL row 1 (270 kbps / 10 ms / 348 bytes, codec-core §10.F).
         let s = Session::new(DecoderLevel::R2, Profile::Hq, MTU).unwrap();
         assert!(s.can_run(Profile::Ll));
         assert_eq!(s.block_size(), 48 * 2 * 4);
     }
 
-    /// One block of constant-level PCM, `S24_32`.
     fn level_block<C: Core>(s: &Session<C>, v: i32) -> Vec<u8> {
         std::iter::repeat_n(v, s.block_size() / 4)
             .flat_map(i32::to_ne_bytes)
             .collect()
     }
 
-    /// Feeds `blocks` constant blocks and records, per block, the gain on its first frame
-    /// (×1e6) and whether a packet came out.
     fn gains<C: Core>(s: &mut Session<C>, blocks: usize) -> Vec<i32> {
         let src = level_block(s, 1_000_000);
         let mut dst = vec![0u8; 2048];
@@ -935,19 +905,15 @@ mod tests {
         let stream = fake::stream(config(DecoderLevel::R1, Profile::Hq), 887).unwrap();
         let mut s = Session::with_stream(stream, MTU).unwrap();
         assert_eq!(s.fade, Fade::StartMute(0));
-        // 96-frame blocks: 20 ms is 960 frames, 10 blocks.
         let g = gains(&mut s, 61);
         assert!(g[..10].iter().all(|&v| v == 0), "{g:?}");
-        // fade_gain(0) is about 1e-7, so the first fade-in frame still truncates to 0.
         assert_eq!(g[10], (1_000_000.0 * fade_gain(0)) as i32);
         assert_eq!(g[11], (1_000_000.0 * fade_gain(96)) as i32);
         assert!(g[11] > 0);
         assert!(g.windows(2).all(|w| w[1] >= w[0]));
-        // 960 + 4800 frames = 60 blocks.
         assert!(g[59] < 1_000_000);
         assert_eq!(s.fade, Fade::Steady);
         assert_eq!(g[60], 1_000_000);
-        // The curve stops just short of 1 (π·4800/4801); after it the gain is exactly 1.
         assert!(fade_gain(FADE_FRAMES - 1) > 0.999_999 && fade_gain(FADE_FRAMES - 1) < 1.0);
     }
 
@@ -962,7 +928,6 @@ mod tests {
         let mut hdr = [0u8; 64];
         assert_eq!(s.request(Profile::Ll), Ok(()));
         assert_eq!((s.profile(), s.target()), (Profile::Hq, Profile::Ll));
-        // (block, gain, packet length, SSRC low byte) for every block.
         let mut log = Vec::new();
         for block in 0..600 {
             let r = s.encode(&src, &mut dst).unwrap();
@@ -1063,8 +1028,6 @@ mod tests {
         assert_eq!((s.profile(), s.fade), (Profile::Ll, Fade::Steady));
     }
 
-    /// What one profile's packets look like: codec packet size, RTP header bytes 4..12
-    /// (timestamp and SSRC) and frame type.
     struct Expect {
         size: usize,
         fields: [u8; 8],
@@ -1271,12 +1234,10 @@ mod tests {
                 levels.push((s.profile(), s.level()));
             }
         }
-        // Level 4 throughout HQ despite the request; 3 from the reset on.
         let ll = levels.iter().position(|l| l.0 == Profile::Ll).unwrap();
         assert!(levels[..ll].iter().all(|&l| l == (Profile::Hq, 4)));
         assert!(levels[ll..].iter().all(|&l| l == (Profile::Ll, 3)));
         assert_eq!(s.stream.pending_level(), None);
-        // Back in HQ: level 3, 364k / 14 ms.
         s.request(Profile::Hq).unwrap();
         for _ in 0..600 {
             if s.encode(&src, &mut dst).unwrap().flush {
@@ -1340,7 +1301,6 @@ mod tests {
             ..Options::default()
         };
         let mut s = Session::open(DecoderLevel::R1, Profile::Ll, MTU, &opts).unwrap();
-        // Replay can't switch: it started in HQ instead.
         assert_eq!(s.profile(), Profile::Hq);
         assert_eq!(s.request(Profile::Ll), Err(SessionError::Unsupported));
         assert_eq!(
@@ -1348,8 +1308,6 @@ mod tests {
             (Profile::Hq, Profile::Hq, 1)
         );
         assert_eq!(s.fade, Fade::Steady);
-        // An MTU that fits LL but is too small for the encoder to run HQ at all: the block is
-        // a whole LL packet and HQ is refused.
         let mut s = Session::new(DecoderLevel::R1, Profile::Ll, 360).unwrap();
         assert_eq!(s.block_size(), 480 * 2 * 4);
         assert!(!s.can_run(Profile::Hq));
@@ -1405,7 +1363,6 @@ mod tests {
             }
             assert_eq!(p[header..], swapped, "packet {i}");
         }
-        // R1 packets begin 00 81 a1 d?; on air they're swapped.
         let p = &sent[0][header..];
         assert_eq!((p[0], p[1], p[2] & 0xf0, p[3]), (0x81, 0x00, 0xd0, 0xa1));
     }
@@ -1420,7 +1377,6 @@ mod tests {
             Session::open(DecoderLevel::R1, Profile::Hq, MTU, &opts("missing.bin")),
             Err(SessionError::BadDevSetting)
         ));
-        // 96000 samples × 4 bytes isn't a multiple of 656.
         assert!(matches!(
             Session::open(DecoderLevel::R1, Profile::Hq, MTU, &opts("sine1k.s32le")),
             Err(SessionError::BadDevSetting)

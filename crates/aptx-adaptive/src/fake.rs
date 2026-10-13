@@ -15,15 +15,11 @@ pub struct Fake {
     first: [i32; 2],
     /// Packet index → buffered samples at which that packet comes out without a flush.
     pub early: HashMap<usize, usize>,
-    /// Per packet out: whether it took a flush.
     pub forced: Vec<bool>,
     pub bitrates: Vec<u32>,
-    /// In-place resets so far.
     pub resets: usize,
 }
 
-/// A stream over a [`Fake`] sized for `config`.
-///
 /// # Errors
 /// As for [`table_row`].
 pub fn stream(config: Config, budget: usize) -> Result<Stream<Fake>> {
@@ -32,7 +28,6 @@ pub fn stream(config: Config, budget: usize) -> Result<Stream<Fake>> {
 }
 
 impl Fake {
-    /// A fake for `row`'s packets.
     #[must_use]
     pub fn new(config: Config, row: Row) -> Self {
         Self {

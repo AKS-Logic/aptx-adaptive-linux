@@ -1,5 +1,3 @@
-//! What the plugin advertises itself as. Shared with `tests/dlopen.rs`.
-
 use std::ffi::CStr;
 
 pub const INTERFACE_TYPE: &CStr = c"Spa:Pointer:Interface:Bluez5:Codec:Media:Private";

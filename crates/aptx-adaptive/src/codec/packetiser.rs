@@ -14,13 +14,9 @@ pub const MAX_FRAME_BLOCKS: usize = 64;
 struct Rate {
     nominal: u32,
     target: u32,
-    /// `A` in §8.1a: smoothed rate counting padding, latest value.
     a: u32,
-    /// `Ap` in §8.1a: the previous `A`.
     ap: u32,
-    /// `Bq` in §8.1a: smoothed rate without padding, latest value.
     bq: u32,
-    /// `Bp` in §8.1a: the previous `Bq`.
     bp: u32,
 }
 
@@ -41,28 +37,23 @@ impl Rate {
 pub struct Packetiser {
     engine: Engine,
     packer: Packer,
-    /// The current frame's subband values, `width` per block.
     frame: Vec<i32>,
     codes: Vec<i32>,
     pad_hist: i64,
     pad1: i64,
     pad2: i64,
-    /// Padding of the last packet, folded into the history after the next packet's first frame.
     pending_pad: Option<i64>,
     ov_hist: i64,
     ov_prev: i64,
     p_est: u32,
     rate: Rate,
-    /// Carried bytes the open packet started with, and blocks coded into it.
     carry_in: usize,
     packet_blocks: usize,
-    /// Allocations and codes packed so far.
     #[cfg(test)]
     sent_frames: Vec<(Vec<u8>, Vec<i32>)>,
 }
 
 impl Packetiser {
-    /// The create bitrate is clamped like set-bitrate's (§10.G).
     pub fn new(params: Params, packet_len: usize, bitrate: u32) -> Self {
         let (lo, hi) = alloc::bitrate_range(params);
         let bitrate = bitrate.clamp(lo, hi);
@@ -87,7 +78,6 @@ impl Packetiser {
         }
     }
 
-    /// Back to the state [`Packetiser::new`] gives, in place: no allocation.
     pub fn reset(&mut self, params: Params, packet_len: usize, bitrate: u32) {
         let (lo, hi) = alloc::bitrate_range(params);
         let bitrate = bitrate.clamp(lo, hi);
@@ -117,7 +107,6 @@ impl Packetiser {
         self.engine.params()
     }
 
-    /// The set-bitrate operation (§8.1a): clamps, then resets the rate check.
     pub fn set_bitrate(&mut self, bitrate: u32) {
         let (lo, hi) = alloc::bitrate_range(self.params());
         self.rate = Rate::new(bitrate.clamp(lo, hi));
@@ -131,7 +120,6 @@ impl Packetiser {
         (self.packet_len() - HEADER_BYTES) as i64
     }
 
-    /// The frame-size rule: blocks wanted, and whether that frame closes the packet.
     fn frame_size(&self) -> (usize, bool) {
         let (space, hold) = if self.packer.is_open() {
             (
@@ -165,7 +153,6 @@ impl Packetiser {
         }
     }
 
-    /// Allocates, quantises and packs the current frame.
     fn code_frame(&mut self) {
         let params = self.params();
         let w = params.width();
@@ -204,7 +191,6 @@ impl Packetiser {
         }
     }
 
-    /// Closes the packet into `out`, then runs the rate check and the carry history.
     fn close(&mut self, out: &mut [u8]) -> usize {
         let written = self.packer.bit_len() / 8;
         let pad = self.packer.finish(out);
@@ -252,8 +238,6 @@ impl Packetiser {
         };
     }
 
-    /// An encode call with input. Returns the samples consumed and the packet bytes written to
-    /// `out` (0 if it needs more input).
     pub fn encode(&mut self, pcm: &[i32], out: &mut [u8]) -> (usize, usize) {
         let w = self.params().width();
         let mut pos = 0;
@@ -279,9 +263,6 @@ impl Packetiser {
         }
     }
 
-    /// The flush call: codes the partial frame, if any, and closes the packet. With nothing
-    /// pending (no blocks buffered and no packet open) it emits nothing (`a2dp-integration.md`
-    /// §7I).
     pub fn flush(&mut self, out: &mut [u8]) -> usize {
         if self.frame.is_empty() && !self.packer.is_open() {
             return 0;
@@ -325,7 +306,6 @@ mod tests {
             .collect()
     }
 
-    /// The wrapper loop with `period`-sample chunks: encode, then flush if nothing came out.
     fn run(p: &mut Packetiser, period: usize, pcm: &[i32]) -> Vec<u8> {
         let len = p.packet_len();
         let mut out = vec![0; len];
@@ -465,7 +445,6 @@ mod tests {
         assert!(ab[..3].iter().all(|(a, b)| a == b));
     }
 
-    /// Buffers retain their initial capacity, even with undersized packets.
     #[test]
     fn buffers_never_grow() {
         let cfg3 = Params {
@@ -529,7 +508,6 @@ mod tests {
         assert!(encode(96).iter().eq(whole.iter()));
     }
 
-    /// The coded subbands follow the input: reconstruction against the analysis output.
     #[test]
     fn reconstruction_tracks_signal() {
         let w = CFG0.width();

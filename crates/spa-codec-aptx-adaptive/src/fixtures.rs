@@ -1,5 +1,3 @@
-//! Test fixtures. Shared with `tests/dlopen.rs`.
-
 use crate::ids::CAPS_LEN;
 
 /// `spec/px7s2e-a2dp-caps.md`

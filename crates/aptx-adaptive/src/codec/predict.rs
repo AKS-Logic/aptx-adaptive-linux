@@ -14,7 +14,6 @@ pub struct Predictor {
     a2: i32,
     taps: usize,
     b: [i32; MAX_TAPS],
-    /// `hist[k]` is the input of age k+1.
     hist: [i32; MAX_TAPS],
     y1: i32,
     z: i32,

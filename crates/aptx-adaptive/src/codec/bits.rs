@@ -5,7 +5,6 @@ use super::tables::Code;
 #[derive(Debug, Clone, Default)]
 pub struct BitWriter {
     bytes: Vec<u8>,
-    /// Bits used in the last byte; zero when byte-aligned.
     used: u32,
 }
 
@@ -35,13 +34,11 @@ impl BitWriter {
         self.put(c.code, u32::from(c.len));
     }
 
-    /// Empties the writer, keeping its buffer.
     pub fn clear(&mut self) {
         self.bytes.clear();
         self.used = 0;
     }
 
-    /// Exp-Golomb order 0.
     pub fn exp_golomb(&mut self, n: u32) {
         let v = n + 1;
         let len = 32 - v.leading_zeros();
@@ -73,7 +70,6 @@ impl BitWriter {
         self.bytes.capacity()
     }
 
-    /// The bytes written so far, with the last byte zero-padded.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }

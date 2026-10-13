@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 /// `APTX_ADAPTIVE_DRIFT_LOG=0` silences the drift line, in every build.
 pub const DRIFT_LOG_VAR: &str = "APTX_ADAPTIVE_DRIFT_LOG";
 
-/// How often a drift line is logged.
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
 const GAP: Duration = Duration::from_secs(1);
@@ -39,7 +38,6 @@ pub struct Report {
     /// Audio sent ahead of `CLOCK_MONOTONIC`, in ms.
     pub drift_ms: Option<f64>,
     pub backlog: (usize, usize, usize),
-    /// HQ/LL switch requests refused since the stream started.
     pub refused_switches: u32,
     /// The quality level running when the line is logged (§7L), if known.
     pub level: Option<u8>,

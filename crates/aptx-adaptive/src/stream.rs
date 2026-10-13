@@ -4,40 +4,29 @@ use crate::frame;
 use crate::tables::{self, DEFAULT_QUALITY, Link, Profile, Row};
 use crate::{Config, Encoder, Error, Progress, Result, WINDOW_SLACK};
 
-/// What the loop needs from the codec proper.
 pub trait Core {
-    /// See [`Encoder::encode_packet`].
-    ///
     /// # Errors
     /// Encoder failures.
     fn encode_packet(&mut self, pcm: &[i32], window: &mut [u8]) -> Result<Progress>;
-    /// See [`Encoder::flush`].
-    ///
     /// # Errors
     /// Encoder failures.
     fn flush(&mut self, window: &mut [u8]) -> Result<usize>;
     fn set_bitrate(&mut self, bps: u32);
-    /// Gets ready for `row`'s packets so the first packet doesn't allocate. See
-    /// [`Encoder::prepare`].
-    ///
     /// # Errors
     /// Encoder failures.
     fn prepare(&mut self, _row: &Row) -> Result<()> {
         Ok(())
     }
-    /// Back to a fresh core for `config` and `row`, in place. See [`Encoder::reset`].
-    ///
     /// # Errors
     /// `UnsupportedConfig` if this core can't (the default), or encoder failures; on error
     /// nothing changes.
     fn reset(&mut self, _config: Config, _row: &Row) -> Result<()> {
         Err(Error::UnsupportedConfig)
     }
-    /// The loop's period is now `samples` interleaved samples per packet.
     fn period_changed(&mut self, _samples: usize) {}
 }
 
-/// Above this many interleaved samples of deficit the bitrate drops by 25%.
+/// §7J.
 const DEFICIT_LIMIT: i64 = 96;
 
 /// Queued input the stream holds without growing: four of the longest packets (40 ms at
@@ -51,31 +40,20 @@ pub struct Stream<C> {
     row: Row,
     samples_per_packet: usize,
     pcm: Vec<i32>,
-    /// [`crate::MAX_PACKET`] plus slack, so any row's window fits without reallocating.
     window: Vec<u8>,
     consumed: usize,
     deficit: i64,
-    /// The link's packet budget, which other levels' rows are capped to.
     budget: usize,
-    /// Quality level of `row`.
     level: u8,
-    /// The last level request, applied after the next packet.
     pending: Option<u8>,
-    /// While set, a pending request waits.
     hold: bool,
-    /// The last value given to the core's set-bitrate, or the create bitrate.
     bitrate: u32,
-    /// Row, P, level and `bitrate` as they were before the last packet's level and bitrate
-    /// step, for [`Stream::apply_level_now`].
     before_step: (Row, usize, u8, u32),
     /// §7L / §8.2: a request for level 1 is treated as 2. Off only for the raw-row vectors.
     map_level_1: bool,
 }
 
 impl Stream<Encoder> {
-    /// A fixed level-3 stream: no QHS, TWM or 96 kHz. `budget` is the packet budget
-    /// from [`crate::packet_budget`].
-    ///
     /// # Errors
     /// Whatever the encoder rejects.
     pub fn new(config: Config, budget: usize) -> Result<Self> {
@@ -85,8 +63,6 @@ impl Stream<Encoder> {
     }
 }
 
-/// The level-3 row with no QHS, TWM or 96 kHz, fitted to `budget`.
-///
 /// # Errors
 /// `UnsupportedConfig` if there's no row or encoder for `config`, `PacketTooSmall` if the
 /// fitted row's bitrate is below what the encoder runs at, which would grow the backlog every
@@ -95,9 +71,6 @@ pub fn table_row(config: Config, budget: usize) -> Result<Row> {
     table_row_at_level(config, budget, DEFAULT_QUALITY)
 }
 
-/// [`table_row`] for quality `level`. HQ rows are capped to `budget` (§7J, recomputed per
-/// level, §7L.1); LL rows never are, so one that doesn't fit is refused.
-///
 /// # Errors
 /// As for [`table_row`], `UnsupportedConfig` for a level outside 1..=7, and
 /// `PacketTooSmall` for an LL row bigger than `budget`.
@@ -160,44 +133,33 @@ impl<C: Core> Stream<C> {
         Ok(())
     }
 
-    /// The link's packet budget (from [`crate::packet_budget`]), which the starting row was
-    /// fitted to. Other levels' HQ rows are capped to it.
     #[must_use]
     pub fn with_budget(mut self, budget: usize) -> Self {
         self.budget = budget.max(self.row.packet_bytes);
         self
     }
 
-    /// See [`Stream::with_budget`].
     #[must_use]
     pub fn budget(&self) -> usize {
         self.budget
     }
 
-    /// The quality level the stream runs at (§7L).
     #[must_use]
     pub fn level(&self) -> u8 {
         self.level
     }
 
-    /// The level request waiting for the next packet, if any.
     #[must_use]
     pub fn pending_level(&self) -> Option<u8> {
         self.pending
     }
 
-    /// The row for quality `level` on this stream's table index, fitted like the starting
-    /// row. `None` if the encoder can't run it in place: no such level, a bitrate below the
-    /// encoder's floor, or a different packet size (fixed until a reset).
     #[must_use]
     pub fn level_row(&self, level: u8) -> Option<Row> {
         let row = table_row_at_level(self.config, self.budget, level).ok()?;
         (row.packet_bytes == self.row.packet_bytes).then_some(row)
     }
 
-    /// Asks for quality `level` from the next packet boundary (§7L, §8.2): 0 and values above
-    /// 7 are ignored, 1 is treated as 2, and the last request before a packet wins. Returns
-    /// whether the request was stored. Never allocates.
     pub fn request_level(&mut self, level: u8) -> bool {
         let level = match level {
             1 if self.map_level_1 => 2,
@@ -211,16 +173,10 @@ impl<C: Core> Stream<C> {
         true
     }
 
-    /// While `hold` is set, a pending level request waits (§7L: during an HQ↔LL switch). A
-    /// request still held when [`Stream::reset`] runs is dropped: the switch runs level 3.
-    /// If the switch is called off instead, release the hold and it applies after the next
-    /// packet.
     pub fn hold_level(&mut self, hold: bool) {
         self.hold = hold;
     }
 
-    /// Test only: a request for level 1 uses the level 1 row, not level 2's
-    /// (`tests/vectors/levels/` `lv_48k_raw1`).
     #[cfg(test)]
     pub(crate) fn set_map_level_1(&mut self, on: bool) {
         self.map_level_1 = on;
@@ -231,9 +187,6 @@ impl<C: Core> Stream<C> {
         self.deficit
     }
 
-    /// §7L: the pending level's row takes effect at once, but only if its bitrate differs from
-    /// the last one given to set-bitrate are the bitrate and the period P changed. The deficit
-    /// and the encoder state carry over.
     fn apply_level(&mut self) {
         if self.hold {
             return;
@@ -269,25 +222,16 @@ impl<C: Core> Stream<C> {
         self.config
     }
 
-    /// Interleaved samples per packet.
     #[must_use]
     pub fn samples_per_packet(&self) -> usize {
         self.samples_per_packet
     }
 
-    /// Test only (or the `fake` feature, for other crates' tests).
     #[cfg(any(test, feature = "fake"))]
     pub fn core(&self) -> &C {
         &self.core
     }
 
-    /// Feeds interleaved 24-bit PCM. If a packet is out, writes it byte-swapped (no header) to
-    /// `out` and returns its length.
-    ///
-    /// At most one packet comes out per call. A caller that feeds more than
-    /// [`Stream::samples_per_packet`] at a time must then call `push(&[], out)` until it
-    /// returns `None`, or the queued input grows past its capacity and has to reallocate.
-    ///
     /// # Errors
     /// `OutputTooSmall` if `out` can't hold a packet, or encoder failures.
     pub fn push(&mut self, pcm: &[i32], out: &mut [u8]) -> Result<Option<usize>> {
@@ -333,8 +277,6 @@ impl<C: Core> Stream<C> {
         Ok(Some(written))
     }
 
-    /// §7K order after the deficit update: the level change, then the bitrate step on the
-    /// (new) row.
     fn after_packet(&mut self) {
         self.before_step = (self.row, self.samples_per_packet, self.level, self.bitrate);
         self.apply_level();
@@ -348,11 +290,6 @@ impl<C: Core> Stream<C> {
         });
     }
 
-    /// At a packet boundary (nothing consumed since the last packet), applies a pending level
-    /// now, exactly as if it had been pending when that packet came out: same deficit, same
-    /// "current bitrate", and the bitrate step re-run on the new row. So a request made
-    /// between packets takes effect from the very next packet. Otherwise it stays pending for
-    /// the next packet. Returns whether it was applied.
     pub fn apply_level_now(&mut self) -> bool {
         if self.consumed != 0 || self.hold || self.pending.is_none() {
             return false;
@@ -399,7 +336,6 @@ mod tests {
         samples.iter().map(|b| i32::from_le_bytes(*b)).collect()
     }
 
-    /// Returns the size of every packet out.
     fn run(s: &mut Stream<Fake>, pcm: &[i32], frames_per_block: usize) -> Vec<usize> {
         let mut out = [0; 2008];
         pcm.chunks(frames_per_block * 2)
@@ -419,8 +355,6 @@ mod tests {
         }
     }
 
-    /// Drives the loop the way the vectors were made (672-frame blocks) with a fake that emits
-    /// on its own wherever the reference did, and checks the `.sizes` files line for line.
     #[test]
     fn reproduces_vector_sizes() {
         for name in ["silence", "sine1k", "noise"] {
@@ -642,7 +576,6 @@ mod tests {
         }
     }
 
-    /// Pushes one period and returns the packet size, the level and P it was made with.
     fn packet(s: &mut Stream<Fake>) -> (usize, u8, usize) {
         let (level, p) = (s.level(), s.samples_per_packet());
         let mut out = [0; 656];

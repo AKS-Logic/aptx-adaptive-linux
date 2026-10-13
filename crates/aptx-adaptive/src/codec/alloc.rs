@@ -11,7 +11,6 @@ use super::{CHANNELS, MAX_WIDTH, Params, Variant};
 
 const NCH: u32 = CHANNELS as u32;
 
-/// The range the set-bitrate operation clamps to (§8.1a).
 #[must_use]
 pub fn bitrate_range(params: Params) -> (u32, u32) {
     match params.variant {
@@ -20,7 +19,6 @@ pub fn bitrate_range(params: Params) -> (u32, u32) {
     }
 }
 
-/// The target bitrate clamped for the pool and ceilings (§8.2).
 fn pool_rate(params: Params, target: u32) -> u32 {
     let (lo, hi) = match params.variant {
         Variant::Cfg0 | Variant::Cfg1 => (100_000 * NCH, 350_000 * NCH),
@@ -30,7 +28,6 @@ fn pool_rate(params: Params, target: u32) -> u32 {
     target.clamp(lo, hi)
 }
 
-/// Bits per block for both channels at `target` bit/s (§8.2).
 #[must_use]
 pub fn pool(params: Params, target: u32) -> u32 {
     let r = u64::from(pool_rate(params, target));
@@ -84,7 +81,6 @@ fn max_bits(params: Params, r: u32, tonal: bool) -> &'static [u8] {
     }
 }
 
-/// `sf` for a band whose largest magnitude is `a` (§8.4).
 fn scale_factor(a: u32) -> i32 {
     let j = ((u64::from(a) << 24) + (1 << 31)) >> 32;
     let j = j.min((1 << 31) - 1);
@@ -103,7 +99,6 @@ fn rate_idx(fs: u32) -> usize {
         .count()
 }
 
-/// The water level (§8.5).
 fn slice(p: i32, need: &[i32], maxb: &[u8], m: i32) -> i32 {
     let mut l = m + 1;
     if m <= -12 {
@@ -133,7 +128,6 @@ fn slice(p: i32, need: &[i32], maxb: &[u8], m: i32) -> i32 {
     if acc == p { l - 2 } else { l - 1 }
 }
 
-/// Scale factors and tonal flag for one frame (§8.4).
 fn scale_factors(params: Params, x: &[i32], sf: &mut [i32]) -> bool {
     let (s, w) = (params.subbands(), params.width());
     let mut peak = [0u32; MAX_WIDTH];
@@ -153,7 +147,6 @@ fn scale_factors(params: Params, x: &[i32], sf: &mut [i32]) -> bool {
         })
 }
 
-/// Bit need per band (§8.4).
 fn bit_need(params: Params, sf: &[i32], tonal: bool, need: &mut [i32]) {
     let w = params.width();
     let offsets: &[i8] = match (params.subbands(), tonal) {
@@ -172,7 +165,6 @@ fn bit_need(params: Params, sf: &[i32], tonal: bool, need: &mut [i32]) {
     }
 }
 
-/// Distribution steps 1–4 (§8.6), on allocations `out` held as `i32`.
 fn distribute(s: usize, pool: i32, need: &[i32], maxb: &[i32], sl: i32, out: &mut [i32]) {
     let w = need.len();
     out.fill(0);

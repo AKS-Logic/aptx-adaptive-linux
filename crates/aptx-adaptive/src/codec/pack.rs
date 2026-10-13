@@ -146,7 +146,6 @@ impl Packer {
         self.open = false;
     }
 
-    /// Opens a packet: the continuation and the carried bytes.
     pub fn begin(&mut self) {
         self.payload.clear();
         self.payload.exp_golomb(self.carry.len() as u32);
@@ -159,7 +158,6 @@ impl Packer {
         self.open
     }
 
-    /// Payload bits written so far in the current packet, including the continuation.
     pub fn bit_len(&self) -> usize {
         self.payload.bit_len()
     }
@@ -173,7 +171,6 @@ impl Packer {
         write_codewords(w, self.params, bits, codes);
     }
 
-    /// Appends a frame: `bits` (one allocation per band) and `codes` (`blocks` × width).
     pub fn push_frame(&mut self, bits: &[u8], codes: &[i32]) {
         if !self.open {
             self.begin();
@@ -188,7 +185,6 @@ impl Packer {
         self.prev = Some(prev);
     }
 
-    /// Closes the current packet into `out` (`packet_len` bytes). Returns the padding bytes.
     pub fn finish(&mut self, out: &mut [u8]) -> usize {
         if !self.open {
             self.begin();
@@ -228,7 +224,6 @@ impl Packer {
         [self.carry.capacity(), self.payload.capacity()]
     }
 
-    /// Bytes owed to the next packet.
     pub fn carry_len(&self) -> usize {
         self.carry.len()
     }

@@ -169,7 +169,6 @@ pub struct spa_audio_info_raw {
     pub position: [u32; SPA_AUDIO_MAX_CHANNELS],
 }
 
-/// `struct spa_audio_info`, padded to the size of the largest C union member.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct spa_audio_info {
