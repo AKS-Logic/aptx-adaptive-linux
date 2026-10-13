@@ -425,9 +425,10 @@ mod tests {
         }
     }
 
-    /// 48- and 672-frame chunks give the same output (`codec-core.md` §8).
+    /// 48- and 672-frame chunks give the same output at 48 kHz. Other chunkings can differ
+    /// (`codec-core.md` §10.B; `c0_48k_L3_chunk13` in the parity vectors).
     #[test]
-    fn chunking_does_not_matter() {
+    fn some_chunkings_agree() {
         let pcm = noise(9600);
         let encode = |step: usize| {
             let mut p = Packetiser::new(CFG0, 656, 364_000);
