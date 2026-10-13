@@ -111,7 +111,7 @@ static CODECS_LC3PLUS_HR: SyncStatic<[*const media_codec; 2]> =
     SyncStatic([&raw const CODEC_LC3PLUS_HR.0, ptr::null()]);
 
 /// The codec list for the slot in `APTX_ADAPTIVE_SLOT`, read when the loader instantiates us.
-/// A bad value is logged once per process.
+/// A bad value is logged once per library load.
 fn codecs() -> *const *const media_codec {
     static BAD_SLOT_LOGGED: Once = Once::new();
     let slot = slot::Slot::from_env(|k| std::env::var_os(k)).unwrap_or_else(|e| {

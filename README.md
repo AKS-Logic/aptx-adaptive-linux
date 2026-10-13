@@ -90,7 +90,7 @@ scripts/install-plugin.sh --uninstall
 systemctl --user restart wireplumber pipewire
 ```
 
-This removes the plugin and the drop-ins. It's safe to run twice. Directories the install created (`~/.local/lib/spa-0.2/…`, `~/.config/systemd/user/….d`) are removed only if empty, so `~/.local/lib` and `~/.config/systemd/user` themselves are left in place.
+This removes the plugin and the drop-ins. It's safe to run twice. Directories the install created (`~/.local/lib/spa-0.2/…`, `${XDG_CONFIG_HOME:-~/.config}/systemd/user/….d`) are removed only if empty, so `~/.local/lib` and `${XDG_CONFIG_HOME:-~/.config}/systemd/user` themselves are left in place.
 
 ## clean room
 

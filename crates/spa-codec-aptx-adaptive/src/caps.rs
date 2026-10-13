@@ -154,7 +154,7 @@ pub fn fill_caps() -> Vec<u8> {
 }
 
 /// Picks 48 kHz and one 2-channel mode and puts `source_type` (normally [`SOURCE_TYPE_HOST`])
-/// in byte 6 bits 0..2 (§7E). Then, per §7J:
+/// in byte 6 bits 1..2 (§7E); the sink flag 0x01 is always cleared. Then, per §7J:
 /// - an R2 sink gets our own block ([`r2_data`]), with the features low byte set to ours & the
 ///   sink's;
 /// - an R1 sink gets its own body 8..25 back, except that with [`SOURCE_TYPE_HOST`] a zero

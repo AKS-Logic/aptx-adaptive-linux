@@ -202,7 +202,15 @@ fn codec_metadata() {
     // A bigger socket buffer than media-sink's 4 × MTU default, so a start-up stall doesn't drop packets.
     assert_eq!(c.send_buf_size, ids::SEND_BUF_SIZE);
     assert!(c.abr_process.is_some());
+    if std::env::var_os(SLOT_CHILD_VAR).is_some() {
+        std::process::exit(SLOT_CHILD_OK);
+    }
 }
+
+const SLOT_CHILD_VAR: &str = "APTX_ADAPTIVE_TEST_SLOT_CHILD";
+/// Exit status of a child that ran `codec_metadata` and passed. A child that matched no test
+/// exits 0, so it can't pass by accident.
+const SLOT_CHILD_OK: i32 = 42;
 
 /// Re-runs `codec_metadata` in a child with each `APTX_ADAPTIVE_SLOT`, since the slot is read
 /// from the environment at factory init and tests can't safely set it in-process.
@@ -212,10 +220,11 @@ fn slot_follows_env() {
         let out = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "codec_metadata", "--test-threads=1"])
             .env("APTX_ADAPTIVE_SLOT", slot)
+            .env(SLOT_CHILD_VAR, "1")
             .output()
             .unwrap();
         assert!(
-            out.status.success(),
+            out.status.code() == Some(SLOT_CHILD_OK),
             "slot {slot}: {}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
