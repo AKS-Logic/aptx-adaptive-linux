@@ -987,3 +987,7 @@ Across all 44 streams these needed no change: §3.1, §3.2 (256-tap), §4–§6,
 | G, create clamp | `c0_48k_qhs_L1` | consistent; no byte depends on it in the vectors |
 | H, three-quarter cut | `c0_48k_qhs_L1` | fires once, no effect after the clamp |
 | config 0 / 3 / 1 rows | every other parity vector | byte-exact |
+
+### 10.J Config 4 above 9 bits (verified 2026-10-13)
+
+When config 4's target reaches 420000 (nominal ≥ 336000 after the 5/4 cap), the §8.3 chain would pick the 520 (or Max) max-bits table, which allows bands of more than 9 bits. Config 4 has no escapes, so such an allocation can't be coded. The reference encoder doesn't guard against this: with loud one-sided input it gives a band 10 bits, writes that band's allocation with zero bits, and produces an undecodable packet. **Rule for a correct encoder:** for config 4, whenever the chain would pick the 520 or Max table, use the 8-band 420 table instead. This matches the reference byte for byte on every packet before its first 10-bit band, and keeps every packet decodable.
