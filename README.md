@@ -5,8 +5,8 @@ aptX Adaptive for Linux: a clean-room Rust encoder plus a PipeWire Bluetooth cod
 ## status
 
 - **Works:** Bowers & Wilkins Px7 S2e, high-quality mode, 48 kHz stereo (364 kbps).
-- **Untested:** every other headset.
-- **Not yet:** low-latency mode, 44.1 or 96 kHz.
+- **Untested:** low-latency mode on real hardware; every other headset.
+- **Not yet:** 44.1 or 96 kHz.
 
 Needs PipeWire 1.6.x. Design notes are in [docs/adr/](docs/adr/).
 
@@ -44,6 +44,33 @@ pactl set-card-profile <card> a2dp-sink-aptx_adaptive
 
 If your WirePlumber config sets `bluez5.codecs`, add `"aptx_adaptive"` to it, or the codec won't show up.
 
+## HQ or low latency
+
+The default is HQ. To use low latency at runtime, set the codec's `quality` property on the Bluetooth output node (0 = HQ, 1 = low latency), the same way LDAC's quality is set:
+
+```sh
+id=$(pw-cli ls Node | awk '/^\tid /{id=$2} /node.name = "bluez_output\./{print id+0; exit}')
+pw-cli enum-params "$id" PropInfo                 # "aptX Adaptive mode": 0 "HQ", 1 "Low latency"
+pw-cli set-param "$id" Props '{ quality = 1 }'    # low latency
+pw-cli set-param "$id" Props '{ quality = 0 }'    # HQ
+pw-cli enum-params "$id" Props                    # what's actually running
+```
+
+You can also find the `bluez_output.…` node id with `wpctl status`. The audio fades out, goes silent for just under a second, and fades back in. The headset's latency mode changes during the silence.
+
+**A runtime choice doesn't survive a reconnect.** To start in low latency every time, add a WirePlumber drop-in, e.g. `~/.config/wireplumber/wireplumber.conf.d/aptx-adaptive.conf`, then run `systemctl --user restart wireplumber`:
+
+```
+monitor.bluez.rules = [
+  {
+    matches = [ { device.name = "~bluez_card." } ]
+    actions = { update-props = { bluez5.a2dp.aptx-adaptive.mode = "ll" } }
+  }
+]
+```
+
+Low latency works on both headset generations: the Px7 S2e (aptX Adaptive R1) gets 265 kbps, and newer (R2) headsets get the R2 low-latency codec at 270 kbps. pavucontrol and the KDE settings don't show per-codec properties for any codec, so there's no menu entry for this.
+
 ## check it's working
 
 While audio plays, the plugin logs a line every 10 s:
@@ -52,7 +79,7 @@ While audio plays, the plugin logs a line every 10 s:
 journalctl --user -u wireplumber -f | grep 'aptx-adaptive: drift'
 ```
 
-To silence it, set `APTX_ADAPTIVE_DRIFT_LOG=0` in WirePlumber's service environment.
+To silence it, set `APTX_ADAPTIVE_DRIFT_LOG=0` in WirePlumber's service environment. If a mode switch was refused (e.g. low latency when the link's MTU is too small for it), the line ends with `refused mode switches N`.
 
 To confirm the headset's latency target is right, run `sudo btmon` and start playback. The headset's AVDTP Delay Report after Start should read 200.0 ms. If it reads 0 ms, expect stutter after a minute or two.
 
