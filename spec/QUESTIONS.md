@@ -312,3 +312,4 @@ Resolved by `codec-core.md` §10 (2026-10-13): config 4 (§10.F; "from codec-cor
 ## from parity / get_delay
 
 1. **Config 4 encoder delay.** `a2dp-integration.md` §7I gives the filterbank delay for configs 0, 1 and 3 (90 / 66 / 255) but not config 4 (8-band, 128-tap prototype). By analogy with config 3's 256 − 1 it might be 127; please measure it the same way. The plugin reports 0 for config 4 until then.
+2. **Config 3 delay at 44.1 kHz (and 88.2 kHz).** §7I measured config 3's 255-sample delay at 48 and 96 kHz only. The plugin assumes 255 at 44.1 kHz too, since the filterbank is the same 256-tap prototype and the delay is a tap count; please confirm.
