@@ -124,6 +124,18 @@ journalctl --user -u wireplumber -f | grep 'aptx-adaptive: level'
 
 To confirm the headset's latency target is right, run `sudo btmon` and start playback. The headset's AVDTP Delay Report after Start should read 200.0 ms. If it reads 0 ms, expect stutter after a minute or two.
 
+## headset keeps switching to the call profile
+
+If the headset drops from aptX Adaptive to "Headset Head Unit" (HFP, 16 kHz mono), that's WirePlumber, not this plugin. With `bluetooth.autoswitch-to-headset-profile` on (the default), every headset's microphone is always listed as an input. As soon as any app records from it (a browser, a call app, or a fallback when your usual mic is unplugged), WirePlumber switches the headset to HFP, and it switches back a few seconds after recording stops.
+
+WirePlumber 0.5 only has this as a global setting; there's no per-device switch. To turn it off and keep the change:
+
+```sh
+wpctl settings --save bluetooth.autoswitch-to-headset-profile false
+```
+
+The headset microphone then only appears when you pick the "Headset Head Unit" profile by hand, e.g. for a call. Turn it back on with `true`.
+
 ## uninstall
 
 ```sh
