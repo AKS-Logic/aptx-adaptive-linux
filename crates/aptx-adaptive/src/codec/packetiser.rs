@@ -65,14 +65,14 @@ pub struct Packetiser {
 impl Packetiser {
     /// The create bitrate is clamped like set-bitrate's (§10.G).
     pub fn new(params: Params, packet_len: usize, bitrate: u32) -> Self {
-        let w = params.width();
         let (lo, hi) = alloc::bitrate_range(params);
         let bitrate = bitrate.clamp(lo, hi);
+        // Sized for the widest variant, so `reset` to any variant never allocates.
         Self {
             engine: Engine::new(params),
             packer: Packer::new(params, packet_len),
-            frame: Vec::with_capacity(MAX_FRAME_BLOCKS * w),
-            codes: Vec::with_capacity(MAX_FRAME_BLOCKS * w),
+            frame: Vec::with_capacity(MAX_FRAME_BLOCKS * MAX_WIDTH),
+            codes: Vec::with_capacity(MAX_FRAME_BLOCKS * MAX_WIDTH),
             pad_hist: 0,
             pad1: 0,
             pad2: 0,
@@ -86,6 +86,28 @@ impl Packetiser {
             #[cfg(test)]
             sent_frames: Vec::new(),
         }
+    }
+
+    /// Back to the state [`Packetiser::new`] gives, in place: no allocation.
+    pub fn reset(&mut self, params: Params, packet_len: usize, bitrate: u32) {
+        let (lo, hi) = alloc::bitrate_range(params);
+        let bitrate = bitrate.clamp(lo, hi);
+        self.engine = Engine::new(params);
+        self.packer.reset(params, packet_len);
+        self.frame.clear();
+        self.codes.clear();
+        self.pad_hist = 0;
+        self.pad1 = 0;
+        self.pad2 = 0;
+        self.pending_pad = None;
+        self.ov_hist = 0;
+        self.ov_prev = 0;
+        self.p_est = alloc::pool(params, bitrate);
+        self.rate = Rate::new(bitrate);
+        self.carry_in = 0;
+        self.packet_blocks = 0;
+        #[cfg(test)]
+        self.sent_frames.clear();
     }
 
     pub fn packet_len(&self) -> usize {
@@ -258,8 +280,13 @@ impl Packetiser {
         }
     }
 
-    /// The flush call: codes the partial frame, if any, and closes the packet.
+    /// The flush call: codes the partial frame, if any, and closes the packet. With nothing
+    /// pending (no blocks buffered and no packet open) it emits nothing (`a2dp-integration.md`
+    /// §7I).
     pub fn flush(&mut self, out: &mut [u8]) -> usize {
+        if self.frame.is_empty() && !self.packer.is_open() {
+            return 0;
+        }
         if !self.frame.is_empty() {
             self.code_frame();
         }

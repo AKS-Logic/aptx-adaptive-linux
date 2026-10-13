@@ -7,6 +7,24 @@ pub enum Profile {
 }
 
 impl Profile {
+    /// Both profiles, in [`Profile::index`] order.
+    pub const ALL: [Self; 2] = [Self::Hq, Self::Ll];
+
+    /// 0 for HQ, 1 for LL: the position in [`Profile::ALL`].
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::Hq => 0,
+            Self::Ll => 1,
+        }
+    }
+
+    /// The inverse of [`Profile::index`].
+    #[must_use]
+    pub fn from_index(i: usize) -> Option<Self> {
+        Self::ALL.get(i).copied()
+    }
+
     /// Header byte 7 (§4.3).
     #[must_use]
     pub fn mode_byte(self) -> u8 {

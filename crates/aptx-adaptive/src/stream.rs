@@ -17,10 +17,30 @@ pub trait Core {
     /// Encoder failures.
     fn flush(&mut self, window: &mut [u8]) -> Result<usize>;
     fn set_bitrate(&mut self, bps: u32);
+    /// Gets ready for `row`'s packets so the first packet doesn't allocate. See
+    /// [`Encoder::prepare`].
+    ///
+    /// # Errors
+    /// Encoder failures.
+    fn prepare(&mut self, _row: &Row) -> Result<()> {
+        Ok(())
+    }
+    /// Back to a fresh core for `config` and `row`, in place. See [`Encoder::reset`].
+    ///
+    /// # Errors
+    /// `UnsupportedConfig` if this core can't (the default), or encoder failures; on error
+    /// nothing changes.
+    fn reset(&mut self, _config: Config, _row: &Row) -> Result<()> {
+        Err(Error::UnsupportedConfig)
+    }
 }
 
 /// Above this many interleaved samples of deficit the bitrate drops by 25%.
 const DEFICIT_LIMIT: i64 = 96;
+
+/// Queued input the stream holds without growing: four of the longest packets (40 ms at
+/// 96 kHz stereo), far more than one push of a period leaves behind.
+const PCM_CAPACITY: usize = 4 * 2 * 3840;
 
 #[derive(Debug)]
 pub struct Stream<C> {
@@ -29,6 +49,7 @@ pub struct Stream<C> {
     row: Row,
     samples_per_packet: usize,
     pcm: Vec<i32>,
+    /// [`crate::MAX_PACKET`] plus slack, so any row's window fits without reallocating.
     window: Vec<u8>,
     consumed: usize,
     deficit: i64,
@@ -65,17 +86,37 @@ pub fn table_row(config: Config, budget: usize) -> Result<Row> {
 }
 
 impl<C: Core> Stream<C> {
-    pub fn with_core(core: C, config: Config, row: Row) -> Self {
+    pub fn with_core(mut core: C, config: Config, row: Row) -> Self {
+        // A core that can't prepare fails on its first packet instead, with the same error.
+        let _ = core.prepare(&row);
+        let pcm = Vec::with_capacity(PCM_CAPACITY);
         Self {
             core,
             config,
             row,
             samples_per_packet: row.interleaved_samples(config.sample_rate, config.channels.into()),
-            pcm: Vec::new(),
-            window: vec![0; row.packet_bytes + WINDOW_SLACK],
+            pcm,
+            window: vec![0; crate::MAX_PACKET + WINDOW_SLACK],
             consumed: 0,
             deficit: 0,
         }
+    }
+
+    /// Switches to `config` and `row` in place (§7K): resets the core and zeroes the loop
+    /// counters. Queued input is kept. No allocation, given a core whose reset doesn't
+    /// allocate. On error nothing changes.
+    ///
+    /// # Errors
+    /// Whatever the core's reset returns.
+    pub fn reset(&mut self, config: Config, row: Row) -> Result<()> {
+        self.core.reset(config, &row)?;
+        self.config = config;
+        self.row = row;
+        self.samples_per_packet =
+            row.interleaved_samples(config.sample_rate, config.channels.into());
+        self.consumed = 0;
+        self.deficit = 0;
+        Ok(())
     }
 
     #[must_use]
@@ -100,9 +141,16 @@ impl<C: Core> Stream<C> {
         frame::header(self.config.profile, &self.row)
     }
 
-    #[cfg(test)]
+    /// Test only (or the `fake` feature, for other crates' tests).
+    #[cfg(any(test, feature = "fake"))]
     pub fn core(&self) -> &C {
         &self.core
+    }
+
+    /// Input taken but not yet consumed by the encoder.
+    #[must_use]
+    pub fn pending(&self) -> &[i32] {
+        &self.pcm
     }
 
     /// Feeds interleaved 24-bit PCM. If a packet is out, writes it byte-swapped (no header) to
@@ -110,7 +158,7 @@ impl<C: Core> Stream<C> {
     ///
     /// At most one packet comes out per call. A caller that feeds more than
     /// [`Stream::samples_per_packet`] at a time must then call `push(&[], out)` until it
-    /// returns `None`, or the queued input grows without limit.
+    /// returns `None`, or the queued input grows past its capacity and has to reallocate.
     ///
     /// # Errors
     /// `OutputTooSmall` if `out` can't hold a packet, or encoder failures.
@@ -119,14 +167,22 @@ impl<C: Core> Stream<C> {
             return Err(Error::OutputTooSmall);
         }
         self.pcm.extend_from_slice(pcm);
-        let p = self.core.encode_packet(&self.pcm, &mut self.window)?;
+        let mut window = std::mem::take(&mut self.window);
+        let res = self.encode(&mut window, out);
+        self.window = window;
+        res
+    }
+
+    fn encode(&mut self, window: &mut [u8], out: &mut [u8]) -> Result<Option<usize>> {
+        let window = &mut window[..self.row.packet_bytes + WINDOW_SLACK];
+        let p = self.core.encode_packet(&self.pcm, window)?;
         self.pcm.drain(..p.consumed);
         self.consumed += p.consumed;
 
         let due = self.consumed as i64 >= self.samples_per_packet as i64 + self.deficit;
         let written = match p.written {
             0 if !due => return Ok(None),
-            0 => self.core.flush(&mut self.window)?,
+            0 => self.core.flush(window)?,
             n => n,
         };
         if written == 0 {
@@ -137,15 +193,19 @@ impl<C: Core> Stream<C> {
         }
         self.deficit += self.samples_per_packet as i64 - self.consumed as i64;
         self.consumed = 0;
-        // LL never carries a deficit (`codec-core.md` §10.C).
+        frame::swap16(&window[..written], out);
+
+        // §7K, codec-core §10.C: LL never carries a deficit. The reference's extra flush here
+        // hits a full window and never produces anything, so it isn't made.
         if self.config.profile == Profile::Ll {
             self.deficit = 0;
         }
-        frame::swap16(&self.window[..written], out);
 
+        // §7J: the 25 % drop clamps at the encoder's floor (200 kbps in stereo).
         let table = self.row.bitrate;
+        let floor = crate::min_bitrate(self.config).unwrap_or(0);
         self.core.set_bitrate(if self.deficit > DEFICIT_LIMIT {
-            table - table / 4
+            (table - table / 4).max(floor.min(table))
         } else {
             table
         });
@@ -261,21 +321,6 @@ mod tests {
         assert_eq!(s.core().bitrates, [273_000, 364_000]);
     }
 
-    /// `codec-core.md` §10.C: in LL an early packet leaves no deficit and no bitrate drop.
-    #[test]
-    fn ll_zeroes_the_deficit() {
-        let ll = Config {
-            profile: Profile::Ll,
-            ..PX7
-        };
-        let mut s = fake::stream(ll, packet_budget(895)).unwrap();
-        s.core.early.insert(0, 600);
-        let mut out = [0; 656];
-        assert_eq!(s.push(&[0; 960], &mut out).unwrap(), Some(348));
-        assert_eq!(s.deficit, 0);
-        assert_eq!(s.core().bitrates, [265_000]);
-    }
-
     #[test]
     fn rejects_packets_that_cant_hold_a_period() {
         assert_eq!(table_row(PX7, 128).unwrap_err(), Error::PacketTooSmall);
@@ -298,6 +343,7 @@ mod tests {
         let row = table_row(config, packet_budget(895)).unwrap();
         let mut s = Stream::with_core(Encoder::new(config, row.bitrate).unwrap(), config, row);
         assert_eq!(s.samples_per_packet(), 960);
+        let capacity = s.pcm.capacity();
         let mut out = [0; 2008];
         let chunk: Vec<i32> = (0..1344).map(|i| (i * 2654) % 65_536 - 32_768).collect();
         let (mut fed, mut packets, mut most) = (0, 0, 0);
@@ -310,10 +356,140 @@ mod tests {
             most = most.max(s.pcm.len());
         }
         assert!(most < 2 * 960, "queue reached {most}");
+        // The queued input never outgrows its first allocation.
+        assert_eq!(s.pcm.capacity(), capacity);
         assert!(
             packets <= fed / 960 && packets >= fed / chunk.len(),
             "{packets} packets for {fed}"
         );
+    }
+
+    /// §7K: in LL the deficit is never carried. 30 s in 2 ms blocks is one packet per 10 ms
+    /// and the bitrate never drops.
+    #[test]
+    fn ll_never_carries_a_deficit() {
+        let row = table_row(LL, packet_budget(895)).unwrap();
+        let mut s = Stream::with_core(Encoder::new(LL, row.bitrate).unwrap(), LL, row);
+        let mut out = [0; 348];
+        let mut seed = 1u32;
+        let (mut fed, mut packets) = (0, 0);
+        while fed < 30 * 96_000 {
+            let block: Vec<i32> = (0..192)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed as i32) >> 9
+                })
+                .collect();
+            packets += usize::from(s.push(&block, &mut out).unwrap().is_some());
+            assert_eq!(s.deficit, 0);
+            fed += block.len();
+        }
+        // One packet per 960-sample period, give or take the last one in flight.
+        assert!(
+            packets <= fed / 960 && packets + 1 >= fed / 960,
+            "{packets} packets for {fed}"
+        );
+    }
+
+    /// §7K, `codec-core.md` §10.C, driven with a fake: an early LL packet leaves a deficit,
+    /// which is zeroed at once, so there's no bitrate drop and the next packet is due a full
+    /// period later. HQ keeps it (§5).
+    #[test]
+    fn ll_zeroes_the_deficit() {
+        let row = table_row(LL, packet_budget(895)).unwrap();
+        let mut s = Stream::with_core(Fake::new(LL, row), LL, row);
+        s.core.early.insert(0, 600);
+        let mut out = [0; 348];
+        assert_eq!(s.push(&[0; 960], &mut out).unwrap(), Some(348));
+        assert_eq!(s.deficit, 0);
+        assert_eq!(s.core().forced, [false]);
+        assert_eq!(s.core().bitrates, [265_000]);
+        let mut s = px7();
+        s.core.early.insert(0, 1000);
+        let mut out = [0; 656];
+        s.push(&[0; 1344], &mut out).unwrap();
+        assert_eq!(s.deficit, 344);
+    }
+
+    /// §7J: the 25 % drop clamps at the 200 kbps stereo floor, so LL-sized rates don't go
+    /// under it. HQ at 364 kbps is unaffected (273 kbps).
+    #[test]
+    fn deficit_drop_clamps_at_floor() {
+        let row = Row {
+            bitrate: 265_000,
+            ..table_row(PX7, packet_budget(895)).unwrap()
+        };
+        let mut s = Stream::with_core(Fake::new(PX7, row), PX7, row);
+        s.core.early.insert(0, 1000);
+        let mut out = [0; 656];
+        assert_eq!(s.push(&[0; 1344], &mut out).unwrap(), Some(656));
+        assert_eq!(s.core().bitrates, [200_000]);
+    }
+
+    const LL: Config = Config {
+        profile: Profile::Ll,
+        ..PX7
+    };
+
+    /// §4.2: an R1 sink's LL row is index 0, 265 kbps / 10 ms / 480 samples, 348-byte packets,
+    /// cfg 0; header `.. 28 00 00 00 00 ad`.
+    #[test]
+    fn ll_r1_row() {
+        let row = table_row(LL, packet_budget(895)).unwrap();
+        assert_eq!(
+            row,
+            Row {
+                bitrate: 265_000,
+                period_ms: 10,
+                samples_per_channel: 480,
+                packet_bytes: 348,
+                cfg: 0,
+            }
+        );
+        assert_eq!(row.interleaved_samples(48_000, 2), 960);
+        let s = fake::stream(LL, packet_budget(895)).unwrap();
+        assert_eq!(s.header()[2..], [40, 0, 0, 0, 0, 0xAD]);
+    }
+
+    /// §7J: R1 LL is the config 0 (HQ) bitstream on the LL row. 1 s of 48 kHz noise and a
+    /// sine in 2 ms blocks gives 100 packets of 348 bytes, which the test decoder parses back
+    /// as config 0 frames covering the input.
+    #[test]
+    fn ll_real_encoder_packets_decode() {
+        use crate::codec::decode::{Frame, decode};
+        let row = table_row(LL, packet_budget(895)).unwrap();
+        let params = crate::params(LL).unwrap();
+        assert_eq!(params.variant, crate::codec::Variant::Cfg0);
+        let mut seed = 7u32;
+        let noise: Vec<i32> = (0..96_000)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed as i32) >> 10
+            })
+            .collect();
+        for pcm in [noise, read_pcm("sine1k.s32le")] {
+            let mut s = Stream::with_core(Encoder::new(LL, row.bitrate).unwrap(), LL, row);
+            let mut out = [0; 348];
+            let mut packets = Vec::new();
+            for block in pcm.chunks(192) {
+                if let Some(len) = s.push(block, &mut out).unwrap() {
+                    assert_eq!(len, 348);
+                    let mut p = [0; 348];
+                    frame::swap16(&out, &mut p);
+                    // Frame type 1 (config 0), 0x80 if padded; Lp/4 − 3 = 84.
+                    assert_eq!((p[0], p[1] & 0x7F, p[2]), (0, 1, 84));
+                    packets.extend_from_slice(&p);
+                }
+            }
+            assert_eq!(packets.len(), 100 * 348);
+            let frames = decode(params, &packets, 348);
+            let blocks: usize = frames.iter().map(Frame::blocks).sum();
+            // 4 subbands × 2 channels per block: 8 interleaved samples. The last packet's
+            // carry isn't out yet.
+            let all = 96_000 / 8;
+            assert!(blocks <= all && all - blocks < 128, "{blocks} of {all}");
+            assert!(frames.iter().all(|f| f.bits.len() == 8));
+        }
     }
 
     #[test]
