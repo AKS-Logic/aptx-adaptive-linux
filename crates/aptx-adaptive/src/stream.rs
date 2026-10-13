@@ -1,7 +1,7 @@
 //! Per-packet loop (spec `a2dp-integration.md` §5) around an encoder core.
 
 use crate::frame::{self, HEADER_LEN};
-use crate::tables::{self, DEFAULT_QUALITY, Link, Row};
+use crate::tables::{self, DEFAULT_QUALITY, Link, Profile, Row};
 use crate::{Config, Encoder, Error, Progress, Result, WINDOW_SLACK};
 
 /// What the loop needs from the codec proper.
@@ -137,6 +137,10 @@ impl<C: Core> Stream<C> {
         }
         self.deficit += self.samples_per_packet as i64 - self.consumed as i64;
         self.consumed = 0;
+        // LL never carries a deficit (`codec-core.md` §10.C).
+        if self.config.profile == Profile::Ll {
+            self.deficit = 0;
+        }
         frame::swap16(&self.window[..written], out);
 
         let table = self.row.bitrate;
@@ -156,7 +160,7 @@ mod tests {
 
     use super::*;
     use crate::fake::{self, Fake};
-    use crate::{DecoderLevel, Profile, packet_budget};
+    use crate::{DecoderLevel, packet_budget};
 
     const PX7: Config = Config {
         profile: Profile::Hq,
@@ -257,6 +261,21 @@ mod tests {
         assert_eq!(s.core().bitrates, [273_000, 364_000]);
     }
 
+    /// `codec-core.md` §10.C: in LL an early packet leaves no deficit and no bitrate drop.
+    #[test]
+    fn ll_zeroes_the_deficit() {
+        let ll = Config {
+            profile: Profile::Ll,
+            ..PX7
+        };
+        let mut s = fake::stream(ll, packet_budget(895)).unwrap();
+        s.core.early.insert(0, 600);
+        let mut out = [0; 656];
+        assert_eq!(s.push(&[0; 960], &mut out).unwrap(), Some(348));
+        assert_eq!(s.deficit, 0);
+        assert_eq!(s.core().bitrates, [265_000]);
+    }
+
     #[test]
     fn rejects_packets_that_cant_hold_a_period() {
         assert_eq!(table_row(PX7, 128).unwrap_err(), Error::PacketTooSmall);
@@ -266,7 +285,9 @@ mod tests {
     }
 
     /// Config 1 (960-sample period) fed 1344 samples a call for 30 s, draining with empty
-    /// pushes: the queue stays under two periods.
+    /// pushes: the queue stays under two periods. LL drops the deficit (`codec-core.md`
+    /// §10.C), so a packet that took more than a period isn't made up for and there are fewer
+    /// packets than periods, never more.
     #[test]
     fn oversized_pushes_stay_bounded_when_drained() {
         let config = Config {
@@ -289,7 +310,7 @@ mod tests {
         }
         assert!(most < 2 * 960, "queue reached {most}");
         assert!(
-            packets.abs_diff(fed / 960) <= 2,
+            packets <= fed / 960 && packets >= fed / 1344,
             "{packets} packets for {fed}"
         );
     }
