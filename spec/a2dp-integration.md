@@ -830,3 +830,9 @@ PipeWire's own back-off (½ s between reductions, 1 s of no backlog before an in
 3. **MTU cap per level.** The §7J cap is recomputed at every level change, for HQ rows only (never LL). The bitrate is computed in single precision: trunc(float32(budget·8000 / period_ms) − 25000.0). This makes §4's UNCERTAIN formula and §7J's integer form exact.
 4. **Equal bitrate, different period (R2 LL index 2, L3↔L4).** Confirmed: no bitrate call is made, the loop keeps the old period, and the codec packets are identical to staying at the old level. The period byte switches anyway. A source should avoid the step.
 5. **Same level while at ¾ bitrate.** Harmless: the output is byte-identical, because the next per-packet step sets ¾ again and fully resets the rate state.
+
+### 7L.2 LL row larger than the packet budget (verified 2026-10-13)
+
+The reference never checks an LL row against the MTU: the budget only caps HQ rows (§7L.1 item 3), so LL packets are always the full table size (348 bytes, or 560 for the larger R2 LL rows). If the output window can't hold one, the encode call outputs nothing and consumes nothing, so input backs up instead of being truncated. Forcing R1 LL into a smaller window stays decodable, but most packets come out padded and the packet timing wanders (768–1024 samples instead of 960), so the stream slowly falls behind real time.
+
+**Rule for a host source:** refuse LL when the link can't carry the full LL packet (RTP 12 + 8 + the row's packet size) and stay on HQ; don't clip.

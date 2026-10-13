@@ -369,7 +369,11 @@ Questions, all **answered** by `a2dp-integration.md` §7L.1:
 4. **Answered** (§7L.1 item 4): confirmed; the period byte switches but P and the packets don't. We avoid the step, as advised. Originally: **Equal-bitrate rows and the period byte.** §7L rule 4: with equal bitrates the period byte, cfg and size come from the new row, but P doesn't. Our source has no period byte (§7F timestamp = samples per channel from P), so we never take such a step: R2 LL index 2, 3 ↔ 4. That index needs QHS, which we never set, so it's unreachable anyway. Is the reference's period byte in that case the new row's (12 ms → 10 ms) while it keeps sending 12 ms of audio per packet?
 5. **Answered** (§7L.1 item 5): harmless, and the output is byte-identical. Originally: **Requesting the running level while the bitrate is ¾-reduced.** With the deficit over 96, the last set-bitrate value is the reduced one, so a request for the running level counts as "different": set-bitrate gets the row bitrate and P is recomputed (unchanged), then the per-packet step reduces it again. That's harmless, and we do it as written. The callbacks never ask for the running level anyway.
 
-## LL row larger than the packet budget (open, 2026-10-13)
+## LL row larger than the packet budget (answered by `a2dp-integration.md` §7L.2)
+
+**Answered:** the reference doesn't check, and a clipped LL stream falls behind real time; refusing LL, as we do, is the rule.
+
+Originally:
 
 §7J and §7L.1 say LL rows are never capped, but not what a source does when the LL packet (348 bytes on R1) exceeds the budget (L2CAP MTU − 20 < 348). We refuse LL: R1 `open` fails with NoSpace, and R2 stays in HQ. Does the reference refuse, clip, or do something else? Not reachable on real links (MTU ≥ 672).
 
