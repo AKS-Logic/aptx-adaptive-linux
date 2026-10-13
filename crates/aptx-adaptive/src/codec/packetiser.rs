@@ -60,8 +60,11 @@ pub struct Packetiser {
 }
 
 impl Packetiser {
+    /// The create bitrate is clamped like set-bitrate's (§10.G).
     pub fn new(params: Params, packet_len: usize, bitrate: u32) -> Self {
         let w = params.width();
+        let (lo, hi) = alloc::bitrate_range(params);
+        let bitrate = bitrate.clamp(lo, hi);
         Self {
             engine: Engine::new(params),
             packer: Packer::new(params, packet_len),
@@ -143,7 +146,13 @@ impl Packetiser {
         let blocks = self.frame_blocks();
         let mut bits = [0u8; MAX_WIDTH];
         let bits = &mut bits[..w];
-        self.p_est = alloc::allocate(params, self.rate.target, &self.frame, bits);
+        self.p_est = alloc::allocate(
+            params,
+            self.rate.target,
+            self.rate.nominal,
+            &self.frame,
+            bits,
+        );
         self.codes.resize(self.frame.len(), 0);
         for (xb, qb) in self
             .frame
@@ -460,7 +469,7 @@ mod tests {
         let mut pred = vec![0; w];
         for frame in x.chunks_exact(64 * w) {
             let mut bits = [0; 8];
-            alloc::allocate(CFG0, 364_000, frame, &mut bits);
+            alloc::allocate(CFG0, 364_000, 364_000, frame, &mut bits);
             let mut q = vec![0; w];
             for xb in frame.chunks_exact(w) {
                 let trace = engine.code_traced(xb, &bits, &mut q);

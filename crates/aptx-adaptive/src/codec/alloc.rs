@@ -225,15 +225,25 @@ fn distribute(s: usize, pool: i32, need: &[i32], maxb: &[i32], sl: i32, out: &mu
     }
 }
 
+/// The alternate flag (§10.E): config 3 stereo at a nominal bitrate under 180 kbps.
+fn alternate(params: Params, nominal: u32) -> bool {
+    params.variant == Variant::Cfg3 && nominal <= 179_999
+}
+
 /// Allocates one frame: `x` is its subband values, `width()` per block, before quantisation.
-/// Writes `width()` allocations to `out` and returns the pool it used.
-pub fn allocate(params: Params, target: u32, x: &[i32], out: &mut [u8]) -> u32 {
-    let w = params.width();
+/// Writes `width()` allocations to `out` and returns the pool it used. `target` is the
+/// rate-controlled bitrate and `nominal` the set one (§8.1a).
+pub fn allocate(params: Params, target: u32, nominal: u32, x: &[i32], out: &mut [u8]) -> u32 {
+    let (s, w) = (params.subbands(), params.width());
     let rate = pool_rate(params, target);
     let bits = pool(params, target);
+    let alternate = alternate(params, nominal);
 
     let mut sf = [0i32; MAX_WIDTH];
     let tonal = scale_factors(params, x, &mut sf[..w]);
+    if alternate {
+        sf[s..w].fill(0);
+    }
     let sf = &sf[..w];
     let mut need = [0i32; MAX_WIDTH];
     bit_need(params, sf, tonal, &mut need[..w]);
@@ -249,9 +259,9 @@ pub fn allocate(params: Params, target: u32, x: &[i32], out: &mut [u8]) -> u32 {
     let maxb = &maxb[..w];
     let mut alloc = [0i32; MAX_WIDTH];
     let alloc = &mut alloc[..w];
-    distribute(params.subbands(), bits as i32, need, maxb, sl, alloc);
+    distribute(s, bits as i32, need, maxb, sl, alloc);
     if params.variant == Variant::Cfg3 {
-        digital_black(sf, maxb, params.subbands(), rate <= 179_999, alloc);
+        digital_black(sf, maxb, s, alternate, alloc);
     }
     for (b, &v) in out.iter_mut().zip(alloc.iter()) {
         *b = v as u8;
@@ -365,10 +375,10 @@ mod tests {
     #[test]
     fn silence() {
         let mut out = [0; 8];
-        assert_eq!(allocate(CFG0, 364_000, &[0; 64 * 8], &mut out), 30);
+        assert_eq!(allocate(CFG0, 364_000, 364_000, &[0; 64 * 8], &mut out), 30);
         assert_eq!(out, [4, 4, 4, 3, 4, 4, 4, 3]);
         let mut out = [9; 16];
-        allocate(CFG3, 364_000, &[0; 64 * 16], &mut out);
+        allocate(CFG3, 364_000, 364_000, &[0; 64 * 16], &mut out);
         assert_eq!(out, [0; 16]);
     }
 
@@ -379,7 +389,7 @@ mod tests {
             .map(|i| if i % 16 < 8 { (i * 7919) << 12 } else { 0 })
             .collect();
         let mut out = [0; 16];
-        allocate(CFG3, 420_000, &x, &mut out);
+        allocate(CFG3, 420_000, 420_000, &x, &mut out);
         assert!(out[..8].iter().any(|&b| b > 2), "{out:?}");
         assert_eq!(out[8..], [2, 0, 0, 0, 0, 0, 0, 0]);
     }
