@@ -1,5 +1,3 @@
-//! Raw PCM packet checks against `tests/vectors/r2` and stage `packets.bin` (§8.7).
-
 use std::fs;
 use std::path::PathBuf;
 
@@ -32,8 +30,6 @@ fn first_difference(what: &str, len: usize, got: &[u8], want: &[u8]) {
     assert_eq!(got.len(), want.len(), "{what}: length");
 }
 
-/// Runs the README packet loop: 672-frame blocks, flush, deficit and set-bitrate.
-/// Returns the packets and whether each was forced.
 fn wrapper_loop(
     enc: &mut Encoder,
     pcm: &[i32],
@@ -111,7 +107,6 @@ fn r2_vectors_r2_from_pcm() {
     }
 }
 
-/// Checks one encode call per packet with all remaining input.
 fn check_stage(name: &str, config: Config, bitrate: u32) {
     check_stage_with(name, Encoder::new(config, bitrate).unwrap());
 }
@@ -175,7 +170,6 @@ fn parity_runs() -> Vec<Run> {
                 "R1" => DecoderLevel::R1,
                 _ => DecoderLevel::R2,
             };
-            // Profile 3 is HQ, 6 the R2 LL encoder (§10.F), 1 the low-power config 1 (§10.D).
             let profile = match num(2) {
                 3 => Profile::Hq,
                 1 | 6 => Profile::Ll,
@@ -195,7 +189,6 @@ fn parity_runs() -> Vec<Run> {
         .collect()
 }
 
-/// Parity loop with period in interleaved samples (§10.A) and LL deficit reset (§10.C).
 fn parity_loop(enc: &mut Encoder, run: &Run, pcm: &[i32]) -> (Vec<u8>, Vec<bool>) {
     let period = i64::from(run.period_ms) * i64::from(run.config.sample_rate) * 2 / 1000;
     let len = run.len;
@@ -228,7 +221,6 @@ fn parity_loop(enc: &mut Encoder, run: &Run, pcm: &[i32]) -> (Vec<u8>, Vec<bool>
     (packets, forced)
 }
 
-/// Checks every parity run from raw PCM using its stated chunk size and loop.
 #[test]
 fn parity_vectors() {
     let dir = vectors("parity");
@@ -291,8 +283,6 @@ fn stages_cfg0_sine() {
     );
 }
 
-/// Config 1 (low-power) isn't selected by any supported config (R1 LL is config 0, §7J), but
-/// the core stays bit-exact for it.
 #[test]
 fn stages_cfg1_noise() {
     let config = cfg(Profile::Ll, DecoderLevel::R1, 48_000);
@@ -329,11 +319,6 @@ fn stages_cfg3_96k_noise() {
     );
 }
 
-/// The parity LL runs that match what the plugin streams, driven through [`crate::Stream`]
-/// (the plugin's loop) rather than the harness loop above, so this pins the profile mapping,
-/// the level-3 table row and the LL deficit rule byte for byte. R1: config 0 on LL row 0
-/// (265 kbps / 10 ms / 348 bytes, `codec-core.md` §10.D). R2: config 4 on LL row 1 (270 kbps /
-/// 10 ms / 348 bytes, §10.F).
 fn check_stream_ll(name: &str, level: DecoderLevel, rate: u32, chunk_frames: usize) {
     use crate::{Stream, packet_budget, table_row};
     let dir = vectors("parity");
@@ -367,14 +352,11 @@ fn stream_ll_matches_parity() {
     check_stream_ll("c4_44k_i1_L3", DecoderLevel::R2, 44_100, 44);
 }
 
-/// Checks mid-stream level changes (§7L), packets and `.sizes` fields: bytes, forced, level, P,
-/// and post-packet deficit. `k:L` requests L between packets k−1 and k.
 fn check_levels(name: &str, rate: u32, chunk_frames: usize, map_1: bool, schedule: &[(usize, u8)]) {
     check_levels_with(name, rate, chunk_frames, map_1, schedule, false);
     check_levels_with(name, rate, chunk_frames, map_1, schedule, true);
 }
 
-/// With `now`, requests are applied after packet k−1 using [`crate::Stream::apply_level_now`].
 fn check_levels_with(
     name: &str,
     rate: u32,

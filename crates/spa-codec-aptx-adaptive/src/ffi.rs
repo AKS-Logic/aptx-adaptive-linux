@@ -1,5 +1,3 @@
-//! SPA and PipeWire 1.6 bluez5 codec struct mirrors, pinned to the 1.6.9 `x86_64` headers.
-
 use std::ffi::{c_char, c_int, c_void};
 
 pub const SPA_VERSION_HANDLE: u32 = 0;
@@ -194,7 +192,6 @@ pub struct media_codec_audio_info {
     pub channels: u32,
 }
 
-/// Opaque PipeWire log and BAP `QoS` structs.
 pub type Opaque = c_void;
 
 #[repr(C)]

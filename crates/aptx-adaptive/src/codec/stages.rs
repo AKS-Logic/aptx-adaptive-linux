@@ -1,7 +1,3 @@
-//! Stage-by-stage checks against `tests/vectors/stages` (see its README). The packets
-//! themselves are checked from raw PCM in `crate::vectors`; these pin down the intermediate
-//! values, given the reference allocations, which our allocator reproduces.
-
 #![expect(clippy::many_single_char_names, reason = "names follow the spec")]
 
 use std::fs;
@@ -15,11 +11,9 @@ struct Vectors {
     params: Params,
     packet_len: usize,
     blocks: usize,
-    /// (packet, blocks, bits)
     frames: Vec<(usize, usize, Vec<u8>)>,
 }
 
-/// Just enough JSON for `meta.json` and `frames.json`: pulls out every integer in order.
 fn numbers(s: &str) -> Vec<i64> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -40,7 +34,6 @@ impl Vectors {
             .join("../../tests/vectors/stages")
             .join(name);
         let meta = fs::read_to_string(dir.join("meta.json")).unwrap();
-        // Keys appear in the order packet_len, n_packets, blocks, subbands_per_channel.
         let m = numbers(&meta);
         let params = Params {
             variant,
@@ -78,7 +71,6 @@ impl Vectors {
             .collect()
     }
 
-    /// Allocation for each block.
     fn block_bits(&self) -> Vec<&[u8]> {
         self.frames
             .iter()
@@ -135,7 +127,6 @@ fn check_quant_predict(v: &Vectors, name: &str) {
     first_mismatch(name, "pred_out", w, &pred, &v.s32("pred_out.s32"));
 }
 
-/// Our parser reads the reference packets back to `frames.json` and the coded codes.
 fn check_decode(v: &Vectors, name: &str) {
     let w = v.params.width();
     let codes = v.s32("quant_codes.s32");
@@ -148,7 +139,6 @@ fn check_decode(v: &Vectors, name: &str) {
     let (head, tail) = (&got[..got.len() - 1], &got[got.len() - 1]);
     let (want_head, want_tail) = v.frames.split_at(v.frames.len() - 1);
     assert_eq!(head, want_head, "{name} frames");
-    // The last frame may run into a packet that isn't in the vectors.
     let want_tail = &want_tail[0];
     assert_eq!(
         (tail.0, &tail.2),

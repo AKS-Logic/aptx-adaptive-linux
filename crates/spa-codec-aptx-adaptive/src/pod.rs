@@ -1,5 +1,3 @@
-//! SPA pod serialisation for raw-audio formats and codec properties.
-
 use crate::ffi::{
     SPA_CHOICE_ENUM, SPA_FORMAT_AUDIO_CHANNELS, SPA_FORMAT_AUDIO_FORMAT, SPA_FORMAT_AUDIO_POSITION,
     SPA_FORMAT_AUDIO_RATE, SPA_FORMAT_MEDIA_SUBTYPE, SPA_FORMAT_MEDIA_TYPE, SPA_MEDIA_SUBTYPE_RAW,
@@ -69,7 +67,6 @@ impl Writer {
         self.pad();
     }
 
-    /// Starts a pod whose size is patched by [`Writer::end`].
     fn begin(&mut self, type_: u32) -> usize {
         let at = self.0.len();
         self.u32(0);
@@ -77,8 +74,6 @@ impl Writer {
         at
     }
 
-    /// Patches the size of the pod started at `at`. A choice's size excludes the padding
-    /// after its last value, like `spa_pod_builder_pop`.
     fn end(&mut self, at: usize, size: usize) {
         let size = (size - at - 8) as u32;
         self.0[at..at + 4].copy_from_slice(&size.to_ne_bytes());
@@ -92,7 +87,6 @@ impl Writer {
     }
 }
 
-/// `PropInfo` for an `Int` property with enumerated values and labels.
 #[must_use]
 pub fn enum_prop_info(
     id: u32,
@@ -131,7 +125,6 @@ pub fn enum_prop_info(
     w.0
 }
 
-/// A `Props` object holding one `Int` property.
 #[must_use]
 pub fn int_props(id: u32, key: u32, value: i32) -> Vec<u8> {
     let mut w = Writer(Vec::with_capacity(40));
@@ -148,8 +141,6 @@ fn u32_at(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_ne_bytes(bytes.try_into().ok()?))
 }
 
-/// The value of `key` in a `Props` object, if it's there as an `Int`. `None` for anything
-/// else, including a malformed pod.
 #[must_use]
 pub fn props_int(pod: &[u8], key: u32) -> Option<i32> {
     let size = u32_at(pod, 0)? as usize;
@@ -178,7 +169,6 @@ pub fn props_int(pod: &[u8], key: u32) -> Option<i32> {
     None
 }
 
-/// Serialises a fixed raw-audio `Format` object, matching `spa_format_audio_raw_build`.
 #[must_use]
 pub fn raw_audio_format(id: u32, f: &RawFormat) -> Vec<u8> {
     let mut w = Writer(Vec::with_capacity(192));
@@ -209,7 +199,6 @@ mod tests {
         SPA_PARAM_ENUM_FORMAT,
     };
 
-    /// `spa_pod_builder_add` output for `SPA_PARAM_EnumFormat` (3), from PipeWire 1.6.9.
     const REFERENCE: [u8; 168] = [
         0xa0, 0, 0, 0, 0x0f, 0, 0, 0, 0x03, 0, 0x04, 0, 0x03, 0, 0, 0, //
         0x01, 0, 0, 0, 0, 0, 0, 0, 0x04, 0, 0, 0, 0x03, 0, 0, 0, //
@@ -224,7 +213,6 @@ mod tests {
         0x03, 0, 0, 0, 0x04, 0, 0, 0,
     ];
 
-    /// PipeWire 1.6.9 `spa_pod_builder` output for the `PropInfo` with value 1 and two labels.
     const PROP_INFO_LL: [u8; 216] = [
         0xd0, 0, 0, 0, 0x0f, 0, 0, 0, 0x01, 0, 0x04, 0, 0x01, 0, 0, 0, //
         0x01, 0, 0, 0, 0, 0, 0, 0, 0x04, 0, 0, 0, 0x03, 0, 0, 0, //
@@ -242,15 +230,12 @@ mod tests {
         0x6e, 0x63, 0x79, 0, 0, 0, 0, 0,
     ];
 
-    /// `Props` with `SPA_PROP_quality` = 1.
     const PROPS_LL: [u8; 40] = [
         0x20, 0, 0, 0, 0x0f, 0, 0, 0, 0x02, 0, 0x04, 0, 0x02, 0, 0, 0, //
         0x0d, 0x01, 0, 0, 0, 0, 0, 0, 0x04, 0, 0, 0, 0x04, 0, 0, 0, //
         0x01, 0, 0, 0, 0, 0, 0, 0,
     ];
 
-    /// `Props` with `SPA_PROP_latencyOffsetNsec` = 5 (a Long), then `SPA_PROP_quality` = 0, as
-    /// media-sink passes one `Props` pod to both itself and the codec.
     const PROPS_LATENCY_THEN_HQ: [u8; 64] = [
         0x38, 0, 0, 0, 0x0f, 0, 0, 0, 0x02, 0, 0x04, 0, 0x02, 0, 0, 0, //
         0x0e, 0, 0x01, 0, 0, 0, 0, 0, 0x08, 0, 0, 0, 0x05, 0, 0, 0, //

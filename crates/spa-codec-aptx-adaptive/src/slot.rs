@@ -1,10 +1,3 @@
-//! Which `enum spa_bluetooth_audio_codec` id the codec claims, and so where PipeWire's
-//! `codec_order` ranks it (`docs/adr/0002-codec-autoselect.md`).
-//!
-//! `APTX_ADAPTIVE_SLOT=ldac|lc3plus_hr`, set by `scripts/install-plugin.sh` in the
-//! wireplumber/pipewire drop-ins. Not a dev switch: it's read with or without `dev-replay`.
-//! `APTX_ADAPTIVE_DEFAULT_MODE=hq|ll` is set the same way and picks which entry owns the slot.
-
 use std::ffi::OsString;
 
 use crate::ffi::{SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR, SPA_BLUETOOTH_AUDIO_CODEC_LDAC};
@@ -13,9 +6,7 @@ pub const SLOT_VAR: &str = "APTX_ADAPTIVE_SLOT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slot {
-    /// Ranked above aptX HD, aptX and AAC, so `bluetoothd` configures aptX Adaptive first on connect.
     Ldac,
-    /// Ranked below them: aptX HD is set up on connect and aptX Adaptive must be picked by hand.
     Lc3plusHr,
 }
 
@@ -48,9 +39,6 @@ impl Slot {
 
 pub const DEFAULT_MODE_VAR: &str = "APTX_ADAPTIVE_DEFAULT_MODE";
 
-/// Which of the two entries owns the endpoint, and so is what `bluetoothd` configures on
-/// connect (`docs/adr/0003-ll-profile.md`). `APTX_ADAPTIVE_DEFAULT_MODE=hq|ll`, set by
-/// `scripts/install-plugin.sh` next to the slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefaultMode {
     Hq,

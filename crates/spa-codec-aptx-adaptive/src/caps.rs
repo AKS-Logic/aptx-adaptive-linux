@@ -15,7 +15,6 @@ pub const STREAM: RawFormat = RawFormat {
 const RATES: usize = 6;
 const CHANNEL_MODES: usize = 7;
 
-/// Byte 6 bits 3..7 (§7H): 0x08 44.1 kHz, 0x10 48 kHz, 0x20 96 kHz. Only 48 kHz is supported.
 const RATE_MASK: u8 = 0xF8;
 const RATE_48K: u8 = 0x10;
 
@@ -32,24 +31,18 @@ const FEATURES: usize = 16;
 /// End of the R2 extension block, including its end marker; R1 body 8..26 is echoed (§7J).
 const R2_DATA_END: usize = 26;
 
-/// Defaults for zero target latency bytes under source type 2 (§7G); bytes 12..13 aren't read (§7H).
 const TARGET_LATENCY_DEFAULTS: [(usize, u8); 4] = [(8, 0x50), (9, 0x64), (10, 0x64), (11, 0x64)];
 
-/// Public default TTP bytes (§1.4, §7J); TWS isn't read.
 const TTP_DEFAULTS: [u8; 6] = [0x50, 0x64, 0x64, 0x64, 0xff, 0xff];
 
-/// Public R2.0 features word (§1.2); configuration low byte is ours & the sink's (§7J).
 const FEATURES_R2_0: u32 = 0x0F00_0000;
 const FEATURES_LOW_BYTE: u32 = 0xff;
 
-/// Body 8..16 for an R1 source (§1.4): TTP defaults, reserved, end marker.
 const R1_DATA: [u8; 9] = {
     let t = TTP_DEFAULTS;
     [t[0], t[1], t[2], t[3], t[4], t[5], 0, 0x00, 0xaa]
 };
 
-/// Body 8..25 for an R2 source (§7J): TTP defaults, reserved, extension version 1, features,
-/// setup preferences `02 03 03 03`, end marker.
 const fn r2_data(features: u32) -> [u8; R2_DATA_END - APTX_DATA] {
     let f = features.to_le_bytes();
     let t = TTP_DEFAULTS;
@@ -59,7 +52,6 @@ const fn r2_data(features: u32) -> [u8; R2_DATA_END - APTX_DATA] {
     ]
 }
 
-/// Minimum LL0 target latency in ms, to absorb host and link jitter (§7H).
 const LL0_MIN: u8 = 0x50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,8 +119,6 @@ fn element(len: usize, rate: u8, channel_mode: u8, aptx_data: &[u8]) -> Vec<u8> 
     c
 }
 
-/// Advertises the R1 layout: copying extension byte 1 into a configuration would make
-/// [`validate_config`] select R2 and send an R1 decoder the config 3 bitstream (§7J).
 #[must_use]
 pub fn fill_caps() -> Vec<u8> {
     element(
@@ -139,14 +129,6 @@ pub fn fill_caps() -> Vec<u8> {
     )
 }
 
-/// Selects 48 kHz and one 2-channel mode, with source type [`SOURCE_TYPE_HOST`] (§7E, §7J):
-/// - an R2 sink gets our own block ([`r2_data`]), with the features low byte set to ours & the
-///   sink's;
-/// - an R1 sink gets its own body 8..25 back, except that a zero target latency byte gets a
-///   default (§7G) and LL0 is raised to at least 80 ms (§7H), and 26..39 zeroed.
-///
-/// Output matches the `caps` length; bytes past [`CAPS_LEN`] are zeroed for PipeWire's length check.
-///
 /// # Errors
 /// As for [`Caps::parse`], or `Unsupported` without 48 kHz and stereo or joint stereo.
 pub fn select_config(bytes: &[u8]) -> Result<Vec<u8>, CapsError> {
@@ -198,7 +180,6 @@ pub fn validate_config(config: &[u8]) -> Result<DecoderLevel, CapsError> {
     Ok(c.decoder_level())
 }
 
-/// The PCM stream PipeWire proposes in `init`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PcmStream {
     pub raw_audio: bool,
@@ -232,8 +213,6 @@ mod tests {
     const SETUP_PREFS: usize = 20;
     const END_MARKER: usize = 24;
 
-    /// R2-style caps: 48 kHz + 0x08, source type 2, stereo + TWS+, public TTP defaults,
-    /// extension version 1, the given features word, setup prefs, end marker.
     fn r2_caps(features: u32) -> [u8; CAPS_LEN] {
         let mut c = [0; CAPS_LEN];
         c[..VENDOR_HEADER.len()].copy_from_slice(&VENDOR_HEADER);
@@ -290,8 +269,6 @@ mod tests {
         assert_eq!(select_config(&PX7_S2E[..39]), Err(CapsError::Invalid));
     }
 
-    /// §7J: an R2 sink gets our block, not its own, whatever TTP bytes (here a zero HQ byte)
-    /// and setup preferences it lists. Our features low byte is 0, so the AND is too.
     #[test]
     fn r2_select_config_sends_own_block() {
         let mut caps = r2_caps(0x0F00_0017);
@@ -318,8 +295,6 @@ mod tests {
         }
     }
 
-    /// An R2 sink's caps as a public R2.1 source would advertise them: 44.1 + 48 kHz with
-    /// the sink flag 0x01, stereo + joint stereo, public TTP, extension v1, R2.1 features.
     #[test]
     fn r2_1_sink_example() {
         #[rustfmt::skip]
@@ -339,7 +314,6 @@ mod tests {
         assert_eq!(validate_config(&config), Ok(DecoderLevel::R2));
     }
 
-    /// §7J: an R1 sink's body 8..25 is echoed and 26..39 zeroed.
     #[test]
     fn r1_select_config_echoes_8_to_25() {
         let mut caps = PX7_S2E;
@@ -396,7 +370,6 @@ mod tests {
         assert_eq!(validate_config(&c), Ok(DecoderLevel::R1));
     }
 
-    /// §7E: byte 6 = rate bit | host source type; the sink's own bits 0..2 are dropped.
     #[test]
     fn select_config_sets_source_type() {
         assert_eq!(PX7_S2E[RATES], 0x19);
@@ -408,11 +381,9 @@ mod tests {
         assert_eq!(select_config(&caps).unwrap()[RATES], 0x12);
     }
 
-    /// §7G: with source type 2 a zero latency byte gets a default; others are echoed.
     #[test]
     fn select_config_replaces_zero_latency() {
         let config = select_config(&PX7_S2E).unwrap();
-        // LL0 55 ms is raised to 80 (§7H).
         assert_eq!(config[8..14], [0x50, 0x6a, 0x64, 0xaf, 0x64, 0x4b]);
         let mut caps = PX7_S2E;
         caps[8] = 0x60;
@@ -422,7 +393,6 @@ mod tests {
         let config = select_config(&caps).unwrap();
         assert_eq!(config[8..14], [0x50, 0x64, 0x64, 0x64, 0, 0x22]);
         caps[8..12].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
-        // Non-zero bytes are echoed, except LL0 under 80 ms (§7H).
         assert_eq!(
             select_config(&caps).unwrap()[8..14],
             [0x50, 0x22, 0x33, 0x44, 0, 0x22]
@@ -444,8 +414,6 @@ mod tests {
         }
     }
 
-    /// §7J: source type 2 at 48 kHz only, never the sink flag 0x01, and the R1 layout, so a
-    /// config copied from our caps can't come out as R2.
     #[test]
     fn fill_caps_is_r1_layout_with_source_type_2() {
         let caps = fill_caps();
@@ -468,8 +436,6 @@ mod tests {
         assert_eq!(config, copied);
     }
 
-    /// §7J: a sink-initiated stream configured from our caps carries our source type 2, but
-    /// a sink that sends 0 is still accepted.
     #[test]
     fn validate_accepts_sink_initiated_source_type_0() {
         let mut config = select_config(&fill_caps()).unwrap();
@@ -480,7 +446,6 @@ mod tests {
         assert_eq!(validate_config(&r2), Ok(DecoderLevel::R2));
     }
 
-    /// §7H: only the 48 kHz bit is accepted, alone; 44.1 (0x08) and 96 kHz (0x20) aren't.
     #[test]
     fn rate_bits() {
         for (byte6, ok) in [(0x0a, false), (0x12, true), (0x22, false), (0x42, false)] {

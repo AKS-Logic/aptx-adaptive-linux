@@ -1,6 +1,3 @@
-//! Exposes HQ or low-latency profile as `SPA_PROP_quality` (spec §2 "Profile").
-//! PipeWire callbacks share state between main and data threads through atomics.
-
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use aptx_adaptive::Profile;
@@ -8,12 +5,10 @@ use aptx_adaptive::Profile;
 use crate::ffi::{SPA_PARAM_PROP_INFO, SPA_PARAM_PROPS, SPA_PROP_QUALITY};
 use crate::pod;
 
-/// Device setting for the profile at stream start: `hq` (the default) or `ll`.
 pub const MODE_SETTING: &str = "bluez5.a2dp.aptx-adaptive.mode";
 
 const DESCRIPTION: &str = "aptX Adaptive mode";
 
-/// `SPA_PROP_quality` values: the profile's [`Profile::index`].
 pub const HQ: i32 = 0;
 pub const LL: i32 = 1;
 
@@ -37,18 +32,13 @@ fn to_u8(p: Profile) -> u8 {
 
 #[derive(Debug)]
 pub struct Props {
-    /// From the device setting; what a reset (`set_props` with no param) goes back to.
     initial: Profile,
-    /// What the user asked for. Main thread writes, data thread reads.
     wanted: AtomicU8,
-    /// Profile reported as running or being switched to.
     running: AtomicU8,
-    /// Whether the stream can offer LL. Data thread writes, main thread reads.
     ll_offered: AtomicBool,
 }
 
 impl Props {
-    /// Starting in `initial`, which is also what a reset goes back to.
     pub fn new(initial: Profile) -> Self {
         Self {
             initial,
@@ -58,7 +48,6 @@ impl Props {
         }
     }
 
-    /// Parses the device setting, defaulting to HQ for unknown values.
     pub fn from_setting(mode: Option<&str>) -> (Self, Option<String>) {
         let (p, msg) = match mode.map(str::trim) {
             None | Some("hq") => (Profile::Hq, None),
@@ -73,24 +62,19 @@ impl Props {
         (Self::new(p), msg)
     }
 
-    /// The profile asked for.
     pub fn wanted(&self) -> Profile {
         from_u8(self.wanted.load(Ordering::Acquire))
     }
 
-    /// The profile reported: the one running, or being switched to.
     pub fn running(&self) -> Profile {
         from_u8(self.running.load(Ordering::Acquire))
     }
 
-    /// Called by the stream (data thread) with what it's running and whether it can run LL.
     pub fn report(&self, running: Profile, ll_offered: bool) {
         self.ll_offered.store(ll_offered, Ordering::Release);
         self.running.store(to_u8(running), Ordering::Release);
     }
 
-    /// The `PropInfo` or `Props` pod for `id` at `idx`: `Ok(None)` past the end, `Err` for an
-    /// id we don't have. LL is only listed while it's offered.
     pub fn enum_param(&self, id: u32, idx: u32) -> Result<Option<Vec<u8>>, ()> {
         let current = value(self.running());
         let pod = match id {
@@ -108,7 +92,6 @@ impl Props {
         Ok((idx == 0).then_some(pod))
     }
 
-    /// Applies a Props pod or resets to the device setting; returns whether the request changed.
     pub fn set(&self, param: Option<&[u8]>) -> bool {
         let want = match param {
             None => Some(self.initial),
@@ -158,8 +141,6 @@ mod tests {
         assert!(msg.unwrap().contains("fast"));
     }
 
-    /// The low-latency profile's props: LL from the start, a reset goes back to LL, and HQ is
-    /// still one `set` away.
     #[test]
     fn starting_in_ll() {
         let p = Props::new(Profile::Ll);
@@ -186,7 +167,6 @@ mod tests {
         assert_eq!(p.wanted(), Profile::Ll);
     }
 
-    /// After a refused switch the stream reports what it runs, and Props shows that.
     #[test]
     fn reports_running_profile() {
         let (p, _) = Props::from_setting(None);

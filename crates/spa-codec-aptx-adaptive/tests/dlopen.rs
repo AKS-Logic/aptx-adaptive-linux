@@ -1,5 +1,3 @@
-//! Loads the cdylib through PipeWire's codec-loader interface.
-
 #[expect(
     dead_code,
     reason = "shared with the cdylib; the test only touches part of the FFI surface"
@@ -32,8 +30,6 @@ use fixtures::{PX7_S2E, PX7_S2E_CONFIG};
 use ids::{CAPS_LEN, VENDOR_HEADER};
 
 const MTU: usize = 895;
-/// 2 ms of stereo `S24_32`: divides both the 14 ms HQ and the 10 ms LL packet (spec
-/// `a2dp-integration.md` §4.1, §4.2).
 const BLOCK_SIZE: c_int = 96 * 2 * 4;
 
 type EnumFn = unsafe extern "C" fn(*mut *const spa_handle_factory, *mut u32) -> c_int;
@@ -64,9 +60,7 @@ fn plugin_path() -> &'static PathBuf {
 struct Loaded {
     _lib: libloading::Library,
     _handle: Vec<u64>,
-    /// Owns the endpoint (`fill_caps`, the slot's id): what a fresh connection binds.
     codec: &'static media_codec,
-    /// The alias on the same endpoint.
     ll: &'static media_codec,
 }
 
@@ -221,8 +215,6 @@ fn codec_metadata() {
         // SAFETY: static string.
         assert_eq!(unsafe { CStr::from_ptr(c.endpoint_name) }, ids::CODEC_NAME);
         assert!(c.encode.is_some() && c.decode.is_none());
-        // A bigger socket buffer than media-sink's 4 × MTU default, so a start-up stall doesn't
-        // drop packets.
         assert_eq!(c.send_buf_size, ids::SEND_BUF_SIZE);
         assert!(c.abr_process.is_some());
     }
@@ -232,13 +224,6 @@ fn codec_metadata() {
     }
 }
 
-/// The second entry is a shared-endpoint alias of the owner, like PipeWire's `sbc_xq`:
-/// - its own id (MPEG), so `bluez5-device.c` lists a separate profile for it;
-/// - no `fill_caps`, so `codec-loader.c` keeps it next to the owner, `bluez5-dbus.c` registers
-///   no second endpoint, and a connection with no preferred codec never binds it;
-/// - the owner's endpoint name, so a `SetConfiguration` on that endpoint can bind to it.
-///
-/// Every callback is the owner's.
 fn check_alias(alias: &media_codec, owner: &media_codec) {
     assert_eq!(alias.id, SPA_BLUETOOTH_AUDIO_CODEC_MPEG);
     assert_ne!(alias.id, owner.id);
@@ -286,11 +271,8 @@ fn check_alias(alias: &media_codec, owner: &media_codec) {
 }
 
 const SLOT_CHILD_VAR: &str = "APTX_ADAPTIVE_TEST_SLOT_CHILD";
-/// Exit status of a child that ran `codec_metadata` and passed. A child that matched no test
-/// exits 0, so it can't pass by accident.
 const SLOT_CHILD_OK: i32 = 42;
 
-/// Runs test `name` in a child with `env` and expects it to pass.
 fn run_child(name: &str, env: &[(&str, &str)]) {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args(["--exact", name, "--test-threads=1"])
@@ -324,10 +306,6 @@ fn slot_and_default_mode_follow_env() {
     }
 }
 
-/// With `APTX_ADAPTIVE_DEFAULT_MODE=ll` the LL entry owns the endpoint, so a fresh connection
-/// binds it: it starts in LL with no props and, unlike the HQ owner, ignores
-/// `bluez5.a2dp.aptx-adaptive.mode = hq`. The HQ alias starts in HQ, even with `mode = ll`.
-/// The `quality` prop still switches either.
 #[test]
 fn ll_default_streams() {
     if std::env::var_os(SLOT_CHILD_VAR).is_none() {
@@ -365,7 +343,6 @@ fn ll_default_streams() {
             c.deinit.unwrap()(data);
         }
     }
-    // The LL owner switches live to HQ and resets back to LL.
     let props = init_props(ll, None);
     // SAFETY: props from init_props.
     unsafe {
@@ -390,7 +367,6 @@ fn caps_round_trip() {
     let n = unsafe { c.fill_caps.unwrap()(c, 0, ptr::null(), caps.as_mut_ptr()) };
     assert_eq!(n as usize, CAPS_LEN);
     assert_eq!(caps[..6], VENDOR_HEADER);
-    // Source type 2 at 48 kHz, R1 layout (end marker at body 15/16).
     assert_eq!((caps[6], caps[15], caps[16]), (0x12, 0x00, 0xaa));
 
     let (n, config) = select(c, &PX7_S2E);
@@ -493,15 +469,11 @@ fn init_and_encode_a_real_packet() {
         let mut out = [0u8; 1024];
         let hdr = c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), 1, 0);
         assert_eq!(hdr, 12);
-        // Spec §7F: 80 60, sequence, timestamp 672 samples (adjust 0), SSRC a3 (HQ), no
-        // payload prefix.
         assert_eq!(
             out[..12],
             [0x80, 0x60, 0, 1, 0, 0, 0x02, 0xa0, 0, 0, 0, 0xa3]
         );
-        // 14 ms of 2 ms blocks.
         assert_eq!(encode_until_flush(c, data, &mut out[12..], 7), (656, 7));
-        // Swapped config 0 packet: 00 01 a1 .. becomes 01 00 .. a1 (0x80 on byte 1 if padded).
         assert_eq!((out[12] & 0x7f, out[13], out[15]), (0x01, 0x00, 0xa1));
         assert_eq!(c.abr_process.unwrap()(data, 0), 0);
         let mut delay = 99;
@@ -511,8 +483,6 @@ fn init_and_encode_a_real_packet() {
     }
 }
 
-/// An R2.1 sink gets a config the plugin can stream: the R2 HQ level-3 row (19 ms, 912 samples
-/// per channel, spec §4.1 idx 1) and the config 3 bitstream.
 #[test]
 fn r2_config_streams() {
     let l = load();
@@ -532,7 +502,6 @@ fn r2_config_streams() {
 
     // SAFETY: data from init, valid until deinit.
     unsafe {
-        // 1 ms: divides both the 19 ms HQ and the 10 ms LL (config 4) packet.
         let block = c.get_block_size.unwrap()(data);
         assert_eq!(block, 48 * 2 * 4);
         let mut out = [0u8; 1024];
@@ -541,18 +510,12 @@ fn r2_config_streams() {
             12
         );
         assert_eq!(out[4..12], [0, 0, 0x03, 0x90, 0, 0, 0, 0xa3]);
-        // 19 ms of 1 ms blocks.
         assert_eq!(encode_until_flush(c, data, &mut out[12..], 19), (656, 19));
-        // Swapped config 3 packet: 00 83 a1 .. (spec §3.2).
         assert_eq!((out[12] & 0x7f, out[13], out[15]), (0x03, 0x00, 0xa1));
         c.deinit.unwrap()(data);
     }
 }
 
-/// Feeds silence a block at a time (the codec's own block size) until a packet comes out,
-/// like `media-sink.c`, writing the packet to `out`. Returns its length and the number of
-/// blocks it took. Panics if no packet comes out within `max_blocks`.
-///
 /// # Safety
 /// `data` must come from `init`.
 unsafe fn encode_until_flush(
@@ -608,7 +571,6 @@ fn init_props(c: &media_codec, mode: Option<&CStr>) -> *mut c_void {
     p
 }
 
-/// Encodes a `SPA_PROP_quality` integer Props pod.
 fn quality_props(v: i32) -> [u32; 10] {
     [
         32,
@@ -624,7 +586,6 @@ fn quality_props(v: i32) -> [u32; 10] {
     ]
 }
 
-/// Enumerates `id` at `idx` and returns the result code and the pod's words.
 fn enum_props(c: &media_codec, props: *mut c_void, id: u32, idx: u32) -> (c_int, Vec<u32>) {
     let mut buf = [0u64; 64];
     let mut b = builder(&mut buf, 512);
@@ -669,7 +630,6 @@ fn props_are_ldac_style() {
         assert_eq!(c.set_props.unwrap()(props, ll.as_ptr().cast()), 1);
         assert_eq!(c.set_props.unwrap()(props, ll.as_ptr().cast()), 0);
         assert_eq!(enum_props(c, props, SPA_PARAM_PROPS, 0).1, ll.to_vec());
-        // NULL resets to the device setting.
         assert_eq!(c.set_props.unwrap()(props, ptr::null()), 1);
         assert_eq!(
             enum_props(c, props, SPA_PARAM_PROPS, 0).1,
@@ -686,8 +646,6 @@ fn props_are_ldac_style() {
     unsafe { c.clear_props.unwrap()(props) };
 }
 
-/// Produces one packet, updating props first when they changed.
-///
 /// # Safety
 /// `data` and `props` must come from `init` and `init_props`.
 unsafe fn next_packet(
@@ -706,7 +664,6 @@ unsafe fn next_packet(
         let hdr = c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), seq, 0);
         assert_eq!(hdr, 12);
         let fields: [u8; 8] = out[4..12].try_into().unwrap();
-        // At most one 14 ms HQ packet's worth of blocks.
         let (written, _) = encode_until_flush(c, data, &mut out[12..], 7);
         (written, fields)
     }
@@ -715,10 +672,6 @@ unsafe fn next_packet(
 const HQ_FIELDS: [u8; 8] = [0, 0, 0x02, 0xa0, 0, 0, 0, 0xa3];
 const LL_FIELDS: [u8; 8] = [0, 0, 0x01, 0xe0, 0, 0, 0, 0xa1];
 
-/// Starting with `bluez5.a2dp.aptx-adaptive.mode = ll`, then switching LL → HQ through
-/// `set_props` + `update_props` the way `media-sink.c` does: Props reports HQ at once, the
-/// packets change (size, timestamp, SSRC, interval) together at the in-place reset about
-/// 300 ms later (§7K: after a 100 ms fade-out and 200 ms of silence), and never mix.
 #[test]
 fn mode_setting_and_runtime_switch() {
     let l = load();
@@ -732,7 +685,6 @@ fn mode_setting_and_runtime_switch() {
     unsafe {
         assert_eq!(c.get_block_size.unwrap()(data), BLOCK_SIZE);
         assert_eq!(c.get_interval.unwrap()(data), 10_000_000);
-        // Past the start-of-stream mute and fade-in (20 + 100 ms, §7I).
         for seq in 0..15 {
             assert_eq!(next_packet(c, data, props, false, seq), (348, LL_FIELDS));
         }
@@ -752,7 +704,6 @@ fn mode_setting_and_runtime_switch() {
             assert_eq!(c.get_block_size.unwrap()(data), BLOCK_SIZE);
         }
         let switch = kinds.find('H').unwrap();
-        // About 300 ms of 10 ms LL packets first, then HQ only.
         assert!((29..=32).contains(&switch), "{kinds}");
         assert!(!kinds[switch..].contains('L'), "{kinds}");
         assert_eq!(c.get_interval.unwrap()(data), 14_000_000);
@@ -762,15 +713,12 @@ fn mode_setting_and_runtime_switch() {
     }
 }
 
-/// An R2 sink runs LL as config 4 (codec-core §10.F): a `ll` setting starts in LL (10 ms,
-/// 348-byte config 4 packets, SSRC A1) with 1 ms blocks, and LL is offered.
 #[test]
 fn r2_sink_runs_ll() {
     let l = load();
     let c = l.codec;
     let props = init_props(c, Some(c"ll"));
     let mut config = PX7_S2E_CONFIG;
-    // The R2 layout: extension version 1, end marker at 24..25 (§1.1).
     config[15] = 1;
     config[16] = 0;
     config[24..26].copy_from_slice(&[0, 0xaa]);
@@ -794,18 +742,13 @@ fn r2_sink_runs_ll() {
             12
         );
         assert_eq!(out[4..12], LL_FIELDS);
-        // 10 ms of 1 ms blocks.
         assert_eq!(encode_until_flush(c, data, &mut out[12..], 10), (348, 10));
-        // Swapped config 4 packet: frame type 4.
         assert_eq!(out[12] & 0x7f, 4);
         c.deinit.unwrap()(data);
         c.clear_props.unwrap()(props);
     }
 }
 
-/// The LL profile picks the same configuration as the main entry: PipeWire's support check
-/// (`media_codec_check_caps`) and the switch both call the alias's `select_config`, which must
-/// return the full caps size.
 #[test]
 fn ll_entry_selects_same_config() {
     let l = load();
@@ -813,9 +756,6 @@ fn ll_entry_selects_same_config() {
     assert_eq!(select(l.ll, &PX7_S2E).0 as usize, PX7_S2E.len());
 }
 
-/// Created through the LL alias, the stream starts in LL even with `mode = hq` (or nothing)
-/// in the device settings, and the `quality` prop still switches it live. A reset goes back to
-/// LL, the profile's own mode.
 #[test]
 fn ll_entry_starts_in_ll_and_still_switches() {
     let l = load();
@@ -857,7 +797,6 @@ fn ll_entry_starts_in_ll_and_still_switches() {
         c.deinit.unwrap()(data);
         c.clear_props.unwrap()(props);
     }
-    // No props at all: the alias still starts in LL, the main entry in HQ.
     for (codec, interval) in [(l.ll, 10_000_000), (l.codec, 14_000_000)] {
         let mut config = PX7_S2E_CONFIG;
         let info = validated_info(codec, &config);
@@ -883,11 +822,6 @@ fn init_returns_null_and_sets_errno_on_rejected_stream() {
     assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(EINVAL));
 }
 
-/// `reduce_bitpool` / `increase_bitpool` through the C ABI, called between packets as
-/// `media-sink.c` does (after a send, before the next `start_encode`): they return the level
-/// that will run (spec §7L: floor 2, ceiling 4 for R1 HQ), and the RTP timestamp low 16 bits
-/// follow from the next packet: 0x02A0 at level 3, 0x0300 at 2, 0x0240 at 4. The SSRC
-/// doesn't change.
 #[test]
 fn bitpool_callbacks_step_the_level() {
     let l = load();
@@ -908,7 +842,6 @@ fn bitpool_callbacks_step_the_level() {
             let hdr = c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), seq, 0);
             assert_eq!(hdr, 12);
             let fields: [u8; 8] = out[4..12].try_into().unwrap();
-            // At most one 16 ms packet of 2 ms blocks.
             let (written, _) = encode_until_flush(c, data, &mut out[12..], 8);
             assert_eq!(written, 656);
             fields
@@ -929,14 +862,11 @@ fn bitpool_callbacks_step_the_level() {
         assert_eq!(packet(4), ts(0x0240));
         assert_eq!(reduce(data), 3);
         assert_eq!(packet(5), ts(0x02a0));
-        // media-sink keeps the block size it read at start; it divides every level's packet.
         assert_eq!(c.get_block_size.unwrap()(data), BLOCK_SIZE);
         c.deinit.unwrap()(data);
     }
 }
 
-/// In LL on an R1 sink the rows don't vary by level: the callbacks change nothing and
-/// return level 3.
 #[test]
 fn bitpool_callbacks_in_r1_ll_change_nothing() {
     let l = load();

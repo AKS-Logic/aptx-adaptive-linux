@@ -29,7 +29,6 @@ impl Profile {
 /// Decoder compatibility level (§1.3). Changes the bitstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecoderLevel {
-    /// "1.1 sink", e.g. the Px7 S2e.
     R1,
     R2,
 }
@@ -43,7 +42,6 @@ pub struct Row {
     pub period_ms: u32,
     pub samples_per_channel: u32,
     pub packet_bytes: usize,
-    /// The packet-size class (§7J), the same for R1 and R2.
     pub cfg: u8,
 }
 
@@ -102,9 +100,7 @@ pub fn packet_budget(mtu: usize) -> usize {
 pub struct Link {
     pub qhs: bool,
     pub twm: bool,
-    /// Only affects HQ.
     pub rate_96k: bool,
-    /// Latency state 1 (§8.3). Only affects LL.
     pub enhanced_ll: bool,
 }
 
@@ -326,8 +322,6 @@ mod tests {
         assert_eq!(PX7.fit(Profile::Hq, 656), PX7);
     }
 
-    /// §7J: the bitrate comes from the budget before rounding (498, not 496); the period
-    /// stays.
     #[test]
     fn fit_shrinks_packet_and_bitrate() {
         let r = PX7.fit(Profile::Hq, 498);
@@ -337,15 +331,12 @@ mod tests {
         assert_eq!(r.period_ms, 14);
     }
 
-    /// §7L.1 item 3: LL rows are never capped.
     #[test]
     fn fit_leaves_ll_rows() {
         let ll = row(Profile::Ll, 2, 1).unwrap();
         assert_eq!(ll.fit(Profile::Ll, 400), ll);
     }
 
-    /// The float32 cap matches the integer form for positive results; non-positive results clamp
-    /// to zero and are rejected as too small.
     #[test]
     fn capped_bitrate_float32_matches_integer() {
         let periods: Vec<u32> = HQ
@@ -365,7 +356,6 @@ mod tests {
                 }
             }
         }
-        // The Px7 at a 600-byte MTU (budget 588) on its 12 ms level-4 row.
         assert_eq!(capped_bitrate(588, 12), 367_000);
     }
 }

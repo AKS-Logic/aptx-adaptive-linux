@@ -1,5 +1,3 @@
-//! Packets, allocation coding and codewords (spec `codec-core.md` §7).
-
 use super::bits::BitWriter;
 use super::tables::{
     ABS_A, ABS_B, CODEWORD, DIFF, DIFF_INDEX, DIFF_RANGE, PAIR_TABLE_4BAND, PAIR_TABLE_8BAND,
@@ -7,13 +5,9 @@ use super::tables::{
 use super::{MAX_WIDTH, Params};
 
 pub const HEADER_BYTES: usize = 3;
-/// More than any frame can take: 64 blocks of 16 bands, every band at 16 bits with the longest
-/// codewords, plus its allocation.
 const MAX_FRAME_BYTES: usize = 32 * 16 * 56 / 8 + 64;
-/// Byte 2 is `Lp/4 − 3` in 8 bits (§7.1), so 1032 bytes is the largest packet.
 pub const MAX_PACKET: usize = 4 * (255 + 3);
 
-/// `ρ(B)`
 fn reduced(b: u8) -> u32 {
     u32::from(if b > 1 { b - 1 } else { b })
 }
@@ -98,7 +92,6 @@ fn write_codewords(w: &mut BitWriter, params: Params, bits: &[u8], codes: &[i32]
     }
 }
 
-/// Configs 0/1 code a 2-bit top band with the allocation-1 table (§7.4).
 fn top_band_entry(params: Params, i: usize, b: u8) -> u8 {
     if params.subbands() == 4 && b == 2 && i % 4 == 3 {
         1
@@ -107,7 +100,6 @@ fn top_band_entry(params: Params, i: usize, b: u8) -> u8 {
     }
 }
 
-/// Builds packets one frame at a time. Payload bytes past one packet carry into the next.
 #[derive(Debug, Clone)]
 pub struct Packer {
     params: Params,
@@ -127,7 +119,6 @@ impl Packer {
             (12..=MAX_PACKET).contains(&packet_len) && packet_len.is_multiple_of(4),
             "packet size {packet_len}"
         );
-        // Sized for the largest packet, so `reset` to any size never allocates.
         Self {
             params,
             packet_len,

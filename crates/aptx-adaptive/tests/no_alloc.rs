@@ -1,6 +1,3 @@
-//! Checks allocation-free HQ↔LL switching on the real encoder, including the in-place reset
-//! required on PipeWire's data thread (`a2dp-integration.md` §7K), for R1 and R2 sinks.
-
 mod support {
     pub mod alloc_count;
 }
@@ -17,7 +14,6 @@ const fn config(level: DecoderLevel, profile: Profile) -> Config {
     }
 }
 
-/// Checks one-second HQ→LL→HQ runs for allocation-free resets and expected packet sizes.
 #[test]
 fn switch_does_not_allocate() {
     for (level, hq_bytes) in [(DecoderLevel::R1, 656), (DecoderLevel::R2, 656)] {

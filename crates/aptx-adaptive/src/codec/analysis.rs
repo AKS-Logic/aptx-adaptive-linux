@@ -1,11 +1,8 @@
-//! Analysis filterbanks (spec `codec-core.md` §3).
-
 #![expect(clippy::many_single_char_names, reason = "names follow the spec")]
 
 use super::arith::{add, r23, r64, sat24, sat64, sub};
 use super::tables::{DCT, FRONTEND, INNER_12, INNER_16, OUTER_12, OUTER_16, PROTO_128, PROTO_256};
 
-/// One two-band stage of the tree QMF (§3.1). Index 0 of each delay line is the newest sample.
 #[derive(Debug, Clone, Copy)]
 struct Qmf2 {
     coef: &'static [i32],
@@ -74,9 +71,7 @@ impl Tree4 {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Cosine8 {
-    /// 256 taps, or 128 for config 4 (§10.F).
     proto: &'static [i32],
-    /// Index m is the sample of age m; only the first `proto.len()` are used.
     hist: [i32; 256],
 }
 
@@ -92,7 +87,6 @@ impl Cosine8 {
         }
     }
 
-    /// Eight samples in time order to eight subband values (§3.2).
     pub fn block(&mut self, s: &[i32], out: &mut [i32]) {
         let taps = self.proto.len();
         self.hist.copy_within(0..taps - 8, 8);
@@ -176,7 +170,6 @@ pub enum Analysis {
 }
 
 impl Analysis {
-    /// `s` holds one channel's samples for the block, in time order.
     pub fn block(&mut self, s: &[i32], out: &mut [i32]) {
         match self {
             Self::Tree4(f) => f.block(s, out),

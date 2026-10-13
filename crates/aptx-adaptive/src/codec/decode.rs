@@ -1,6 +1,3 @@
-//! Test-only parser for the packet structure (§7): continuation, padding, allocations and
-//! codewords. Proves our packets decode, and is itself checked against the reference packets.
-
 use super::Params;
 use super::pack::HEADER_BYTES;
 use super::tables::{
@@ -11,7 +8,6 @@ use super::tables::{
 pub struct Frame {
     pub packet: usize,
     pub bits: Vec<u8>,
-    /// `blocks` × width codes, each reduced to its low `bits` bits (as coded).
     pub codes: Vec<i32>,
 }
 
@@ -24,7 +20,6 @@ impl Frame {
 struct Reader {
     bits: Vec<bool>,
     pos: usize,
-    /// Set by a read past the end, which only the stream's very last frame may do.
     ended: bool,
 }
 
@@ -70,7 +65,6 @@ fn unreduce(v: u32) -> u8 {
     if v > 0 { v as u8 + 1 } else { 0 }
 }
 
-/// Payload bytes before the padding (§7.1).
 fn payload(packet: &[u8]) -> &[u8] {
     let body = &packet[HEADER_BYTES..];
     if packet[1] & 0x80 == 0 {
@@ -83,7 +77,6 @@ fn payload(packet: &[u8]) -> &[u8] {
     &body[..start]
 }
 
-/// (frame bits, carried byte count) for each packet.
 fn split(params: Params, packets: &[u8], packet_len: usize) -> Vec<(Vec<bool>, usize)> {
     let mut out: Vec<(Vec<bool>, usize)> = Vec::new();
     for p in packets.chunks_exact(packet_len) {
@@ -116,7 +109,6 @@ fn split(params: Params, packets: &[u8], packet_len: usize) -> Vec<(Vec<bool>, u
 fn read_alloc(r: &mut Reader, params: Params, prev: Option<&[u8]>) -> Vec<u8> {
     let w = params.width();
     let eight = params.subbands() == 8;
-    // Config 3 only; config 4 codes like configs 0/1 with the 8-band pair tables (§10.F).
     let escapes = params.escapes();
     let mut bits = Vec::with_capacity(w);
     match prev {
@@ -190,9 +182,6 @@ fn only_padding(r: &Reader) -> bool {
     r.left() < 8 && r.bits[r.pos..].iter().all(|&b| !b)
 }
 
-/// Parses every frame. The last frame of each packet runs to the end of its data. The last
-/// packet's data may stop mid-frame (its continuation isn't there); that frame comes back
-/// short.
 pub fn decode(params: Params, packets: &[u8], packet_len: usize) -> Vec<Frame> {
     assert_ne!(packets, [] as [u8; 0]);
     let mut frames = Vec::new();
@@ -226,7 +215,6 @@ pub fn decode(params: Params, packets: &[u8], packet_len: usize) -> Vec<Frame> {
                 bits: bits.clone(),
                 codes,
             };
-            // A flush closes the last frame at any even size (§7.1, §8.0).
             assert!(
                 f.blocks() <= 64 && f.blocks().is_multiple_of(2),
                 "packet {packet}: frame of {} blocks",
@@ -242,7 +230,6 @@ pub fn decode(params: Params, packets: &[u8], packet_len: usize) -> Vec<Frame> {
     frames
 }
 
-/// The low `bits` bits of a code, as it's carried in the stream.
 pub fn coded(q: i32, bits: u8) -> i32 {
     if bits == 0 { 0 } else { q & ((1 << bits) - 1) }
 }

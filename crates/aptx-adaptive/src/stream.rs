@@ -33,8 +33,7 @@ pub trait Core {
     fn reset(&mut self, _config: Config, _row: &Row) -> Result<()> {
         Err(Error::UnsupportedConfig)
     }
-    /// The loop's period is now `samples` interleaved samples per packet (a level change,
-    /// §7L). The encoder doesn't care; a stand-in that buffers one period does.
+    /// The loop's period is now `samples` interleaved samples per packet.
     fn period_changed(&mut self, _samples: usize) {}
 }
 
@@ -56,15 +55,13 @@ pub struct Stream<C> {
     window: Vec<u8>,
     consumed: usize,
     deficit: i64,
-    /// The link's packet budget, which other levels' rows are capped to (§7J, §7L.1 item 3:
-    /// from the budget before rounding). [`Stream::with_core`] assumes the starting row's
-    /// packet size; [`Stream::new`] and [`Stream::with_budget`] set the real one.
+    /// The link's packet budget, which other levels' rows are capped to.
     budget: usize,
-    /// Quality level of `row` (§7L).
+    /// Quality level of `row`.
     level: u8,
-    /// The last level request, applied after the next packet (§7L).
+    /// The last level request, applied after the next packet.
     pending: Option<u8>,
-    /// While set, a pending request waits (an HQ↔LL switch is in progress, §7L).
+    /// While set, a pending request waits.
     hold: bool,
     /// The last value given to the core's set-bitrate, or the create bitrate.
     bitrate: u32,
@@ -76,7 +73,7 @@ pub struct Stream<C> {
 }
 
 impl Stream<Encoder> {
-    /// A fixed level-3 stream: no QHS, TWM or 96 kHz (§8.4). `budget` is the packet budget
+    /// A fixed level-3 stream: no QHS, TWM or 96 kHz. `budget` is the packet budget
     /// from [`crate::packet_budget`].
     ///
     /// # Errors

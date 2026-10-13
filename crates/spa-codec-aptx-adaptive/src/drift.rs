@@ -1,7 +1,3 @@
-//! Measures packet pacing against `CLOCK_MONOTONIC` and logs socket backlog periodically.
-//! With source type 2, sink timing follows packet sample count (spec §7F); the sink corrects
-//! drift, so a source sends TTP adjust 0 (§7G, §7H).
-
 use std::fmt::{self, Write as _};
 use std::io::Write as _;
 use std::time::{Duration, Instant};
@@ -12,7 +8,6 @@ pub const DRIFT_LOG_VAR: &str = "APTX_ADAPTIVE_DRIFT_LOG";
 /// How often a drift line is logged.
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// A pause in sending longer than this restarts the measurement.
 const GAP: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -37,15 +32,12 @@ impl Backlog {
     }
 }
 
-/// One [`REPORT_INTERVAL`]'s summary.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Report {
     /// Host audio clock drift against `CLOCK_MONOTONIC`; absent in the settling interval.
     pub ppm: Option<f64>,
     /// Audio sent ahead of `CLOCK_MONOTONIC`, in ms.
     pub drift_ms: Option<f64>,
-    /// Min/avg/max `abr_process(unsent)` in bytes; the plugin cannot distinguish payload outstanding
-    /// from socket memory (`TIOCOUTQ`), hence "PipeWire unsent".
     pub backlog: (usize, usize, usize),
     /// HQ/LL switch requests refused since the stream started.
     pub refused_switches: u32,
@@ -78,11 +70,6 @@ impl fmt::Display for Report {
     }
 }
 
-/// Measures the host audio clock and backlog.
-///
-/// Measures packet pacing and backlog from `abr_process` calls immediately before each send.
-/// Interval minimum pacing error absorbs timer wakeup jitter; positive drift means the host
-/// audio clock runs fast.
 #[derive(Debug, Clone)]
 pub struct Drift {
     rate: u32,
@@ -90,7 +77,6 @@ pub struct Drift {
     last: Option<Instant>,
     frames: u64,
     next_report: Option<Instant>,
-    /// Time of the first report and the minimum *ahead* (s) in its interval.
     baseline: Option<(Instant, f64)>,
     min_ahead: f64,
     backlog: Backlog,
@@ -180,13 +166,11 @@ impl Drift {
             r.level = Some(level);
             let mut line = LineBuf::new();
             let _ = writeln!(line, "{r}");
-            // One write(2) prevents interleaving; stderr is unbuffered and a short write may truncate the log.
             let _ = std::io::stderr().write(line.as_bytes());
         }
     }
 }
 
-/// A fixed stack buffer for one log line; output past its end is dropped.
 pub struct LineBuf {
     buf: [u8; 320],
     len: usize,
@@ -218,7 +202,6 @@ impl fmt::Write for LineBuf {
 mod tests {
     use super::*;
 
-    /// Sends a 672-frame packet every `period` for `secs`.
     fn run(d: &mut Drift, t0: Instant, period: Duration, secs: u64) -> Vec<Report> {
         let n = Duration::from_secs(secs).as_nanos() / period.as_nanos();
         (0..n)
@@ -240,7 +223,6 @@ mod tests {
         }
     }
 
-    /// The host sends audio 80 ppm faster than real time.
     #[test]
     fn fast_host_clock_measures() {
         let period = Duration::from_nanos((14_000_000.0 / 1.000_08_f64).round() as u64);
@@ -250,11 +232,9 @@ mod tests {
         let last = r.last().unwrap();
         assert!((last.ppm.unwrap() - 80.0).abs() < 2.0, "{last:?}");
         assert!(last.to_string().contains("host clock +80."), "{last}");
-        // 90 s at 80 ppm = 7.2 ms.
         assert!((last.drift_ms.unwrap() - 7.2).abs() < 0.3, "{last:?}");
     }
 
-    /// Sends jittered by up to ±1 ms (timer wakeups) don't bias the estimate.
     #[test]
     fn jitter_doesnt_bias() {
         let mut d = Drift::new(48_000);
@@ -310,7 +290,6 @@ mod tests {
             ..r
         };
         assert!(r.to_string().ends_with(", refused mode switches 3"));
-        // The longest line fits the stack buffer.
         let r = Report {
             ppm: Some(-1e9),
             drift_ms: Some(-1e9),

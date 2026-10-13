@@ -52,7 +52,6 @@ fn set_errno(e: c_int) {
     unsafe { *__errno_location() = e };
 }
 
-/// Builds an HQ or LL entry; an entry without an owner is an alias profile.
 const fn codec(mode: slot::DefaultMode, owner: Option<slot::Slot>) -> media_codec {
     let (name, description) = match mode {
         slot::DefaultMode::Hq => (ids::CODEC_NAME, ids::CODEC_DESCRIPTION),
@@ -137,7 +136,6 @@ static CODECS_LL_LC3PLUS_HR: CodecList = SyncStatic([
     ptr::null(),
 ]);
 
-/// Returns the fixed start mode for profile entries; the owning HQ entry follows the device setting.
 fn entry_profile(codec: *const media_codec) -> Option<aptx_adaptive::Profile> {
     let is =
         |list: &[&SyncStatic<media_codec>]| list.iter().any(|c| ptr::eq(codec, &raw const c.0));
@@ -150,7 +148,6 @@ fn entry_profile(codec: *const media_codec) -> Option<aptx_adaptive::Profile> {
     }
 }
 
-/// Selects the codec list from the environment, logging invalid values once per library load.
 fn codecs() -> *const *const media_codec {
     static BAD_ENV_LOGGED: Once = Once::new();
     let var = |k: &str| std::env::var_os(k);
@@ -240,8 +237,6 @@ unsafe extern "C" fn codec_select_config(
     }
 }
 
-/// Appends raw data, returning `-ENOSPC` on overflow unless the callback grows the buffer.
-///
 /// # Safety
 /// `b` must be a valid, initialised builder.
 unsafe fn builder_append(b: *mut spa_pod_builder, data: &[u8]) -> Result<*mut spa_pod, c_int> {

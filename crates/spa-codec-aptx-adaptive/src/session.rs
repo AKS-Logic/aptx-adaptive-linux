@@ -196,7 +196,6 @@ impl Session<AnyCore> {
         opts: &Options,
     ) -> Result<Self, SessionError> {
         let mtu = mtu.saturating_sub(usize::from(opts.scmst.is_some()));
-        // Replay holds one profile's packets, so it never switches.
         let profile = if opts.replay.is_none() && link_row(level, profile, mtu).is_some() {
             profile
         } else {
@@ -309,7 +308,6 @@ impl<C: Core> Session<C> {
             if row.bitrate != cur.bitrate {
                 Some(Some(l))
             } else if row.period_ms != cur.period_ms {
-                // §7L: equal bitrate, other period: P wouldn't follow the period byte.
                 Some(None)
             } else {
                 None
@@ -322,14 +320,11 @@ impl<C: Core> Session<C> {
         };
         let stored = found.flatten().filter(|&l| self.stream.request_level(l));
         if self.hold_level_if_switching() {
-            // The switch's reset will run level 3 and drop the held request.
             return Ok(DEFAULT_LEVEL);
         }
         let Some(l) = stored else {
             return Ok(from);
         };
-        // media-sink calls this between packets, so the next packet already uses the new row
-        // (§7L "next packet boundary", §7L.1 item 1).
         if self.stream.apply_level_now() {
             self.log_level();
         }
@@ -407,7 +402,6 @@ impl<C: Core> Session<C> {
             };
             self.fade = next;
             for s in frame {
-                // Truncated toward zero (§7I).
                 *s = (f64::from(*s) * gain) as i32;
             }
         }
@@ -514,8 +508,6 @@ impl<C: Core> Session<C> {
         seqnum: u16,
         _timestamp: u32,
     ) -> Result<usize, SessionError> {
-        // Between packets, after media-sink has sent the last one (and fed `abr_process` its
-        // frame count), so the reset's new row starts with this packet's header.
         self.maybe_reset();
         let cp = usize::from(self.scmst.is_some());
         let h = dst
@@ -525,7 +517,6 @@ impl<C: Core> Session<C> {
         h[1] = RTP_PAYLOAD_TYPE;
         h[2..4].copy_from_slice(&seqnum.to_be_bytes());
         h[4..8].copy_from_slice(&self.rtp_timestamp().to_be_bytes());
-        // Changes exactly when the encoder switches (§7H).
         h[8..12].copy_from_slice(&mode_ssrc(self.profile()).to_be_bytes());
         if let Some(b) = self.scmst {
             h[RTP_HEADER_LEN] = b;
@@ -550,7 +541,6 @@ impl<C: Core> Session<C> {
         let room = self.mtu.saturating_sub(RTP_HEADER_LEN).min(dst.len());
         let (samples, _) = src[..block].as_chunks::<4>();
         for (s, b) in self.pcm.iter_mut().zip(samples) {
-            // S24_32 leaves the top byte unspecified; the encoder wants it sign-extended.
             *s = (i32::from_ne_bytes(*b) << 8) >> 8;
         }
         self.apply_fade();
@@ -717,7 +707,6 @@ mod tests {
             s.start_encode(&mut [0; 12], 0, 0),
             Err(SessionError::NoSpace)
         );
-        // At an MTU that just fits, the byte shrinks the packet.
         let opts = |scmst| Options {
             scmst,
             ..Options::default()
@@ -759,11 +748,9 @@ mod tests {
     #[test]
     fn timing() {
         let s = session();
-        // 2 ms: divides both the 14 ms HQ and the 10 ms LL packet.
         assert_eq!(s.block_size(), 96 * 2 * 4);
         assert_eq!(packet_size(&s), 1344 * 4);
         assert_eq!(s.interval_ns(), 14_000_000);
-        // Config 0's filterbank (§7I).
         assert_eq!(s.delay_samples(), 90);
     }
 
@@ -794,12 +781,10 @@ mod tests {
             Session::with_stream(stream, 600),
             Err(SessionError::NoSpace)
         ));
-        // The budget floor is 128 bytes, which a tiny MTU can't hold.
         assert!(matches!(
             Session::new(DecoderLevel::R1, Profile::Hq, 100),
             Err(SessionError::NoSpace)
         ));
-        // Nor can a packet whose MTU-fitted bitrate is below the encoder's lowest (§8.8).
         let need =
             aptx_adaptive::min_packet_bytes(config(DecoderLevel::R1, Profile::Hq), 14).unwrap();
         let mtu = need + RTP_HEADER_LEN;
@@ -915,13 +900,11 @@ mod tests {
 
     #[test]
     fn ll_fits_the_mtu() {
-        // 12 + 348 fits a small MTU that HQ's 656 doesn't.
         let s = Session::new(DecoderLevel::R1, Profile::Ll, 360).unwrap();
         assert_eq!(s.stream.row().packet_bytes, 348);
         // R2 LL is config 4 on LL row 1 (270 kbps / 10 ms / 348 bytes, codec-core §10.F).
         let s = Session::new(DecoderLevel::R2, Profile::Hq, MTU).unwrap();
         assert!(s.can_run(Profile::Ll));
-        // 1 ms blocks: the gcd of the 19 ms R2 HQ and 10 ms LL packets.
         assert_eq!(s.block_size(), 48 * 2 * 4);
     }
 
@@ -991,23 +974,17 @@ mod tests {
             };
             log.push((block, s.pcm[0], r.written, mode, s.profile()));
         }
-        // Fade-out: 4800 frames = 50 blocks, falling to 0.
         assert_eq!(log[0].1, (1_000_000.0 * fade_gain(4799)) as i32);
         assert!(log[..50].windows(2).all(|w| w[1].1 <= w[0].1));
-        // Block 49 starts at fade-out frame 4704, so table entry 4799 − 4704.
         assert_eq!(log[49].1, (1_000_000.0 * fade_gain(95)) as i32);
-        // Silence: 900 ms = 43200 frames = 450 blocks.
         assert!(log[50..500].iter().all(|l| l.1 == 0));
-        // Fade-in over the next 50 blocks, then full level.
         assert_eq!(log[500].1, (1_000_000.0 * fade_gain(0)) as i32);
         assert_eq!(log[501].1, (1_000_000.0 * fade_gain(96)) as i32);
         assert!(log[549].1 < 1_000_000);
         assert_eq!(log[550].1, 1_000_000);
-        // The reset: the first packet ≥ 200 ms into the silence ends the HQ stretch.
         let reset = log.iter().position(|l| l.4 == Profile::Ll).unwrap();
         let silence_start = 50;
         let blocks_in = reset - silence_start;
-        // 200 ms = 100 blocks; the reset waits for the next packet (≤ 7 blocks of HQ).
         assert!(
             (100..=107).contains(&blocks_in),
             "reset {blocks_in} blocks in"
@@ -1020,8 +997,6 @@ mod tests {
         assert!(ssrcs[switch..].iter().all(|&b| b == 0xa1));
         assert_eq!(s.interval_ns(), 10_000_000);
         assert_eq!(s.stream.core().resets, 1);
-        // Packets kept flowing: one per 14 ms, then one per 10 ms, never more than a period
-        // apart.
         let packets: Vec<usize> = log.iter().filter(|l| l.2 != 0).map(|l| l.0).collect();
         assert!(packets.windows(2).all(|w| w[1] - w[0] <= 7));
     }
@@ -1038,7 +1013,6 @@ mod tests {
         let g = gains(&mut s, 60);
         assert_eq!(g[59], 1_000_000);
         assert_eq!((s.profile(), s.stream.core().resets), (Profile::Hq, 0));
-        // In the silence, it goes straight to the fade-in.
         s.request(Profile::Ll).unwrap();
         gains(&mut s, 60);
         s.request(Profile::Hq).unwrap();
@@ -1054,8 +1028,6 @@ mod tests {
         let before = *gains(&mut s, 20).last().unwrap();
         s.request(Profile::Hq).unwrap();
         let after = gains(&mut s, 1)[0];
-        // After 20 blocks the fade-out would play entry 4799 − 1920 next; the reversed fade
-        // plays exactly that, then climbs.
         assert!(after < before);
         assert_eq!(
             after,
@@ -1073,7 +1045,6 @@ mod tests {
         let mut s = Session::new(DecoderLevel::R1, Profile::Hq, MTU).unwrap();
         let src: Vec<u8> = sine_pcm(96);
         let mut buf = vec![0u8; 2048];
-        // Settle past the start fade first.
         for _ in 0..100 {
             s.encode(&src, &mut buf).unwrap();
         }
@@ -1189,14 +1160,11 @@ mod tests {
         assert_eq!(s.step_level(false), Ok(4));
         assert_eq!(s.step_level(false), Ok(4));
         assert_eq!((s.level(), s.stream.samples_per_packet()), (4, 1152));
-        // Several steps between packets: each starts from the last, and the packet uses the
-        // last one.
         assert_eq!(s.step_level(true), Ok(3));
         assert_eq!(s.step_level(true), Ok(2));
         assert_eq!(s.step_level(false), Ok(3));
         headers(&mut s, 1);
         assert_eq!((s.level(), s.stream.samples_per_packet()), (3, 1344));
-        // The 2 ms block divides every reachable period (12, 14, 16 and LL's 10 ms).
         assert_eq!(s.block_size(), 96 * 2 * 4);
     }
 
@@ -1276,7 +1244,6 @@ mod tests {
                 steps.push((i, ts));
             }
         }
-        // The call before packet n's header changes packet n's timestamp.
         assert_eq!(steps, [(0, 0x02a0), (20, 0x0300), (40, 0x02a0)]);
         assert_eq!(s.level(), 3);
     }

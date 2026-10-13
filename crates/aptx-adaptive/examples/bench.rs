@@ -1,5 +1,3 @@
-//! Measures encoder speed against real time: `cargo run --release -p aptx-adaptive --example bench`.
-
 use std::time::Instant;
 
 use aptx_adaptive::{Config, DecoderLevel, Profile, Stream, packet_budget};
@@ -31,7 +29,6 @@ fn main() {
         let mut out = [0; 2048];
         let (mut packets, mut bytes) = (0, 0);
         let start = Instant::now();
-        // 1 ms chunks, like the reference source.
         for chunk in pcm.chunks(96) {
             if let Some(n) = stream.push(chunk, &mut out).expect("encode") {
                 packets += 1;

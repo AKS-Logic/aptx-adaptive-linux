@@ -1,14 +1,3 @@
-//! Development switches read from the plugin host process environment.
-//!
-//! - `APTX_ADAPTIVE_REPLAY=/path/to/file.bin`, only with the `dev-replay` feature: ignore PCM and
-//!   send the file's raw codec packets (e.g. `tests/vectors/r2/sine1k.r1.bin`, or packets
-//!   captured from a phone) in order, looping. Framing, RTP and timing stay the real code path.
-//! - `APTX_ADAPTIVE_SCMST=1`, only with `dev-replay`: put a 1-byte SCMS-T content protection
-//!   header right after the RTP header, for a sink configured with SCMS-T (needs a bluetoothd that
-//!   puts Content Protection in Set Configuration). The byte is [`SCMST_COPY_FREE`] unless
-//!   `APTX_ADAPTIVE_SCMST_BYTE=0x..` overrides it.
-//! - `APTX_ADAPTIVE_DRIFT_LOG=0`, in every build: don't log the drift line (see `drift`).
-
 use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
@@ -93,7 +82,6 @@ impl Options {
     }
 }
 
-/// Sends pre-encoded packets while preserving the reference's steady-state timing.
 #[derive(Debug)]
 pub struct Replay {
     packets: Vec<u8>,
@@ -165,7 +153,6 @@ impl Core for Replay {
     fn set_bitrate(&mut self, _bps: u32) {}
 }
 
-/// The core a session runs on: the real encoder, or a replay in dev.
 #[derive(Debug)]
 pub enum AnyCore {
     Encoder(Encoder),
