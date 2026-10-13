@@ -822,3 +822,11 @@ It's then stored as **pending**. If several requests arrive between two packets,
 - apply the change at the next packet boundary.
 
 PipeWire's own back-off (½ s between reductions, 1 s of no backlog before an increase) is pacing enough.
+
+### 7L.1 Answers to the level-change questions (verified 2026-10-13)
+
+1. **Boundary timing.** Applying a pending level at the first packet boundary after the request is exactly equivalent to the reference: that packet's deficit update and header always use the old period. Applying it anywhere else (mid-packet) changes the output.
+2. **RSSI without sideband.** The reference's RSSI starts at 0 dBm and only sideband messages change it. With no sideband the −60/−55 dBm HQ caps never apply; only the dual-mono/TWS cap of 3 does. R2 HQ level 5 is reachable.
+3. **MTU cap per level.** The §7J cap is recomputed at every level change, for HQ rows only (never LL). The bitrate is computed in single precision: trunc(float32(budget·8000 / period_ms) − 25000.0). This makes §4's UNCERTAIN formula and §7J's integer form exact.
+4. **Equal bitrate, different period (R2 LL index 2, L3↔L4).** Confirmed: no bitrate call is made, the loop keeps the old period, and the codec packets are identical to staying at the old level. The period byte switches anyway. A source should avoid the step.
+5. **Same level while at ¾ bitrate.** Harmless: the output is byte-identical, because the next per-packet step sets ¾ again and fully resets the rate state.
