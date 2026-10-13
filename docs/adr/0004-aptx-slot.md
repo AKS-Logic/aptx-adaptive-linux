@@ -111,7 +111,10 @@ Manual recovery: pick the other aptX Adaptive profile and then the wanted one ba
   2. Set `Profile` back to the same index, with `save = false`.
   - The second set differs from `off`, so `set_profile` runs `spa_bt_device_ensure_media_codec` with every supported entry of that id in order (`get_media_codecs`, L207-225; `bluez5-dbus.c` L5092-5117). The first one is ours, so it reconfigures to aptX Adaptive.
   - It logs `… runs aptx_hd under profile 'a2dp-sink' (…aptX Adaptive); re-selecting it via 'off' to switch to aptX Adaptive` at info level, topic `s-aptx-adaptive`.
-- **Rate limit:** one attempt per device per connection, keyed by the device's bound id and cleared on `device-removed`, so it can't loop even if the switch fails.
+- **Rate limit:** one attempt per device per connection, so it can't loop even if the switch fails.
+  - **Key:** the device's `object.serial`, cleared on `device-removed`.
+  - **Why not the bound id:** PipeWire reuses bound ids, and on `device-removed` the subject is already unbound (`bound-id` reads 4294967295). The serial is new for each device object and is in the event properties on removal. A private WirePlumber 0.5.18 probe showed it there: two connections of one device kept bound id 38 and got serials 38 and 40, and both `device-removed` events carried the matching serial.
+- **Loading:** the conf fragment marks the script `optional`, pulled in by a `required` virtual component that only *wants* it. In a 0.5 profile, `optional` alone never loads anything, and `required` stops WirePlumber from starting if the script fails. Checked on the private instance: a script with a syntax error is logged as a failed optional component, and WirePlumber still finishes loading. With `required`, it exits.
 
 Why "off" and not the alternatives:
 - **Device `Props` `bluetoothAudioCodec`:** it's keyed by id. `impl_set_param` looks up the id among the supported codecs and calls `set_profile(this, this->profile, codec_id, true)` (L3243-3250). With the same id that's the early return, so it's a no-op.

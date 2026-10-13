@@ -22,8 +22,12 @@ local REAL_CODECS = { aptx_hd = 7, aptx = 6 }
 -- only our entries' descriptions contain this, the real ones are "aptX", "aptX HD", "aptX-LL"
 local OUR_DESCRIPTION = "aptX Adaptive"
 
--- device bound-id (string) -> true once we've acted; cleared when the device goes away
+-- Keyed by the device's object.serial (string). PipeWire reuses bound ids, and on
+-- device-removed the subject is already unbound (bound-id reads 4294967295); the serial is
+-- unique per object and is in the event properties on both add and remove.
+-- serial -> true once we've acted; cleared when the device goes away
 local attempted = {}
+-- serial -> pending settle timer
 local pending = {}
 
 -- True when the running codec is a real aptX codec but the current profile, which has its
@@ -34,7 +38,7 @@ function shouldRecover (codec, profile)
     return false
   end
   local index = tonumber (profile.index)
-  if index == nil or index // 65536 ~= A2DP_PROFILE or index % 65536 ~= id then
+  if index == nil or math.floor (index / 65536) ~= A2DP_PROFILE or index % 65536 ~= id then
     return false
   end
   local desc = profile.description
@@ -68,9 +72,9 @@ function setProfile (device, index)
   })
 end
 
-function check (source, dev_id)
-  pending [dev_id] = nil
-  if attempted [dev_id] then
+function check (source, serial, dev_id)
+  pending [serial] = nil
+  if attempted [serial] then
     return
   end
   local device_om = source:call ("get-object-manager", "device")
@@ -79,7 +83,7 @@ function check (source, dev_id)
     Constraint { "bound-id", "=", dev_id, type = "gobject" },
     Constraint { "device.api", "=", "bluez5", type = "pw" },
   }
-  if device == nil then
+  if device == nil or device.properties ["object.serial"] ~= serial then
     return
   end
   local codec = sinkCodec (node_om, dev_id)
@@ -88,7 +92,7 @@ function check (source, dev_id)
     return
   end
 
-  attempted [dev_id] = true
+  attempted [serial] = true
   local index = tonumber (profile.index)
   log:info (device, string.format (
       "%s runs %s under profile '%s' (%s); re-selecting it via 'off' to switch to aptX Adaptive",
@@ -101,12 +105,13 @@ function check (source, dev_id)
 end
 
 -- Let WirePlumber's own profile selection settle first; check() looks at the state again.
-function schedule (source, dev_id)
-  if dev_id == nil or attempted [dev_id] or pending [dev_id] then
+-- dev_id is the device's bound id (string), used to look it and its nodes up.
+function schedule (source, serial, dev_id)
+  if serial == nil or dev_id == nil or attempted [serial] or pending [serial] then
     return
   end
-  pending [dev_id] = Core.timeout_add (SETTLE_MSEC, function ()
-    check (source, dev_id)
+  pending [serial] = Core.timeout_add (SETTLE_MSEC, function ()
+    check (source, serial, dev_id)
     return false
   end)
 end
@@ -126,7 +131,18 @@ SimpleEventHook {
     },
   },
   execute = function (event)
-    schedule (event:get_source (), event:get_subject ().properties ["device.id"])
+    local source = event:get_source ()
+    local dev_id = event:get_subject ().properties ["device.id"]
+    if dev_id == nil then
+      return
+    end
+    local device = source:call ("get-object-manager", "device"):lookup {
+      Constraint { "bound-id", "=", dev_id, type = "gobject" },
+      Constraint { "device.api", "=", "bluez5", type = "pw" },
+    }
+    if device ~= nil then
+      schedule (source, device.properties ["object.serial"], dev_id)
+    end
   end
 }:register ()
 
@@ -142,7 +158,9 @@ SimpleEventHook {
     },
   },
   execute = function (event)
-    schedule (event:get_source (), tostring (event:get_subject () ["bound-id"]))
+    local device = event:get_subject ()
+    schedule (event:get_source (), device.properties ["object.serial"],
+        tostring (device ["bound-id"]))
   end
 }:register ()
 
@@ -155,11 +173,14 @@ SimpleEventHook {
     },
   },
   execute = function (event)
-    local dev_id = tostring (event:get_subject () ["bound-id"])
-    if pending [dev_id] ~= nil then
-      pending [dev_id]:destroy ()
+    local serial = event:get_properties () ["object.serial"]
+    if serial == nil then
+      return
     end
-    pending [dev_id] = nil
-    attempted [dev_id] = nil
+    if pending [serial] ~= nil then
+      pending [serial]:destroy ()
+    end
+    pending [serial] = nil
+    attempted [serial] = nil
   end
 }:register ()

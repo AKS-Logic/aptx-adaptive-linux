@@ -57,10 +57,20 @@ local function om (objects)
   end }
 end
 
+-- Live on WirePlumber 0.5.18 (probe hook on a private instance): a device keeps its bound
+-- id across reconnects but gets a new object.serial, and on device-removed the subject is
+-- already unbound (bound-id 4294967295, no properties); object.serial and object.id are
+-- only in the event properties.
+local UNBOUND = 4294967295
+local next_serial = 100
+local current_serial
+
 local function scenario (codec, profile_index, profile_desc)
+  next_serial = next_serial + 1
+  current_serial = tostring (next_serial)
   local device = {
     match = { ["bound-id"] = 42, ["device.api"] = "bluez5" },
-    properties = { ["device.name"] = "bluez_card.00_11" },
+    properties = { ["device.name"] = "bluez_card.00_11", ["object.serial"] = current_serial },
     ["bound-id"] = 42,
   }
   device.iterate_params = function (_, id)
@@ -109,11 +119,19 @@ local function run_timers ()
   end
 end
 
-local function reset ()
-  set_params, logs, timers = {}, {}, {}
+-- The device disconnects: device-removed as WirePlumber delivers it.
+local function device_removed ()
   hooks ["aptx-adaptive/guard-forget-device"].execute {
-    get_subject = function () return { ["bound-id"] = 42 } end,
+    get_subject = function () return { ["bound-id"] = UNBOUND, properties = {} } end,
+    get_properties = function ()
+      return { ["object.id"] = "42", ["object.serial"] = current_serial, ["device.api"] = "bluez5" }
+    end,
   }
+end
+
+local function reset ()
+  device_removed ()
+  set_params, logs, timers = {}, {}, {}
 end
 
 local OURS = "High Fidelity Playback (A2DP Sink, codec aptX Adaptive)"
@@ -135,8 +153,9 @@ node_added (node, source)
 run_timers ()
 assert (#set_params == 2, "once per connection")
 
--- a new connection may act again
+-- a new connection (same bound id, new serial) may act again
 reset ()
+_, node, source = scenario ("aptx_hd", A2DP_HD, OURS)
 node_added (node, source)
 run_timers ()
 assert (#set_params == 2, "acts after the device is re-added")
@@ -173,7 +192,9 @@ assert (#set_params == 0)
 reset ()
 _, node, source = scenario ("aptx_hd", A2DP_HD, OURS)
 node_added (node, source)
-reset ()
+local timer = timers [1]
+device_removed ()
+assert (timer ~= nil and timer.destroyed, "pending timer destroyed on removal")
 run_timers ()
 assert (#set_params == 0, "pending check cancelled")
 
