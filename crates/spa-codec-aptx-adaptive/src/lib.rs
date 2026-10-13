@@ -23,6 +23,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::io::Write as _;
 use std::ptr;
 use std::slice;
+use std::sync::Once;
 
 use ffi::{
     A2DP_CODEC_VENDOR, A2DP_MAX_CAPS_SIZE, EINVAL, ENOENT, ENOSPC, ENOTSUP, MEDIA_CODEC_A2DP,
@@ -54,69 +55,69 @@ fn set_errno(e: c_int) {
     unsafe { *__errno_location() = e };
 }
 
-/// The codec; `id` is filled in per slot below (see `slot`).
-const CODEC: media_codec = media_codec {
-    id: 0,
-    kind: MEDIA_CODEC_A2DP,
-    codec_id: A2DP_CODEC_VENDOR,
-    vendor: a2dp_vendor_codec_t {
-        vendor_id: ids::VENDOR_ID,
-        codec_id: ids::CODEC_ID,
-    },
-    name: ids::CODEC_NAME.as_ptr(),
-    description: ids::CODEC_DESCRIPTION.as_ptr(),
-    endpoint_name: ptr::null(),
-    info: ptr::null(),
-    send_buf_size: ids::SEND_BUF_SIZE,
-    duplex_codec: ptr::null(),
-    stream_pkt: false,
-    get_bis_config: None,
-    fill_caps: Some(codec_fill_caps),
-    select_config: Some(codec_select_config),
-    enum_config: Some(codec_enum_config),
-    validate_config: Some(codec_validate_config),
-    get_qos: None,
-    get_metadata: None,
-    free_config_data: None,
-    caps_preference_cmp: None,
-    init_props: Some(codec_init_props),
-    clear_props: Some(codec_clear_props),
-    enum_props: Some(codec_enum_props),
-    set_props: Some(codec_set_props),
-    init: Some(codec_init),
-    deinit: Some(codec_deinit),
-    update_props: Some(codec_update_props),
-    get_block_size: Some(codec_get_block_size),
-    get_interval: Some(codec_get_interval),
-    abr_process: Some(codec_abr_process),
-    start_encode: Some(codec_start_encode),
-    encode: Some(codec_encode),
-    start_decode: None,
-    decode: None,
-    produce_plc: None,
-    reduce_bitpool: None,
-    increase_bitpool: None,
-    set_log: None,
-    get_delay: Some(codec_get_delay),
-};
+/// The codec, claiming `slot`'s id.
+const fn codec(slot: slot::Slot) -> media_codec {
+    media_codec {
+        id: slot.id(),
+        kind: MEDIA_CODEC_A2DP,
+        codec_id: A2DP_CODEC_VENDOR,
+        vendor: a2dp_vendor_codec_t {
+            vendor_id: ids::VENDOR_ID,
+            codec_id: ids::CODEC_ID,
+        },
+        name: ids::CODEC_NAME.as_ptr(),
+        description: ids::CODEC_DESCRIPTION.as_ptr(),
+        endpoint_name: ptr::null(),
+        info: ptr::null(),
+        send_buf_size: ids::SEND_BUF_SIZE,
+        duplex_codec: ptr::null(),
+        stream_pkt: false,
+        get_bis_config: None,
+        fill_caps: Some(codec_fill_caps),
+        select_config: Some(codec_select_config),
+        enum_config: Some(codec_enum_config),
+        validate_config: Some(codec_validate_config),
+        get_qos: None,
+        get_metadata: None,
+        free_config_data: None,
+        caps_preference_cmp: None,
+        init_props: Some(codec_init_props),
+        clear_props: Some(codec_clear_props),
+        enum_props: Some(codec_enum_props),
+        set_props: Some(codec_set_props),
+        init: Some(codec_init),
+        deinit: Some(codec_deinit),
+        update_props: Some(codec_update_props),
+        get_block_size: Some(codec_get_block_size),
+        get_interval: Some(codec_get_interval),
+        abr_process: Some(codec_abr_process),
+        start_encode: Some(codec_start_encode),
+        encode: Some(codec_encode),
+        start_decode: None,
+        decode: None,
+        produce_plc: None,
+        reduce_bitpool: None,
+        increase_bitpool: None,
+        set_log: None,
+        get_delay: Some(codec_get_delay),
+    }
+}
 
-static CODEC_LDAC: SyncStatic<media_codec> = SyncStatic(media_codec {
-    id: slot::Slot::Ldac.id(),
-    ..CODEC
-});
-static CODEC_LC3PLUS_HR: SyncStatic<media_codec> = SyncStatic(media_codec {
-    id: slot::Slot::Lc3plusHr.id(),
-    ..CODEC
-});
+static CODEC_LDAC: SyncStatic<media_codec> = SyncStatic(codec(slot::Slot::Ldac));
+static CODEC_LC3PLUS_HR: SyncStatic<media_codec> = SyncStatic(codec(slot::Slot::Lc3plusHr));
 static CODECS_LDAC: SyncStatic<[*const media_codec; 2]> =
     SyncStatic([&raw const CODEC_LDAC.0, ptr::null()]);
 static CODECS_LC3PLUS_HR: SyncStatic<[*const media_codec; 2]> =
     SyncStatic([&raw const CODEC_LC3PLUS_HR.0, ptr::null()]);
 
 /// The codec list for the slot in `APTX_ADAPTIVE_SLOT`, read when the loader instantiates us.
+/// A bad value is logged once per process.
 fn codecs() -> *const *const media_codec {
+    static BAD_SLOT_LOGGED: Once = Once::new();
     let slot = slot::Slot::from_env(|k| std::env::var_os(k)).unwrap_or_else(|e| {
-        let _ = writeln!(std::io::stderr(), "aptx-adaptive: {e}");
+        BAD_SLOT_LOGGED.call_once(|| {
+            let _ = writeln!(std::io::stderr(), "aptx-adaptive: {e}");
+        });
         slot::Slot::DEFAULT
     });
     match slot {

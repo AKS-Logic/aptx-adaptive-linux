@@ -26,7 +26,7 @@ The plugin is installed as PipeWire's LC3plus HR plugin, so it replaces a real L
 
 ## codec selection
 
-By default the plugin borrows PipeWire's LDAC codec id, which ranks above aptX HD, aptX and AAC. A headset with aptX Adaptive gets it as soon as it connects, as the plain `a2dp-sink` profile; aptX HD is still there as `a2dp-sink-aptx_hd`. See [ADR 0002](docs/adr/0002-codec-autoselect.md).
+By default the plugin borrows PipeWire's LDAC codec id, which ranks above aptX HD, aptX and AAC. A headset with aptX Adaptive gets it as soon as it connects, as the plain `a2dp-sink` profile; aptX HD is still there as `a2dp-sink-aptx_hd`. There's no `a2dp-sink-aptx_adaptive` profile in this slot, so if WirePlumber saved that one earlier it falls back to `a2dp-sink`. See [ADR 0002](docs/adr/0002-codec-autoselect.md).
 
 **If your headset also supports LDAC**, the two share that id, and which one you get can change between restarts. Install in the LC3plus HR slot instead:
 
@@ -90,7 +90,7 @@ scripts/install-plugin.sh --uninstall
 systemctl --user restart wireplumber pipewire
 ```
 
-This removes the plugin and the drop-ins. It's safe to run twice.
+This removes the plugin and the drop-ins. It's safe to run twice. Directories the install created (`~/.local/lib/spa-0.2/…`, `~/.config/systemd/user/….d`) are removed only if empty, so `~/.local/lib` and `~/.config/systemd/user` themselves are left in place.
 
 ## clean room
 
