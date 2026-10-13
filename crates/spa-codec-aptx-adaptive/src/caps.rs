@@ -20,10 +20,7 @@ const CHANNEL_MODES: usize = 7;
 const RATE_MASK: u8 = 0xF8;
 const RATE_48K: u8 = 0x10;
 
-/// Byte 6 bits 0..2: independent flags (§7J). 0x01 is the sink's own and never sent.
-const SOURCE_TYPE_MASK: u8 = 0x07;
-const SOURCE_TYPE_SINK: u8 = 0x01;
-/// The sink times playback itself. A host encoder always sends this, never the sink's bits
+/// Byte 6 bits 0..2 are independent flags (§7J). The sink times playback itself. A host encoder always sends this, never the sink's bits
 /// (§7E, §7J).
 pub const SOURCE_TYPE_HOST: u8 = 0x02;
 
@@ -153,20 +150,19 @@ pub fn fill_caps() -> Vec<u8> {
     )
 }
 
-/// Picks 48 kHz and one 2-channel mode and puts `source_type` (normally [`SOURCE_TYPE_HOST`])
-/// in byte 6 bits 1..2 (§7E); the sink flag 0x01 is always cleared. Then, per §7J:
+/// Picks 48 kHz and one 2-channel mode, with source type [`SOURCE_TYPE_HOST`] in byte 6 (§7E,
+/// §7J); the sink's own bits are never sent. Then, per §7J:
 /// - an R2 sink gets our own block ([`r2_data`]), with the features low byte set to ours & the
 ///   sink's;
-/// - an R1 sink gets its own body 8..25 back, except that with [`SOURCE_TYPE_HOST`] a zero
-///   target latency byte gets a default (§7G) and LL0 is raised to at least 80 ms
-///   (§7H), and 26..39 zeroed.
+/// - an R1 sink gets its own body 8..25 back, except that a zero target latency byte gets a
+///   default (§7G) and LL0 is raised to at least 80 ms (§7H), and 26..39 zeroed.
 ///
 /// The result is as long as `caps`, with any bytes past [`CAPS_LEN`] zeroed, because PipeWire
 /// only offers the codec when the lengths match.
 ///
 /// # Errors
 /// As for [`Caps::parse`], or `Unsupported` without 48 kHz and stereo or joint stereo.
-pub fn select_config(bytes: &[u8], source_type: u8) -> Result<Vec<u8>, CapsError> {
+pub fn select_config(bytes: &[u8]) -> Result<Vec<u8>, CapsError> {
     let caps = Caps::parse(bytes)?;
     if caps.rates() & RATE_48K == 0 {
         return Err(CapsError::Unsupported);
@@ -175,8 +171,7 @@ pub fn select_config(bytes: &[u8], source_type: u8) -> Result<Vec<u8>, CapsError
         .into_iter()
         .find(|m| caps.channel_modes() & m != 0)
         .ok_or(CapsError::Unsupported)?;
-    let source_type = source_type & SOURCE_TYPE_MASK & !SOURCE_TYPE_SINK;
-    let rate = RATE_48K | source_type;
+    let rate = RATE_48K | SOURCE_TYPE_HOST;
     let config = match caps.decoder_level() {
         DecoderLevel::R2 => {
             // Our low byte is 0, so the AND is always 0; that's what §7J asks for.
@@ -186,14 +181,12 @@ pub fn select_config(bytes: &[u8], source_type: u8) -> Result<Vec<u8>, CapsError
         }
         DecoderLevel::R1 => {
             let mut c = element(bytes.len(), rate, mode, &caps.0[APTX_DATA..R2_DATA_END]);
-            if source_type & SOURCE_TYPE_HOST != 0 {
-                for (i, default) in TARGET_LATENCY_DEFAULTS {
-                    if c[i] == 0 {
-                        c[i] = default;
-                    }
+            for (i, default) in TARGET_LATENCY_DEFAULTS {
+                if c[i] == 0 {
+                    c[i] = default;
                 }
-                c[8] = c[8].max(LL0_MIN);
             }
+            c[8] = c[8].max(LL0_MIN);
             c
         }
     };
@@ -249,10 +242,6 @@ mod tests {
     use super::*;
     use crate::fixtures::{PX7_S2E, PX7_S2E_CONFIG};
 
-    fn select_config_host(bytes: &[u8]) -> Result<Vec<u8>, CapsError> {
-        select_config(bytes, SOURCE_TYPE_HOST)
-    }
-
     const SETUP_PREFS: usize = 20;
     const END_MARKER: usize = 24;
 
@@ -281,7 +270,7 @@ mod tests {
 
     #[test]
     fn px7_s2e_select_config_matches_spec() {
-        let config = select_config_host(&PX7_S2E).unwrap();
+        let config = select_config(&PX7_S2E).unwrap();
         assert_eq!(config, PX7_S2E_CONFIG);
         assert_eq!(validate_config(&config), Ok(DecoderLevel::R1));
     }
@@ -305,13 +294,13 @@ mod tests {
     #[test]
     fn parse_ignores_trailing_bytes() {
         let long = [&PX7_S2E[..], &[0x55; 4]].concat();
-        let config = select_config_host(&long).unwrap();
+        let config = select_config(&long).unwrap();
         assert_eq!(config.len(), long.len());
         assert_eq!(config[..CAPS_LEN], PX7_S2E_CONFIG);
         assert_eq!(config[CAPS_LEN..], [0; 4]);
         let long_config = [&PX7_S2E_CONFIG[..], &[0x55; 4]].concat();
         assert_eq!(validate_config(&long_config), Ok(DecoderLevel::R1));
-        assert_eq!(select_config_host(&PX7_S2E[..39]), Err(CapsError::Invalid));
+        assert_eq!(select_config(&PX7_S2E[..39]), Err(CapsError::Invalid));
     }
 
     /// §7J: an R2 sink gets our block, not its own, whatever TTP bytes (here a zero HQ byte)
@@ -321,7 +310,7 @@ mod tests {
         let mut caps = r2_caps(0x0F00_0017);
         caps[APTX_DATA..APTX_DATA + 6].copy_from_slice(&[0x37, 0x6a, 0, 0xaf, 0x64, 0x4b]);
         caps[30] = 0x55;
-        let config = select_config_host(&caps).unwrap();
+        let config = select_config(&caps).unwrap();
         #[rustfmt::skip]
         let want: [u8; CAPS_LEN] = [
             0xd7, 0, 0, 0, 0xad, 0, 0x12, 0x02,
@@ -336,7 +325,7 @@ mod tests {
     #[test]
     fn r2_features_low_byte_is_anded() {
         for sink in [0x0F00_0000, 0x0F00_0003, 0x0F00_0017, 0xFFFF_FFFF] {
-            let config = select_config_host(&r2_caps(sink)).unwrap();
+            let config = select_config(&r2_caps(sink)).unwrap();
             let got = u32::from_le_bytes(config[FEATURES..SETUP_PREFS].try_into().unwrap());
             assert_eq!(got, 0x0F00_0000, "{sink:#010x}");
         }
@@ -356,7 +345,7 @@ mod tests {
         let c = Caps::parse(&caps).unwrap();
         assert_eq!(c.decoder_level(), DecoderLevel::R2);
         assert_eq!(c.features(), 0x0F00_0003);
-        let config = select_config_host(&caps).unwrap();
+        let config = select_config(&caps).unwrap();
         assert_eq!(config[RATES..=CHANNEL_MODES], [0x12, CHANNEL_STEREO]);
         assert_eq!(config[FEATURES], 0);
         assert_eq!(config[EXT_VERSION], 1);
@@ -374,7 +363,7 @@ mod tests {
         let mut want = PX7_S2E_CONFIG;
         want[20] = 0x55;
         want[25] = 0x66;
-        assert_eq!(select_config_host(&caps).unwrap(), want);
+        assert_eq!(select_config(&caps).unwrap(), want);
         assert_eq!(validate_config(&want), Ok(DecoderLevel::R1));
     }
 
@@ -383,7 +372,7 @@ mod tests {
         let mut caps = PX7_S2E;
         caps[CHANNEL_MODES] = CHANNEL_JOINT_STEREO | 0x01;
         assert_eq!(
-            select_config_host(&caps).unwrap()[CHANNEL_MODES],
+            select_config(&caps).unwrap()[CHANNEL_MODES],
             CHANNEL_JOINT_STEREO
         );
     }
@@ -392,26 +381,20 @@ mod tests {
     fn rejects_unusable_caps() {
         let mut no_48k = PX7_S2E;
         no_48k[RATES] = 0x08;
-        assert_eq!(select_config_host(&no_48k), Err(CapsError::Unsupported));
+        assert_eq!(select_config(&no_48k), Err(CapsError::Unsupported));
         let mut mono = PX7_S2E;
         mono[CHANNEL_MODES] = 0x01 | 0x04 | 0x10 | 0x20;
-        assert_eq!(select_config_host(&mono), Err(CapsError::Unsupported));
-        assert_eq!(select_config_host(&PX7_S2E[..34]), Err(CapsError::Invalid));
+        assert_eq!(select_config(&mono), Err(CapsError::Unsupported));
+        assert_eq!(select_config(&PX7_S2E[..34]), Err(CapsError::Invalid));
     }
 
     #[test]
     fn rejects_other_vendor_codecs() {
         let aptx_classic = [0x4f, 0, 0, 0, 0x01, 0, 0x32];
-        assert_eq!(
-            select_config_host(&aptx_classic),
-            Err(CapsError::Unsupported)
-        );
+        assert_eq!(select_config(&aptx_classic), Err(CapsError::Unsupported));
         let aptx_hd = [0xD7, 0, 0, 0, 0x24, 0, 0];
-        assert_eq!(select_config_host(&aptx_hd), Err(CapsError::Unsupported));
-        assert_eq!(
-            select_config_host(&VENDOR_HEADER[..2]),
-            Err(CapsError::Invalid)
-        );
+        assert_eq!(select_config(&aptx_hd), Err(CapsError::Unsupported));
+        assert_eq!(select_config(&VENDOR_HEADER[..2]), Err(CapsError::Invalid));
     }
 
     #[test]
@@ -426,47 +409,37 @@ mod tests {
         assert_eq!(validate_config(&c), Ok(DecoderLevel::R1));
     }
 
-    /// §7E: byte 6 = rate bit | source type; the sink's own bits 0..2 are dropped.
+    /// §7E: byte 6 = rate bit | host source type; the sink's own bits 0..2 are dropped.
     #[test]
     fn select_config_sets_source_type() {
         assert_eq!(PX7_S2E[RATES], 0x19);
-        assert_eq!(select_config_host(&PX7_S2E).unwrap()[RATES], 0x12);
-        assert_eq!(select_config(&PX7_S2E, 0).unwrap()[RATES], 0x10);
-        let mut caps = PX7_S2E;
-        caps[RATES] = 0x17;
-        assert_eq!(select_config(&caps, 2).unwrap()[RATES], 0x12);
-        // The sink flag 0x01 is never sent; the host bit is tested on its own (§7J).
-        let config = select_config(&PX7_S2E, 0x03).unwrap();
+        let config = select_config(&PX7_S2E).unwrap();
         assert_eq!(config[RATES], 0x12);
         assert_eq!(config, PX7_S2E_CONFIG);
+        let mut caps = PX7_S2E;
+        caps[RATES] = 0x17;
+        assert_eq!(select_config(&caps).unwrap()[RATES], 0x12);
     }
 
     /// §7G: with source type 2 a zero latency byte gets a default; others are echoed.
     #[test]
     fn select_config_replaces_zero_latency() {
-        let config = select_config_host(&PX7_S2E).unwrap();
+        let config = select_config(&PX7_S2E).unwrap();
         // LL0 55 ms is raised to 80 (§7H).
         assert_eq!(config[8..14], [0x50, 0x6a, 0x64, 0xaf, 0x64, 0x4b]);
         let mut caps = PX7_S2E;
         caps[8] = 0x60;
-        assert_eq!(select_config_host(&caps).unwrap()[8], 0x60);
+        assert_eq!(select_config(&caps).unwrap()[8], 0x60);
         let mut caps = PX7_S2E;
         caps[8..14].copy_from_slice(&[0, 0, 0, 0, 0, 0x22]);
-        let config = select_config_host(&caps).unwrap();
+        let config = select_config(&caps).unwrap();
         assert_eq!(config[8..14], [0x50, 0x64, 0x64, 0x64, 0, 0x22]);
         caps[8..12].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
         // Non-zero bytes are echoed, except LL0 under 80 ms (§7H).
         assert_eq!(
-            select_config_host(&caps).unwrap()[8..14],
+            select_config(&caps).unwrap()[8..14],
             [0x50, 0x22, 0x33, 0x44, 0, 0x22]
         );
-    }
-
-    /// Source type 0 echoes the sink's bytes, zeros included.
-    #[test]
-    fn select_config_source_type_0_echoes_zero_latency() {
-        let config = select_config(&PX7_S2E, 0).unwrap();
-        assert_eq!(config[8..26], PX7_S2E[8..26]);
     }
 
     #[test]
@@ -504,7 +477,7 @@ mod tests {
         let mut copied = caps.clone();
         copied[CHANNEL_MODES] = CHANNEL_STEREO;
         assert_eq!(validate_config(&copied), Ok(DecoderLevel::R1));
-        let config = select_config_host(&caps).unwrap();
+        let config = select_config(&caps).unwrap();
         assert_eq!(config, copied);
     }
 
@@ -512,10 +485,10 @@ mod tests {
     /// a sink that sends 0 is still accepted.
     #[test]
     fn validate_accepts_sink_initiated_source_type_0() {
-        let mut config = select_config_host(&fill_caps()).unwrap();
+        let mut config = select_config(&fill_caps()).unwrap();
         config[RATES] = RATE_48K;
         assert_eq!(validate_config(&config), Ok(DecoderLevel::R1));
-        let mut r2 = select_config_host(&r2_caps(0x0F00_0003)).unwrap();
+        let mut r2 = select_config(&r2_caps(0x0F00_0003)).unwrap();
         r2[RATES] = RATE_48K;
         assert_eq!(validate_config(&r2), Ok(DecoderLevel::R2));
     }
@@ -529,7 +502,7 @@ mod tests {
             assert_eq!(validate_config(&c).is_ok(), ok, "{byte6:#04x}");
             let mut caps = PX7_S2E;
             caps[RATES] = byte6 | 0x01;
-            assert_eq!(select_config_host(&caps).is_ok(), ok, "{byte6:#04x}");
+            assert_eq!(select_config(&caps).is_ok(), ok, "{byte6:#04x}");
         }
     }
 
