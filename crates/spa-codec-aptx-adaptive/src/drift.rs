@@ -147,6 +147,9 @@ pub struct Report {
     pub backlog: (usize, usize, usize),
     /// The adjust in use, `None` when it's off.
     pub adjust_ms: Option<i16>,
+    /// HQ/LL switch requests refused since the stream started (logged when non-zero; the
+    /// data thread doesn't log them itself).
+    pub refused_switches: u32,
 }
 
 impl fmt::Display for Report {
@@ -166,6 +169,9 @@ impl fmt::Display for Report {
         }
         if let Some(a) = self.adjust_ms {
             write!(f, ", ttp adjust {a:+} ms")?;
+        }
+        if self.refused_switches > 0 {
+            write!(f, ", refused mode switches {}", self.refused_switches)?;
         }
         Ok(())
     }
@@ -272,15 +278,24 @@ impl Drift {
             drift_ms,
             backlog: (b.min, (b.sum / b.n.max(1)) as usize, b.max),
             adjust_ms: (self.mode != TtpAdjust::Off).then(|| self.adjust_ms()),
+            refused_switches: 0,
         })
     }
 
-    /// [`Self::on_send`], with the report written to stderr (the service's journal) unless
-    /// `log` is off.
-    pub fn on_send_log(&mut self, now: Instant, unsent: usize, frames: u64, log: bool) {
-        if let Some(r) = self.on_send(now, unsent, frames)
+    /// [`Self::on_send`], with the report (plus `refused` mode switches) written to stderr
+    /// (the service's journal) unless `log` is off.
+    pub fn on_send_log(
+        &mut self,
+        now: Instant,
+        unsent: usize,
+        frames: u64,
+        log: bool,
+        refused: u32,
+    ) {
+        if let Some(mut r) = self.on_send(now, unsent, frames)
             && log
         {
+            r.refused_switches = refused;
             let mut line = LineBuf::new();
             let _ = writeln!(line, "{r}");
             // One write(2), so the line can't interleave with other threads' output. Unbuffered
@@ -292,14 +307,14 @@ impl Drift {
 
 /// A fixed stack buffer for one log line; output past its end is dropped.
 struct LineBuf {
-    buf: [u8; 256],
+    buf: [u8; 320],
     len: usize,
 }
 
 impl LineBuf {
     fn new() -> Self {
         Self {
-            buf: [0; 256],
+            buf: [0; 320],
             len: 0,
         }
     }
@@ -476,6 +491,7 @@ mod tests {
             drift_ms: Some(-0.5),
             backlog: (0, 312, 1312),
             adjust_ms: None,
+            refused_switches: 0,
         };
         assert_eq!(
             r.to_string(),
@@ -486,17 +502,24 @@ mod tests {
             drift_ms: None,
             backlog: (0, 0, 0),
             adjust_ms: Some(2),
+            refused_switches: 0,
         };
         assert_eq!(
             r.to_string(),
             "aptx-adaptive: drift: host clock settling, backlog (PipeWire unsent) 0/0/0 bytes (min/avg/max), ttp adjust +2 ms"
         );
+        let r = Report {
+            refused_switches: 3,
+            ..r
+        };
+        assert!(r.to_string().ends_with(", refused mode switches 3"));
         // The longest line fits the stack buffer.
         let r = Report {
             ppm: Some(-1e9),
             drift_ms: Some(-1e9),
             backlog: (usize::MAX, usize::MAX, usize::MAX),
             adjust_ms: Some(i16::MIN),
+            refused_switches: u32::MAX,
         };
         let mut line = LineBuf::new();
         assert!(writeln!(line, "{r}").is_ok());
@@ -506,7 +529,7 @@ mod tests {
     #[test]
     fn line_buf_truncates() {
         let mut line = LineBuf::new();
-        assert!(line.write_str(&"x".repeat(300)).is_err());
-        assert_eq!(line.as_bytes().len(), 256);
+        assert!(line.write_str(&"x".repeat(400)).is_err());
+        assert_eq!(line.as_bytes().len(), 320);
     }
 }

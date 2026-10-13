@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::stream::table_row;
-use crate::{Config, Core, Progress, Result, Stream, WINDOW_SLACK};
+use crate::{Config, Core, Progress, Result, Row, Stream, WINDOW_SLACK};
 
 /// Takes input until it holds one packet's worth, then waits for a flush, which is how the
 /// reference behaves in steady state (spec §6). A packet is the low bytes of its first two
@@ -18,6 +18,8 @@ pub struct Fake {
     /// Per packet out: whether it took a flush.
     pub forced: Vec<bool>,
     pub bitrates: Vec<u32>,
+    /// In-place resets so far.
+    pub resets: usize,
 }
 
 /// A stream over a [`Fake`] sized for `config`.
@@ -26,18 +28,24 @@ pub struct Fake {
 /// As for [`table_row`].
 pub fn stream(config: Config, budget: usize) -> Result<Stream<Fake>> {
     let row = table_row(config, budget)?;
-    let fake = Fake {
-        capacity: row.interleaved_samples(config.sample_rate, config.channels.into()),
-        buffered: 0,
-        first: [0; 2],
-        early: HashMap::new(),
-        forced: Vec::new(),
-        bitrates: Vec::new(),
-    };
-    Ok(Stream::with_core(fake, config, row))
+    Ok(Stream::with_core(Fake::new(config, row), config, row))
 }
 
 impl Fake {
+    /// A fake for `row`'s packets.
+    #[must_use]
+    pub fn new(config: Config, row: Row) -> Self {
+        Self {
+            capacity: row.interleaved_samples(config.sample_rate, config.channels.into()),
+            buffered: 0,
+            first: [0; 2],
+            early: HashMap::new(),
+            forced: Vec::new(),
+            bitrates: Vec::new(),
+            resets: 0,
+        }
+    }
+
     fn packet(&mut self, window: &mut [u8], forced: bool) -> usize {
         let size = window.len() - WINDOW_SLACK;
         window[..size].fill(0);
@@ -75,5 +83,12 @@ impl Core for Fake {
 
     fn set_bitrate(&mut self, bps: u32) {
         self.bitrates.push(bps);
+    }
+
+    fn reset(&mut self, config: Config, row: &Row) -> Result<()> {
+        self.capacity = row.interleaved_samples(config.sample_rate, config.channels.into());
+        self.buffered = 0;
+        self.resets += 1;
+        Ok(())
     }
 }

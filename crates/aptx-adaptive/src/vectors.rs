@@ -295,6 +295,8 @@ fn stages_cfg0_sine() {
     );
 }
 
+/// Config 1 (low-power) isn't selected by any supported config (R1 LL is config 0, §7J), but
+/// the core stays bit-exact for it.
 #[test]
 fn stages_cfg1_noise() {
     let config = cfg(Profile::Ll, DecoderLevel::R1, 48_000);
@@ -329,4 +331,43 @@ fn stages_cfg3_96k_noise() {
         cfg(Profile::Hq, DecoderLevel::R2, 96_000),
         420_000,
     );
+}
+
+/// The parity LL runs that match what the plugin streams, driven through [`crate::Stream`]
+/// (the plugin's loop) rather than the harness loop above, so this pins the profile mapping,
+/// the level-3 table row and the LL deficit rule byte for byte. R1: config 0 on LL row 0
+/// (265 kbps / 10 ms / 348 bytes, `codec-core.md` §10.D). R2: config 4 on LL row 1 (270 kbps /
+/// 10 ms / 348 bytes, §10.F).
+fn check_stream_ll(name: &str, level: DecoderLevel, rate: u32, chunk_frames: usize) {
+    use crate::{Stream, packet_budget, table_row};
+    let dir = vectors("parity");
+    let pcm = read_s32(dir.join(format!("mix{rate}.s32le")));
+    let want = fs::read(dir.join(format!("{name}.bin"))).unwrap();
+    let config = cfg(Profile::Ll, level, rate);
+    let row = table_row(config, packet_budget(895)).unwrap();
+    let kbps = if level == DecoderLevel::R1 { 265 } else { 270 };
+    assert_eq!(
+        (row.bitrate, row.period_ms, row.packet_bytes),
+        (kbps * 1000, 10, 348)
+    );
+    let mut s = Stream::with_core(Encoder::new(config, row.bitrate).unwrap(), config, row);
+    let mut out = [0u8; 348];
+    let mut got = Vec::new();
+    for chunk in pcm.chunks(chunk_frames * 2) {
+        if let Some(n) = s.push(chunk, &mut out).unwrap() {
+            // The stream swaps for air; the vectors are as the encoder wrote them.
+            let mut p = [0u8; 348];
+            crate::frame::swap16(&out[..n], &mut p);
+            got.extend_from_slice(&p);
+        }
+    }
+    first_difference(name, 348, &got, &want);
+}
+
+#[test]
+fn stream_ll_matches_parity() {
+    check_stream_ll("c0_48k_ll", DecoderLevel::R1, 48_000, 48);
+    check_stream_ll("c0_44k_ll", DecoderLevel::R1, 44_100, 44);
+    check_stream_ll("c4_48k_i1_L3", DecoderLevel::R2, 48_000, 48);
+    check_stream_ll("c4_44k_i1_L3", DecoderLevel::R2, 44_100, 44);
 }

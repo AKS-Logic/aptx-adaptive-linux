@@ -164,6 +164,38 @@ impl Encoder {
         })
     }
 
+    /// Builds the packet state for `packet_len`-byte packets now rather than on the first
+    /// call, so neither the first packet nor a later [`Encoder::reset`] allocates.
+    ///
+    /// # Errors
+    /// `WindowSize` unless `packet_len` is a multiple of 4 in 12..=[`MAX_PACKET`], or differs
+    /// from the size already in use.
+    pub fn prepare(&mut self, packet_len: usize) -> Result<()> {
+        self.packetiser(&vec![0; packet_len + WINDOW_SLACK])
+            .map(|_| ())
+    }
+
+    /// Back to a freshly created encoder for `config`, `bitrate` and `packet_len`-byte
+    /// packets, in place: no allocation once [`Encoder::prepare`] has run (the reference resets
+    /// in place on an HQ↔LL switch too, `a2dp-integration.md` §7K). On error nothing changes.
+    ///
+    /// # Errors
+    /// As for [`Encoder::new`], or `WindowSize` for a bad packet size.
+    pub fn reset(&mut self, config: Config, bitrate: u32, packet_len: usize) -> Result<()> {
+        if config.channels != 2 || bitrate == 0 {
+            return Err(Error::UnsupportedConfig);
+        }
+        let params = params(config)?;
+        check_window_len(packet_len)?;
+        self.params = params;
+        self.bitrate = bitrate;
+        match &mut self.packetiser {
+            Some(p) => p.reset(params, packet_len, bitrate),
+            None => self.packetiser = Some(Box::new(Packetiser::new(params, packet_len, bitrate))),
+        }
+        Ok(())
+    }
+
     /// The low-power config 1 encoder (create profile 1, `codec-core.md` §10.D), which no sink
     /// gets from a source; only for the config 1 vectors. 44.1/48 kHz only.
     #[cfg(test)]
@@ -226,7 +258,10 @@ impl Encoder {
 
 /// The packet size a window is for.
 fn check_window(window: &[u8]) -> Result<usize> {
-    let size = window.len().saturating_sub(WINDOW_SLACK);
+    check_window_len(window.len().saturating_sub(WINDOW_SLACK))
+}
+
+fn check_window_len(size: usize) -> Result<usize> {
     if (MIN_WINDOW..=MAX_PACKET).contains(&size) && size.is_multiple_of(4) {
         Ok(size)
     } else {
@@ -243,6 +278,12 @@ impl Core for Encoder {
     }
     fn set_bitrate(&mut self, bps: u32) {
         Encoder::set_bitrate(self, bps);
+    }
+    fn prepare(&mut self, row: &Row) -> Result<()> {
+        Encoder::prepare(self, row.packet_bytes)
+    }
+    fn reset(&mut self, config: Config, row: &Row) -> Result<()> {
+        Encoder::reset(self, config, row.bitrate, row.packet_bytes)
     }
 }
 
@@ -405,6 +446,58 @@ mod tests {
         assert_eq!(delay_frames(r2(Profile::Ll, 48_000)), Ok(None));
     }
 
+    /// §7J: LL with an R1 sink is config 0 (frame type 1), not config 1.
+    #[test]
+    fn r1_ll_is_config_0() {
+        let ll = Config {
+            profile: Profile::Ll,
+            ..STEREO_48K
+        };
+        assert_eq!(params(ll).unwrap().variant, Variant::Cfg0);
+        let mut enc = Encoder::new(ll, 265_000).unwrap();
+        let mut out = [0u8; 348 + WINDOW_SLACK];
+        enc.encode_packet(&[0; 960], &mut out).unwrap();
+        assert_eq!(enc.flush(&mut out), Ok(348));
+        assert_eq!(out[..3], [0x00, 0x81, 84]);
+    }
+
+    /// A reset gives the same packets as a new encoder, without a new allocation.
+    #[test]
+    fn reset_matches_new() {
+        let ll = Config {
+            profile: Profile::Ll,
+            ..STEREO_48K
+        };
+        let pcm: Vec<i32> = (0..9600).map(|i| ((i * 7919) % 20_000) - 10_000).collect();
+        let run = |enc: &mut Encoder, len: usize| {
+            let mut out = vec![0u8; len + WINDOW_SLACK];
+            let mut got = Vec::new();
+            for chunk in pcm.chunks(960) {
+                enc.encode_packet(chunk, &mut out).unwrap();
+                let n = enc.flush(&mut out).unwrap();
+                got.extend_from_slice(&out[..n]);
+            }
+            got
+        };
+        let want = run(&mut Encoder::new(ll, 265_000).unwrap(), 348);
+        let mut enc = Encoder::new(STEREO_48K, 364_000).unwrap();
+        enc.prepare(656).unwrap();
+        run(&mut enc, 656);
+        enc.reset(ll, 265_000, 348).unwrap();
+        assert_eq!(run(&mut enc, 348), want);
+        // A bad reset changes nothing.
+        let ll_96k = Config {
+            sample_rate: 96_000,
+            ..ll
+        };
+        assert_eq!(
+            enc.reset(ll_96k, 265_000, 348),
+            Err(Error::UnsupportedConfig)
+        );
+        assert_eq!(enc.reset(ll, 265_000, 350), Err(Error::WindowSize));
+        assert_eq!(enc.flush(&mut [0; 348 + WINDOW_SLACK]), Ok(0));
+    }
+
     #[test]
     fn min_packet_is_under_the_px7_packet() {
         let need = min_packet_bytes(STEREO_48K, 14).unwrap();
@@ -445,6 +538,9 @@ mod tests {
         assert_eq!(enc.flush(&mut [0; 658 + 64]), Err(Error::WindowSize));
         assert_eq!(enc.flush(&mut [0; 1036 + 64]), Err(Error::WindowSize));
         let mut window = [0; 1032 + 64];
+        // Nothing pending: nothing out (§7I).
+        assert_eq!(enc.flush(&mut window), Ok(0));
+        enc.encode_packet(&[0; 16], &mut window).unwrap();
         assert_eq!(enc.flush(&mut window), Ok(1032));
         assert_eq!(window[2], 0xFF);
         // The packet size is fixed by the first call.

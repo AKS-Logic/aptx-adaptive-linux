@@ -127,14 +127,32 @@ impl Packer {
             (12..=MAX_PACKET).contains(&packet_len) && packet_len.is_multiple_of(4),
             "packet size {packet_len}"
         );
+        // Sized for the largest packet, so `reset` to any size never allocates.
         Self {
             params,
             packet_len,
-            carry: Vec::with_capacity(packet_len + MAX_FRAME_BYTES),
-            payload: BitWriter::with_capacity(2 * packet_len + MAX_FRAME_BYTES),
+            carry: Vec::with_capacity(MAX_PACKET + MAX_FRAME_BYTES),
+            payload: BitWriter::with_capacity(2 * MAX_PACKET + MAX_FRAME_BYTES),
             prev: None,
             open: false,
         }
+    }
+
+    /// Back to a fresh packer for `params` and `packet_len`, keeping the buffers.
+    ///
+    /// # Panics
+    /// As for [`Packer::new`].
+    pub fn reset(&mut self, params: Params, packet_len: usize) {
+        assert!(
+            (12..=MAX_PACKET).contains(&packet_len) && packet_len.is_multiple_of(4),
+            "packet size {packet_len}"
+        );
+        self.params = params;
+        self.packet_len = packet_len;
+        self.carry.clear();
+        self.payload.clear();
+        self.prev = None;
+        self.open = false;
     }
 
     /// Opens a packet: the continuation and the carried bytes.

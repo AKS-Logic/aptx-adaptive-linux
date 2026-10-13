@@ -18,19 +18,22 @@ use std::ptr;
 use std::sync::OnceLock;
 
 use ffi::{
-    A2DP_CODEC_VENDOR, A2DP_MAX_CAPS_SIZE, EINVAL, ENOTSUP, MEDIA_CODEC_A2DP, SPA_AUDIO_CHANNEL_FL,
-    SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_FORMAT_S24_32_LE, SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR,
-    SPA_BLUETOOTH_AUDIO_CODEC_LDAC, SPA_MEDIA_SUBTYPE_RAW, SPA_MEDIA_TYPE_AUDIO,
-    SPA_PARAM_ENUM_FORMAT, SPA_TYPE_OBJECT, SPA_VERSION_BLUEZ5_CODEC_MEDIA,
-    SPA_VERSION_HANDLE_FACTORY, media_codec, media_codec_audio_info, spa_audio_info,
-    spa_bluez5_codec_a2dp, spa_handle, spa_handle_factory, spa_pod, spa_pod_builder,
+    A2DP_CODEC_VENDOR, A2DP_MAX_CAPS_SIZE, EINVAL, ENOENT, ENOTSUP, MEDIA_CODEC_A2DP,
+    SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_FORMAT_S24_32_LE,
+    SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR, SPA_BLUETOOTH_AUDIO_CODEC_LDAC, SPA_MEDIA_SUBTYPE_RAW,
+    SPA_MEDIA_TYPE_AUDIO, SPA_PARAM_ENUM_FORMAT, SPA_PARAM_PROP_INFO, SPA_PARAM_PROPS,
+    SPA_PROP_QUALITY, SPA_TYPE_INT, SPA_TYPE_OBJECT, SPA_TYPE_OBJECT_PROP_INFO,
+    SPA_TYPE_OBJECT_PROPS, SPA_VERSION_BLUEZ5_CODEC_MEDIA, SPA_VERSION_HANDLE_FACTORY, media_codec,
+    media_codec_audio_info, spa_audio_info, spa_bluez5_codec_a2dp, spa_dict, spa_dict_item,
+    spa_handle, spa_handle_factory, spa_pod, spa_pod_builder,
 };
 use fixtures::{PX7_S2E, PX7_S2E_CONFIG};
 use ids::{CAPS_LEN, VENDOR_HEADER};
 
 const MTU: usize = 895;
-/// One 14 ms HQ packet of stereo `S24_32` (spec `a2dp-integration.md` §4.1).
-const BLOCK_SIZE: c_int = 672 * 2 * 4;
+/// 2 ms of stereo `S24_32`: divides both the 14 ms HQ and the 10 ms LL packet (spec
+/// `a2dp-integration.md` §4.1, §4.2).
+const BLOCK_SIZE: c_int = 96 * 2 * 4;
 
 type EnumFn = unsafe extern "C" fn(*mut *const spa_handle_factory, *mut u32) -> c_int;
 
@@ -153,6 +156,15 @@ fn validated_info(codec: &media_codec, config: &[u8]) -> spa_audio_info {
 }
 
 fn init(codec: &media_codec, config: &mut [u8], info: &spa_audio_info) -> *mut c_void {
+    init_with_props(codec, config, info, ptr::null_mut())
+}
+
+fn init_with_props(
+    codec: &media_codec,
+    config: &mut [u8],
+    info: &spa_audio_info,
+    props: *mut c_void,
+) -> *mut c_void {
     // SAFETY: arguments match the C contract.
     unsafe {
         codec.init.unwrap()(
@@ -161,7 +173,7 @@ fn init(codec: &media_codec, config: &mut [u8], info: &spa_audio_info) -> *mut c
             config.as_mut_ptr().cast(),
             config.len(),
             info,
-            ptr::null_mut(),
+            props,
             MTU,
         )
     }
@@ -329,19 +341,8 @@ fn init_and_encode_a_real_packet() {
             out[..12],
             [0x80, 0x60, 0, 1, 0, 0, 0x02, 0xa0, 0, 0, 0, 0xa3]
         );
-        let pcm = vec![0u8; block as usize];
-        let (mut written, mut flush) = (0usize, 0);
-        let res = c.encode.unwrap()(
-            data,
-            pcm.as_ptr().cast(),
-            pcm.len(),
-            out.as_mut_ptr().add(12).cast(),
-            out.len() - 12,
-            &raw mut written,
-            &raw mut flush,
-        );
-        assert_eq!(res, block);
-        assert_eq!((written, flush), (656, 1));
+        // 14 ms of 2 ms blocks.
+        assert_eq!(encode_until_flush(c, data, &mut out[12..], 7), (656, 7));
         // Swapped config 0 packet: 00 01 a1 .. becomes 01 00 .. a1 (0x80 on byte 1 if padded).
         assert_eq!((out[12] & 0x7f, out[13], out[15]), (0x01, 0x00, 0xa1));
         assert_eq!(c.abr_process.unwrap()(data, 0), 0);
@@ -373,30 +374,276 @@ fn r2_config_streams() {
 
     // SAFETY: data from init, valid until deinit.
     unsafe {
+        // 1 ms: divides both the 19 ms HQ and the 10 ms LL (config 4) packet.
         let block = c.get_block_size.unwrap()(data);
-        assert_eq!(block, 912 * 2 * 4);
+        assert_eq!(block, 48 * 2 * 4);
         let mut out = [0u8; 1024];
         assert_eq!(
             c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), 1, 0),
             12
         );
         assert_eq!(out[4..12], [0, 0, 0x03, 0x90, 0, 0, 0, 0xa3]);
-        let pcm = vec![0u8; block as usize];
-        let (mut written, mut flush) = (0usize, 0);
-        let res = c.encode.unwrap()(
-            data,
-            pcm.as_ptr().cast(),
-            pcm.len(),
-            out.as_mut_ptr().add(12).cast(),
-            out.len() - 12,
-            &raw mut written,
-            &raw mut flush,
-        );
-        assert_eq!(res, block);
-        assert_eq!((written, flush), (656, 1));
+        // 19 ms of 1 ms blocks.
+        assert_eq!(encode_until_flush(c, data, &mut out[12..], 19), (656, 19));
         // Swapped config 3 packet: 00 83 a1 .. (spec §3.2).
         assert_eq!((out[12] & 0x7f, out[13], out[15]), (0x03, 0x00, 0xa1));
         c.deinit.unwrap()(data);
+    }
+}
+
+/// Feeds silence a block at a time (the codec's own block size) until a packet comes out,
+/// like `media-sink.c`, writing the packet to `out`. Returns its length and the number of
+/// blocks it took. Panics if no packet comes out within `max_blocks`.
+///
+/// # Safety
+/// `data` must come from `init`.
+unsafe fn encode_until_flush(
+    c: &media_codec,
+    data: *mut c_void,
+    out: &mut [u8],
+    max_blocks: usize,
+) -> (usize, usize) {
+    // SAFETY: caller contract.
+    let block = unsafe { c.get_block_size.unwrap()(data) };
+    let pcm = vec![0u8; block as usize];
+    for n in 1..=max_blocks {
+        let (mut written, mut flush) = (0usize, 0);
+        // SAFETY: caller contract; buffers are valid for their lengths.
+        let res = unsafe {
+            c.encode.unwrap()(
+                data,
+                pcm.as_ptr().cast(),
+                pcm.len(),
+                out.as_mut_ptr().cast(),
+                out.len(),
+                &raw mut written,
+                &raw mut flush,
+            )
+        };
+        assert_eq!(res, block);
+        if flush != 0 {
+            return (written, n);
+        }
+        assert_eq!(written, 0);
+    }
+    panic!("no packet in {max_blocks} blocks");
+}
+
+fn init_props(c: &media_codec, mode: Option<&CStr>) -> *mut c_void {
+    let items = mode.map(|m| spa_dict_item {
+        key: c"bluez5.a2dp.aptx-adaptive.mode".as_ptr(),
+        value: m.as_ptr(),
+    });
+    let other = spa_dict_item {
+        key: c"bluez5.a2dp.ldac.quality".as_ptr(),
+        value: c"hq".as_ptr(),
+    };
+    let items: Vec<spa_dict_item> = std::iter::once(other).chain(items).collect();
+    let dict = spa_dict {
+        flags: 0,
+        n_items: items.len() as u32,
+        items: items.as_ptr(),
+    };
+    // SAFETY: a valid dict that outlives the call.
+    let p = unsafe { c.init_props.unwrap()(c, 0, &raw const dict) };
+    assert!(!p.is_null());
+    p
+}
+
+/// `spa_pod_builder_add_object(b, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props, SPA_PROP_quality,
+/// SPA_POD_Int(v))`.
+fn quality_props(v: i32) -> [u32; 10] {
+    [
+        32,
+        SPA_TYPE_OBJECT,
+        SPA_TYPE_OBJECT_PROPS,
+        SPA_PARAM_PROPS,
+        SPA_PROP_QUALITY,
+        0,
+        4,
+        SPA_TYPE_INT,
+        v as u32,
+        0,
+    ]
+}
+
+/// Enumerates `id` at `idx` and returns the result code and the pod's words.
+fn enum_props(c: &media_codec, props: *mut c_void, id: u32, idx: u32) -> (c_int, Vec<u32>) {
+    let mut buf = [0u64; 64];
+    let mut b = builder(&mut buf, 512);
+    let mut param: *mut spa_pod = ptr::null_mut();
+    // SAFETY: arguments match the C contract.
+    let res =
+        unsafe { c.enum_props.unwrap()(props, ptr::null(), id, idx, &raw mut b, &raw mut param) };
+    if res != 1 {
+        return (res, Vec::new());
+    }
+    // SAFETY: param points at a pod in buf.
+    let words = unsafe {
+        let n = ((*param).size as usize + 8) / 4;
+        std::slice::from_raw_parts(param.cast::<u32>(), n).to_vec()
+    };
+    (res, words)
+}
+
+#[test]
+fn props_are_ldac_style() {
+    let l = load();
+    let c = l.codec;
+    assert!(c.init_props.is_some() && c.update_props.is_some());
+    let props = init_props(c, None);
+    let (res, info) = enum_props(c, props, SPA_PARAM_PROP_INFO, 0);
+    assert_eq!(res, 1);
+    assert_eq!(
+        info[1..4],
+        [
+            SPA_TYPE_OBJECT,
+            SPA_TYPE_OBJECT_PROP_INFO,
+            SPA_PARAM_PROP_INFO
+        ]
+    );
+    assert_eq!(enum_props(c, props, SPA_PARAM_PROP_INFO, 1).0, 0);
+    let (res, current) = enum_props(c, props, SPA_PARAM_PROPS, 0);
+    assert_eq!((res, current), (1, quality_props(0).to_vec()));
+    assert_eq!(enum_props(c, props, SPA_PARAM_ENUM_FORMAT, 0).0, -ENOENT);
+    // SAFETY: props from init_props.
+    unsafe {
+        let ll = quality_props(1);
+        assert_eq!(c.set_props.unwrap()(props, ll.as_ptr().cast()), 1);
+        assert_eq!(c.set_props.unwrap()(props, ll.as_ptr().cast()), 0);
+        assert_eq!(enum_props(c, props, SPA_PARAM_PROPS, 0).1, ll.to_vec());
+        // NULL resets to the device setting.
+        assert_eq!(c.set_props.unwrap()(props, ptr::null()), 1);
+        assert_eq!(
+            enum_props(c, props, SPA_PARAM_PROPS, 0).1,
+            quality_props(0).to_vec()
+        );
+        c.clear_props.unwrap()(props);
+    }
+    let props = init_props(c, Some(c"ll"));
+    assert_eq!(
+        enum_props(c, props, SPA_PARAM_PROPS, 0).1,
+        quality_props(1).to_vec()
+    );
+    // SAFETY: props from init_props.
+    unsafe { c.clear_props.unwrap()(props) };
+}
+
+/// One packet's RTP fields and size, driving the codec like `media-sink.c`: `update_props`
+/// (if the props changed) then `start_encode`, then blocks until a flush.
+///
+/// # Safety
+/// `data` and `props` must come from `init` and `init_props`.
+unsafe fn next_packet(
+    c: &media_codec,
+    data: *mut c_void,
+    props: *mut c_void,
+    changed: bool,
+    seq: u16,
+) -> (usize, [u8; 8]) {
+    let mut out = [0u8; 1024];
+    // SAFETY: caller contract.
+    unsafe {
+        if changed {
+            assert_eq!(c.update_props.unwrap()(data, props), 0);
+        }
+        let hdr = c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), seq, 0);
+        assert_eq!(hdr, 12);
+        let fields: [u8; 8] = out[4..12].try_into().unwrap();
+        // At most one 14 ms HQ packet's worth of blocks.
+        let (written, _) = encode_until_flush(c, data, &mut out[12..], 7);
+        (written, fields)
+    }
+}
+
+const HQ_FIELDS: [u8; 8] = [0, 0, 0x02, 0xa0, 0, 0, 0, 0xa3];
+const LL_FIELDS: [u8; 8] = [0, 0, 0x01, 0xe0, 0, 0, 0, 0xa1];
+
+/// Starting with `bluez5.a2dp.aptx-adaptive.mode = ll`, then switching LL → HQ through
+/// `set_props` + `update_props` the way `media-sink.c` does: Props reports HQ at once, the
+/// packets change (size, timestamp, SSRC, interval) together at the in-place reset about
+/// 300 ms later (§7K: after a 100 ms fade-out and 200 ms of silence), and never mix.
+#[test]
+fn mode_setting_and_runtime_switch() {
+    let l = load();
+    let c = l.codec;
+    let props = init_props(c, Some(c"ll"));
+    let mut config = PX7_S2E_CONFIG;
+    let info = validated_info(c, &config);
+    let data = init_with_props(c, &mut config, &info, props);
+    assert!(!data.is_null());
+    // SAFETY: data and props from init and init_props, valid until deinit / clear_props.
+    unsafe {
+        assert_eq!(c.get_block_size.unwrap()(data), BLOCK_SIZE);
+        assert_eq!(c.get_interval.unwrap()(data), 10_000_000);
+        // Past the start-of-stream mute and fade-in (20 + 100 ms, §7I).
+        for seq in 0..15 {
+            assert_eq!(next_packet(c, data, props, false, seq), (348, LL_FIELDS));
+        }
+        let hq = quality_props(0);
+        assert_eq!(c.set_props.unwrap()(props, hq.as_ptr().cast()), 1);
+        assert_eq!(enum_props(c, props, SPA_PARAM_PROPS, 0).1, hq.to_vec());
+        let mut kinds = String::new();
+        let mut changed = true;
+        for seq in 15..130 {
+            let (size, fields) = next_packet(c, data, props, changed, seq);
+            changed = false;
+            kinds.push(match (size, fields) {
+                (348, LL_FIELDS) => 'L',
+                (656, HQ_FIELDS) => 'H',
+                other => panic!("packet {seq}: {other:?}"),
+            });
+            assert_eq!(c.get_block_size.unwrap()(data), BLOCK_SIZE);
+        }
+        let switch = kinds.find('H').unwrap();
+        // About 300 ms of 10 ms LL packets first, then HQ only.
+        assert!((29..=32).contains(&switch), "{kinds}");
+        assert!(!kinds[switch..].contains('L'), "{kinds}");
+        assert_eq!(c.get_interval.unwrap()(data), 14_000_000);
+        assert_eq!(enum_props(c, props, SPA_PARAM_PROPS, 0).1, hq.to_vec());
+        c.deinit.unwrap()(data);
+        c.clear_props.unwrap()(props);
+    }
+}
+
+/// An R2 sink runs LL as config 4 (codec-core §10.F): a `ll` setting starts in LL (10 ms,
+/// 348-byte config 4 packets, SSRC A1) with 1 ms blocks, and LL is offered.
+#[test]
+fn r2_sink_runs_ll() {
+    let l = load();
+    let c = l.codec;
+    let props = init_props(c, Some(c"ll"));
+    let mut config = PX7_S2E_CONFIG;
+    // The R2 layout: extension version 1, end marker at 24..25 (§1.1).
+    config[15] = 1;
+    config[16] = 0;
+    config[24..26].copy_from_slice(&[0, 0xaa]);
+    let info = validated_info(c, &config);
+    let data = init_with_props(c, &mut config, &info, props);
+    assert!(!data.is_null());
+    // SAFETY: data and props from init and init_props.
+    unsafe {
+        assert_eq!(
+            enum_props(c, props, SPA_PARAM_PROPS, 0).1,
+            quality_props(1).to_vec()
+        );
+        let (_, info) = enum_props(c, props, SPA_PARAM_PROP_INFO, 0);
+        let as_bytes: Vec<u8> = info.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        assert!(as_bytes.windows(11).any(|w| w == b"Low latency"));
+        assert_eq!(c.get_block_size.unwrap()(data), 48 * 2 * 4);
+        assert_eq!(c.get_interval.unwrap()(data), 10_000_000);
+        let mut out = [0u8; 1024];
+        assert_eq!(
+            c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), 0, 0),
+            12
+        );
+        assert_eq!(out[4..12], LL_FIELDS);
+        // 10 ms of 1 ms blocks.
+        assert_eq!(encode_until_flush(c, data, &mut out[12..], 10), (348, 10));
+        // Swapped config 4 packet: frame type 4.
+        assert_eq!(out[12] & 0x7f, 4);
+        c.deinit.unwrap()(data);
+        c.clear_props.unwrap()(props);
     }
 }
 

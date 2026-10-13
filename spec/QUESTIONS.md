@@ -313,3 +313,18 @@ Resolved by `codec-core.md` §10 (2026-10-13): config 4 (§10.F; "from codec-cor
 
 1. **Config 4 encoder delay.** `a2dp-integration.md` §7I gives the filterbank delay for configs 0, 1 and 3 (90 / 66 / 255) but not config 4 (8-band, 128-tap prototype). By analogy with config 3's 256 − 1 it might be 127; please measure it the same way. The plugin reports 0 for config 4 until then.
 2. **Config 3 delay at 44.1 kHz (and 88.2 kHz).** §7I measured config 3's 255-sample delay at 48 and 96 kHz only. The plugin assumes 255 at 44.1 kHz too, since the filterbank is the same 256-tap prototype and the delay is a tap count; please confirm.
+
+## HQ/LL switch per §7H–§7K (2026-10-13, PR #16)
+
+- R1 LL = config 0 on LL row 0 (§7J): 265 kbps / 10 ms / 348 bytes. R2 LL = config 4 on LL row 1 (codec-core §10.F): 270 kbps / 10 ms / 348 bytes. Both use timestamp `0x01E0` and SSRC `0xA1` (LL0 only, no sideband), and both are byte-exact through the stream loop against `c0_48k_ll`, `c0_44k_ll`, `c4_48k_i1_L3` and `c4_44k_i1_L3`. Runtime switch through `SPA_PROP_quality` (0 HQ, 1 LL) and the device setting `bluez5.a2dp.aptx-adaptive.mode`. Not yet tried on hardware.
+- Switch per §7K: 4800-frame fade-out, 900 ms silence, 4800-frame fade-in, packets throughout; in-place encoder reset at the first packet boundary ≥ 200 ms into the silence (level 3, counters zeroed, new row/SSRC from that packet). Start of stream per §7I: 20 ms mute + 4800-frame fade-in, re-armed at every encoder creation. The in-place reset itself isn't followed by a second 20 ms mute, because it already sits inside the silence.
+- LL0 byte raised to `0x50` when lower (§7H), so the Px7 config is now `d7 00 00 00 ad 00 12 02 50 6a 64 af 64 4b 00 00 aa` + zeros.
+- LL deficit: zeroed after every LL packet, with no extra flush (codec-core §10.C: it never produces anything).
+- Block size: the gcd of the two packet periods, so 2 ms for R1 (14/10 ms) and 1 ms for R2 (19/10 ms).
+
+Where we deviate from or can't follow the spec exactly:
+
+1. **"900 input blocks" and "about 200 blocks".** Our blocks are the gcd of the HQ and LL periods: 2 ms for R1 sinks (14/10 ms) and 1 ms for R2 sinks (19/10 ms). So for R1 we can't count 1 ms blocks, and for both we use durations in frames: 43200 frames of silence and 9600 frames to the reset. The reset can only happen between packets, so it lands up to one packet (≤ 14 ms for R1, ≤ 19 ms for R2) after the 200 ms mark. Is the reference's 900 counted in its 1 ms input calls at every rate (so 900 ms at 96 kHz too)?
+2. **Reversal mid-switch.** §7K says asking for the opposite mode reverses the switch, but not how. We continue from the current gain: during the fade-out we fade back in from the same table entry; in the silence before the reset we go straight to the fade-in; after the reset, the request becomes a new switch. Is that right?
+3. **R2.1 "800 blocks for a switch to LL".** Not implemented: R2 switches use 900 ms of silence like R1. Our R2 detection doesn't tell R2.0 from R2.1 in the session, and §7K only gives the number. Is 800 for R2.1 sinks only (features bit 1), and only for HQ → LL?
+4. **Chunk size.** The parity vectors use 1 ms chunks. R2 gets 1 ms blocks, the same as the reference. R1 gets 2 ms blocks; at 48 kHz codec-core §10.B lists 96-frame chunks as giving identical output, so the stream matches the reference's, but this rests on that observation.
