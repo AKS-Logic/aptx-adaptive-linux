@@ -116,6 +116,8 @@ fn split(params: Params, packets: &[u8], packet_len: usize) -> Vec<(Vec<bool>, u
 fn read_alloc(r: &mut Reader, params: Params, prev: Option<&[u8]>) -> Vec<u8> {
     let w = params.width();
     let eight = params.subbands() == 8;
+    // Config 3 only; config 4 codes like configs 0/1 with the 8-band pair tables (§10.F).
+    let escapes = params.escapes();
     let mut bits = Vec::with_capacity(w);
     match prev {
         None => {
@@ -128,7 +130,7 @@ fn read_alloc(r: &mut Reader, params: Params, prev: Option<&[u8]>) -> Vec<u8> {
             for &b in &pair_b[..w / 2] {
                 let sym = r.huffman(if b { &ABS_B } else { &ABS_A }) as u32;
                 let (mut a, mut c) = (sym >> 4, sym & 15);
-                if eight {
+                if escapes {
                     if a == 8 {
                         a += r.get(3);
                     }
@@ -144,7 +146,7 @@ fn read_alloc(r: &mut Reader, params: Params, prev: Option<&[u8]>) -> Vec<u8> {
                 let pv = u32::from(if p > 1 { p - 1 } else { p }) as i32;
                 let sym = r.huffman(&DIFF[DIFF_INDEX[pv as usize]]) as i32;
                 let mut v = (pv + sym) & 15;
-                if eight {
+                if escapes {
                     let (lo, hi) = DIFF_RANGE[pv as usize];
                     if v > hi {
                         v -= 16;
@@ -205,7 +207,7 @@ pub fn decode(params: Params, packets: &[u8], packet_len: usize) -> Vec<Frame> {
         let mut prev: Option<Vec<u8>> = None;
         while !r.ended && !only_padding(&r) {
             let bits = read_alloc(&mut r, params, prev.as_deref());
-            let escape = params.subbands() == 8 && bits.iter().all(|&b| b == 0);
+            let escape = params.escapes() && bits.iter().all(|&b| b == 0);
             let max = if escape { r.get(8) as usize + 1 } else { 64 };
             let mut codes = Vec::new();
             while codes.len() / params.width() < max {

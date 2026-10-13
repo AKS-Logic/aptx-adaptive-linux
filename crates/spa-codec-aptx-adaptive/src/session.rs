@@ -245,12 +245,13 @@ impl<C: Core> Session<C> {
         u64::from(self.stream.row().period_ms) * 1_000_000
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "the encoder delay isn't in the spec yet"
-    )]
+    /// The filterbank delay only (§7I): `media-sink.c` adds the packet wait (`packet_delay_ns`)
+    /// and the transport delay itself.
     pub fn delay_samples(&self) -> u32 {
-        0
+        aptx_adaptive::delay_frames(self.stream.config())
+            .ok()
+            .flatten()
+            .unwrap_or(0)
     }
 
     /// The per-packet bitrate rule lives in the stream loop (spec §5 step 7). What a Linux
@@ -719,7 +720,8 @@ mod tests {
         let s = session(FRAMING);
         assert_eq!(s.block_size(), 1344 * 4);
         assert_eq!(s.interval_ns(), 14_000_000);
-        assert_eq!(s.delay_samples(), 0);
+        // Config 0's filterbank (§7I).
+        assert_eq!(s.delay_samples(), 90);
     }
 
     #[test]

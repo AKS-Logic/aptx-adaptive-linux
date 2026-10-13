@@ -18,7 +18,8 @@ fn main() {
         .collect();
     for (name, profile, level) in [
         ("config 0 (R1 HQ)", Profile::Hq, DecoderLevel::R1),
-        ("config 1 (R1 LL)", Profile::Ll, DecoderLevel::R1),
+        ("config 0 (R1 LL row)", Profile::Ll, DecoderLevel::R1),
+        ("config 4 (R2 LL)", Profile::Ll, DecoderLevel::R2),
         ("config 3 (R2 HQ)", Profile::Hq, DecoderLevel::R2),
     ] {
         let config = Config {

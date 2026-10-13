@@ -85,8 +85,11 @@ impl fmt::Debug for Encoder {
     }
 }
 
-/// The bitstream variant for a config (`codec-core.md` §1): HQ at 88.2/96 kHz is config 3
-/// whatever the decoder level; LL there isn't allowed.
+/// The bitstream variant for a config (`codec-core.md` §1, §10.D, §10.F,
+/// `a2dp-integration.md` §7J): HQ at 88.2/96 kHz is config 3 whatever the decoder level; LL
+/// there isn't allowed. An R1 sink gets config 0 in both modes (in LL on the LL table row,
+/// with the LL loop), and an R2 sink in LL gets config 4. The low-power config 1 (create
+/// profile 1) is never given to a sink, so it's only reachable from tests.
 fn params(config: Config) -> Result<Params> {
     let high_rate = match config.sample_rate {
         44_100 | 48_000 => false,
@@ -95,10 +98,9 @@ fn params(config: Config) -> Result<Params> {
     };
     let variant = match (config.profile, config.level, high_rate) {
         (Profile::Hq, _, true) | (Profile::Hq, DecoderLevel::R2, false) => Variant::Cfg3,
-        (Profile::Hq, DecoderLevel::R1, false) => Variant::Cfg0,
-        (Profile::Ll, DecoderLevel::R1, false) => Variant::Cfg1,
-        // Config 4 (R2 LL) isn't specified, and LL is 44.1/48 kHz only.
-        (Profile::Ll, _, _) => return Err(Error::UnsupportedConfig),
+        (_, DecoderLevel::R1, false) => Variant::Cfg0,
+        (Profile::Ll, DecoderLevel::R2, false) => Variant::Cfg4,
+        (Profile::Ll, _, true) => return Err(Error::UnsupportedConfig),
     };
     Ok(Params {
         variant,
@@ -113,6 +115,21 @@ fn params(config: Config) -> Result<Params> {
 /// As for [`Encoder::new`].
 pub fn min_bitrate(config: Config) -> Result<u32> {
     Ok(alloc::bitrate_range(params(config)?).0)
+}
+
+/// The filterbank delay in sample frames (`a2dp-integration.md` §7I), not counting the packet
+/// wait. `None` for config 4, whose delay isn't measured yet.
+///
+/// # Errors
+/// As for [`Encoder::new`].
+pub fn delay_frames(config: Config) -> Result<Option<u32>> {
+    Ok(match params(config)?.variant {
+        Variant::Cfg0 => Some(90),
+        // Unreachable from `params`, kept for completeness.
+        Variant::Cfg1 => Some(66),
+        Variant::Cfg3 => Some(255),
+        Variant::Cfg4 => None,
+    })
 }
 
 /// The smallest packet for a `period_ms` row whose MTU-fitted bitrate ([`Row::fit`]) the
@@ -130,17 +147,35 @@ pub fn min_packet_bytes(config: Config, period_ms: u32) -> Result<usize> {
 
 impl Encoder {
     /// # Errors
-    /// `UnsupportedConfig` for anything but stereo configs 0, 1 and 3 at their sample rates,
+    /// `UnsupportedConfig` for anything but stereo configs 0, 3 and 4 at their sample rates,
     /// or a zero bitrate.
     pub fn new(config: Config, bitrate: u32) -> Result<Self> {
+        Self::with_params(config, params(config)?, bitrate)
+    }
+
+    fn with_params(config: Config, params: Params, bitrate: u32) -> Result<Self> {
         if config.channels != 2 || bitrate == 0 {
             return Err(Error::UnsupportedConfig);
         }
         Ok(Self {
-            params: params(config)?,
+            params,
             bitrate,
             packetiser: None,
         })
+    }
+
+    /// The low-power config 1 encoder (create profile 1, `codec-core.md` §10.D), which no sink
+    /// gets from a source; only for the config 1 vectors. 44.1/48 kHz only.
+    #[cfg(test)]
+    pub(crate) fn low_power(config: Config, bitrate: u32) -> Result<Self> {
+        if !matches!(config.sample_rate, 44_100 | 48_000) {
+            return Err(Error::UnsupportedConfig);
+        }
+        let params = Params {
+            variant: Variant::Cfg1,
+            sample_rate: config.sample_rate,
+        };
+        Self::with_params(config, params, bitrate)
     }
 
     fn packetiser(&mut self, window: &[u8]) -> Result<&mut Packetiser> {
@@ -232,6 +267,7 @@ mod tests {
             Config {
                 profile: Profile::Ll,
                 level: DecoderLevel::R2,
+                sample_rate: 88_200,
                 ..STEREO_48K
             },
             Config {
@@ -275,6 +311,98 @@ mod tests {
         }
         let r1_48k = params(STEREO_48K).unwrap();
         assert_eq!(r1_48k.variant, Variant::Cfg0);
+    }
+
+    /// Config 4 has no allocation escapes, so it must never allocate over 9 bits, whatever
+    /// bitrate it's created or set to (§10.F). Loud noise with the rate check lifting the
+    /// target by 5/4, then packets that decode.
+    #[test]
+    fn config_4_survives_any_bitrate() {
+        use codec::decode::decode;
+        let config = Config {
+            profile: Profile::Ll,
+            level: DecoderLevel::R2,
+            ..STEREO_48K
+        };
+        // Loud noise, then a loud low tone over quiet noise: one hot band that isn't tonal
+        // enough to set the flag, the case that wanted 10 bits from the 520 table.
+        let mut s = 1u32;
+        let pcm: Vec<i32> = (0..96_000)
+            .map(|i| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let n = (s as i32) >> 8;
+                if i < 48_000 {
+                    n
+                } else {
+                    let t = f64::from(i / 2) / 48_000.0;
+                    let tone = 8_000_000.0 * (2.0 * std::f64::consts::PI * 700.0 * t).sin();
+                    tone as i32 + (n >> 8)
+                }
+            })
+            .collect();
+        for (create, set) in [
+            (600_000, None),
+            (u32::MAX, None),
+            (270_000, Some(600_000)),
+            (270_000, Some(u32::MAX)),
+        ] {
+            let mut enc = Encoder::new(config, create).unwrap();
+            let mut window = [0u8; 560 + WINDOW_SLACK];
+            let mut packets = Vec::new();
+            for chunk in pcm.chunks(960) {
+                let mut pos = 0;
+                loop {
+                    let p = enc.encode_packet(&chunk[pos..], &mut window).unwrap();
+                    pos += p.consumed;
+                    if p.written == 0 {
+                        break;
+                    }
+                    packets.extend_from_slice(&window[..560]);
+                }
+                enc.flush(&mut window).unwrap();
+                packets.extend_from_slice(&window[..560]);
+                if let Some(b) = set {
+                    enc.set_bitrate(b);
+                }
+            }
+            let frames = decode(params(config).unwrap(), &packets, 560);
+            assert!(frames.len() > 50, "{create} {set:?}");
+            assert!(frames.iter().all(|f| f.bits.iter().all(|&b| b <= 9)));
+        }
+    }
+
+    /// §10.D / §7J: an R1 sink in LL gets config 0, an R2 sink config 4.
+    #[test]
+    fn ll_variants() {
+        for sample_rate in [44_100, 48_000] {
+            let ll = |level| Config {
+                profile: Profile::Ll,
+                sample_rate,
+                level,
+                ..STEREO_48K
+            };
+            assert_eq!(params(ll(DecoderLevel::R1)).unwrap().variant, Variant::Cfg0);
+            assert_eq!(params(ll(DecoderLevel::R2)).unwrap().variant, Variant::Cfg4);
+        }
+    }
+
+    #[test]
+    fn delays() {
+        let r2 = |profile, sample_rate| Config {
+            profile,
+            sample_rate,
+            level: DecoderLevel::R2,
+            ..STEREO_48K
+        };
+        let ll_r1 = Config {
+            profile: Profile::Ll,
+            ..STEREO_48K
+        };
+        assert_eq!(delay_frames(STEREO_48K), Ok(Some(90)));
+        assert_eq!(delay_frames(ll_r1), Ok(Some(90)));
+        assert_eq!(delay_frames(r2(Profile::Hq, 48_000)), Ok(Some(255)));
+        assert_eq!(delay_frames(r2(Profile::Hq, 96_000)), Ok(Some(255)));
+        assert_eq!(delay_frames(r2(Profile::Ll, 48_000)), Ok(None));
     }
 
     #[test]

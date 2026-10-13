@@ -115,6 +115,10 @@ fn r2_vectors_r2_from_pcm() {
 
 /// One encode call per packet with all remaining input; no flush, no set-bitrate.
 fn check_stage(name: &str, config: Config, bitrate: u32) {
+    check_stage_with(name, Encoder::new(config, bitrate).unwrap());
+}
+
+fn check_stage_with(name: &str, mut enc: Encoder) {
     let dir = vectors("stages").join(name);
     let pcm = read_s32(dir.join("pcm_in.s32"));
     let want = fs::read(dir.join("packets.bin")).unwrap();
@@ -126,7 +130,6 @@ fn check_stage(name: &str, config: Config, bitrate: u32) {
         .unwrap()
         .parse()
         .unwrap();
-    let mut enc = Encoder::new(config, bitrate).unwrap();
     let mut window = vec![0; len + WINDOW_SLACK];
     let mut got = Vec::new();
     let mut pos = 0;
@@ -151,6 +154,129 @@ const fn cfg(profile: Profile, level: DecoderLevel, sample_rate: u32) -> Config 
     }
 }
 
+/// One line of `tests/vectors/parity/runs.txt`.
+struct Run {
+    name: String,
+    /// Create profile 1: config 1 through the test-only constructor.
+    low_power: bool,
+    config: Config,
+    bitrate: u32,
+    period_ms: u32,
+    len: usize,
+    chunk_frames: usize,
+    ll: bool,
+}
+
+fn parity_runs() -> Vec<Run> {
+    let text = fs::read_to_string(vectors("parity").join("runs.txt")).unwrap();
+    text.lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let num = |i: usize| -> u32 { f[i].parse().unwrap() };
+            let level = match f[1] {
+                "R1" => DecoderLevel::R1,
+                _ => DecoderLevel::R2,
+            };
+            // Profile 3 is HQ, 6 the R2 LL encoder (§10.F), 1 the low-power config 1 (§10.D).
+            let profile = match num(2) {
+                3 => Profile::Hq,
+                1 | 6 => Profile::Ll,
+                p => panic!("profile {p}"),
+            };
+            Run {
+                name: f[0].to_owned(),
+                low_power: num(2) == 1,
+                config: cfg(profile, level, num(3)),
+                bitrate: num(4),
+                period_ms: num(5),
+                len: num(6) as usize,
+                chunk_frames: num(7) as usize,
+                ll: num(8) == 1,
+            }
+        })
+        .collect()
+}
+
+/// The parity README's loop, which is the r2 loop with the period in interleaved samples
+/// (§10.A) and, in LL, the deficit zeroed after every packet (§10.C).
+fn parity_loop(enc: &mut Encoder, run: &Run, pcm: &[i32]) -> (Vec<u8>, Vec<bool>) {
+    let period = i64::from(run.period_ms) * i64::from(run.config.sample_rate) * 2 / 1000;
+    let len = run.len;
+    let mut window = vec![0; len + WINDOW_SLACK];
+    let (mut packets, mut forced) = (Vec::new(), Vec::new());
+    let mut buf = Vec::new();
+    let (mut consumed, mut deficit) = (0i64, 0i64);
+    for chunk in pcm.chunks(run.chunk_frames * 2) {
+        buf.extend_from_slice(chunk);
+        let p = enc.encode_packet(&buf, &mut window).unwrap();
+        buf.drain(..p.consumed);
+        consumed += p.consumed as i64;
+        let due = consumed >= period + deficit;
+        let written = match p.written {
+            0 if !due => continue,
+            0 => enc.flush(&mut window).unwrap(),
+            n => n,
+        };
+        assert_eq!(written, len, "{}", run.name);
+        forced.push(p.written == 0);
+        packets.extend_from_slice(&window[..len]);
+        deficit += period - consumed;
+        consumed = 0;
+        if run.ll {
+            deficit = 0;
+        }
+        let b = run.bitrate;
+        enc.set_bitrate(if deficit > 96 { b - b / 4 } else { b });
+    }
+    (packets, forced)
+}
+
+/// Every run in `tests/vectors/parity`, from raw PCM with its stated chunk size and loop.
+#[test]
+fn parity_vectors() {
+    let dir = vectors("parity");
+    let mut failures = Vec::new();
+    for run in parity_runs() {
+        let pcm = read_s32(dir.join(format!("mix{}.s32le", run.config.sample_rate)));
+        let want = fs::read(dir.join(format!("{}.bin", run.name))).unwrap();
+        let sizes = fs::read_to_string(dir.join(format!("{}.sizes", run.name))).unwrap();
+        let want_forced: Vec<bool> = sizes.lines().map(|l| l.ends_with(" 1")).collect();
+        let enc = if run.low_power {
+            Encoder::low_power(run.config, run.bitrate)
+        } else {
+            Encoder::new(run.config, run.bitrate)
+        };
+        let mut enc = match enc {
+            Ok(e) => e,
+            Err(e) => {
+                failures.push(format!("{}: {e}", run.name));
+                continue;
+            }
+        };
+        let (got, forced) = parity_loop(&mut enc, &run, &pcm);
+        let len = run.len;
+        if let Some(b) = got.iter().zip(&want).position(|(a, b)| a != b) {
+            failures.push(format!(
+                "{}: first difference at packet {} byte {}",
+                run.name,
+                b / len,
+                b % len
+            ));
+        } else if got.len() != want.len() {
+            failures.push(format!(
+                "{}: {} packets, want {}",
+                run.name,
+                got.len() / len,
+                want.len() / len
+            ));
+        } else if forced != want_forced {
+            failures.push(format!("{}: forced packets differ", run.name));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
 #[test]
 fn stages_cfg0_noise() {
     check_stage(
@@ -171,10 +297,10 @@ fn stages_cfg0_sine() {
 
 #[test]
 fn stages_cfg1_noise() {
-    check_stage(
+    let config = cfg(Profile::Ll, DecoderLevel::R1, 48_000);
+    check_stage_with(
         "cfg1_48k_noise",
-        cfg(Profile::Ll, DecoderLevel::R1, 48_000),
-        279_000,
+        Encoder::low_power(config, 279_000).unwrap(),
     );
 }
 

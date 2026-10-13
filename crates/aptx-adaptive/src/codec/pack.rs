@@ -26,10 +26,11 @@ fn write_absolute(w: &mut BitWriter, params: Params, bits: &[u8], blocks: usize)
     } else {
         &PAIR_TABLE_4BAND
     };
+    let escapes = params.escapes();
     for (m, pair) in bits.as_chunks::<2>().0.iter().enumerate() {
         let table = if pair_b[m] { &ABS_B } else { &ABS_A };
         let (a, b) = (reduced(pair[0]), reduced(pair[1]));
-        if eight {
+        if escapes {
             w.code(table[((a.min(8) << 4) | b.min(8)) as usize]);
             for v in [a, b] {
                 if v > 7 {
@@ -37,10 +38,11 @@ fn write_absolute(w: &mut BitWriter, params: Params, bits: &[u8], blocks: usize)
                 }
             }
         } else {
+            debug_assert!(a <= 8 && b <= 8, "allocation over 9 bits without escapes");
             w.code(table[((a << 4) | b) as usize]);
         }
     }
-    if eight {
+    if escapes {
         zero_escape(w, bits, blocks);
     }
 }
@@ -52,11 +54,11 @@ fn zero_escape(w: &mut BitWriter, bits: &[u8], blocks: usize) {
 }
 
 fn write_diff(w: &mut BitWriter, params: Params, prev: &[u8], bits: &[u8], blocks: usize) {
-    let eight = params.subbands() == 8;
+    let escapes = params.escapes();
     for (&b, &p) in bits.iter().zip(prev) {
         let (v, pv) = (reduced(b) as i32, reduced(p) as usize);
         let table = &DIFF[DIFF_INDEX[pv]];
-        if eight {
+        if escapes {
             let (lo, hi) = DIFF_RANGE[pv];
             let cl = v.clamp(lo, hi);
             w.code(table[((cl - pv as i32) & 15) as usize]);
@@ -69,7 +71,7 @@ fn write_diff(w: &mut BitWriter, params: Params, prev: &[u8], bits: &[u8], block
             w.code(table[((v - pv as i32) & 15) as usize]);
         }
     }
-    if eight {
+    if escapes {
         zero_escape(w, bits, blocks);
     }
 }

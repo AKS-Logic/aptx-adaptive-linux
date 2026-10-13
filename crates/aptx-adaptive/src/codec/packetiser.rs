@@ -57,11 +57,17 @@ pub struct Packetiser {
     /// Carried bytes the open packet started with, and blocks coded into it.
     carry_in: usize,
     packet_blocks: usize,
+    /// Every frame packed so far: allocation and codes.
+    #[cfg(test)]
+    sent_frames: Vec<(Vec<u8>, Vec<i32>)>,
 }
 
 impl Packetiser {
+    /// The create bitrate is clamped like set-bitrate's (§10.G).
     pub fn new(params: Params, packet_len: usize, bitrate: u32) -> Self {
         let w = params.width();
+        let (lo, hi) = alloc::bitrate_range(params);
+        let bitrate = bitrate.clamp(lo, hi);
         Self {
             engine: Engine::new(params),
             packer: Packer::new(params, packet_len),
@@ -77,6 +83,8 @@ impl Packetiser {
             rate: Rate::new(bitrate),
             carry_in: 0,
             packet_blocks: 0,
+            #[cfg(test)]
+            sent_frames: Vec::new(),
         }
     }
 
@@ -143,7 +151,13 @@ impl Packetiser {
         let blocks = self.frame_blocks();
         let mut bits = [0u8; MAX_WIDTH];
         let bits = &mut bits[..w];
-        self.p_est = alloc::allocate(params, self.rate.target, &self.frame, bits);
+        self.p_est = alloc::allocate(
+            params,
+            self.rate.target,
+            self.rate.nominal,
+            &self.frame,
+            bits,
+        );
         self.codes.resize(self.frame.len(), 0);
         for (xb, qb) in self
             .frame
@@ -158,6 +172,8 @@ impl Packetiser {
             self.packer.begin();
         }
         self.packer.push_frame(bits, &self.codes);
+        #[cfg(test)]
+        self.sent_frames.push((bits.to_vec(), self.codes.clone()));
         self.frame.clear();
         self.packet_blocks += blocks;
         if first && let Some(pad) = self.pending_pad.take() {
@@ -336,6 +352,43 @@ mod tests {
         parses(cfg3_96k, 656, 340_000, 2880, &noise(48_000));
     }
 
+    /// Config 4 (§10.F) round trip: the decoder reads it without config 3's escapes, and every
+    /// frame's allocation and codes match what was packed, through sine, silence and noise.
+    #[test]
+    fn config_4_round_trip() {
+        for sample_rate in [44_100, 48_000] {
+            let cfg4 = Params {
+                variant: Variant::Cfg4,
+                sample_rate,
+            };
+            let rate = f64::from(sample_rate);
+            let mut pcm = sine(12_000, rate);
+            pcm.extend(vec![0; 12_000]);
+            pcm.extend(noise(12_000));
+            for (len, bitrate) in [(348, 270_000), (560, 320_000)] {
+                parses(cfg4, len, bitrate, 960, &pcm);
+            }
+
+            let mut p = Packetiser::new(cfg4, 348, 270_000);
+            let packets = run(&mut p, 960, &pcm);
+            let frames = decode(cfg4, &packets, 348);
+            let sent = &p.sent_frames;
+            assert!(frames.len() > 10 && frames.len() <= sent.len());
+            // No digital black on config 4, so even silence keeps band 0 of each channel.
+            assert!(sent.iter().all(|(b, _)| b[0] >= 2 && b[8] >= 2));
+            for (f, (bits, codes)) in frames.iter().zip(sent) {
+                assert_eq!(&f.bits, bits);
+                let w = cfg4.width();
+                let want: Vec<i32> = codes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &q)| crate::codec::decode::coded(q, bits[i % w]))
+                    .collect();
+                assert_eq!(f.codes, want[..f.codes.len()]);
+            }
+        }
+    }
+
     /// §8.8: with packets far too small for the bitrate, nothing is dropped and the carry stays
     /// small; the input the encoder can't code is left with the caller, whose backlog grows.
     #[test]
@@ -396,10 +449,16 @@ mod tests {
             variant: Variant::Cfg3,
             ..CFG0
         };
+        let cfg4 = Params {
+            variant: Variant::Cfg4,
+            ..CFG0
+        };
         for (params, len, bitrate) in [
             (CFG0, 656, 364_000),
             (CFG0, 64, 364_000),
             (cfg3, 128, 270_000),
+            (cfg4, 348, 270_000),
+            (cfg4, 64, 600_000),
         ] {
             let mut p = Packetiser::new(params, len, bitrate);
             let caps = |p: &Packetiser| {
@@ -416,9 +475,10 @@ mod tests {
         }
     }
 
-    /// 48- and 672-frame chunks give the same output (`codec-core.md` §8).
+    /// 48- and 672-frame chunks give the same output at 48 kHz. Other chunkings can differ
+    /// (`codec-core.md` §10.B; `c0_48k_L3_chunk13` in the parity vectors).
     #[test]
-    fn chunking_does_not_matter() {
+    fn some_chunkings_agree() {
         let pcm = noise(9600);
         let encode = |step: usize| {
             let mut p = Packetiser::new(CFG0, 656, 364_000);
@@ -460,7 +520,7 @@ mod tests {
         let mut pred = vec![0; w];
         for frame in x.chunks_exact(64 * w) {
             let mut bits = [0; 8];
-            alloc::allocate(CFG0, 364_000, frame, &mut bits);
+            alloc::allocate(CFG0, 364_000, 364_000, frame, &mut bits);
             let mut q = vec![0; w];
             for xb in frame.chunks_exact(w) {
                 let trace = engine.code_traced(xb, &bits, &mut q);
