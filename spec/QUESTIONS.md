@@ -36,7 +36,7 @@
 
 ## from codec-core
 
-1. Config 4 (R2 low latency): the 128-tap prototype in `tables/filterbank_8band_prototype_128.json` and its predictor mode are unverified. Not needed for the Px7 S2e, but needed for R2 LL sinks. (§1, §3.2)
+1. **Answered:** see `codec-core.md` §10.F. The 128-tap prototype is verified, the predictor is normal mode with config 3's 44.1/48 kHz tap counts, and config 4 is byte-exact on 10 LL rows. Originally: Config 4 (R2 low latency): the 128-tap prototype in `tables/filterbank_8band_prototype_128.json` and its predictor mode are unverified. Not needed for the Px7 S2e, but needed for R2 LL sinks. (§1, §3.2)
 2. Config 0 with the low-power create option set would use 12-tap coefficients with a 16-long delay line and different read positions. Can this happen via the normal wrapper, and if so what are the exact read positions? (§3.1)
 3. 4-band allocation header bit 4 ("create-parameter channel config equals 2"): never observed. What channel config sets it, and does it change anything else in the stream? (§7.2)
 4. **Answered:** see `codec-core.md` §8.1 (frame-size rule, padding and carry histories, `P_est`) and §8.1a (rate check). Constant-bitrate mode with create flag 0 is still open as "from codec-core allocator" item 3. Originally: last-frame size policy (§8.1): how is the bits-per-block estimate computed, what exactly is the "padding history capped at 30", and what is the second constant-bitrate estimate? Is constant-bitrate mode really tied to the create flag being 0?
@@ -96,13 +96,13 @@ Conclusion: the chime doesn't separate layouts. It seems tied to the restart and
 ## from codec-core allocator
 
 1. `codec-core.md` §8.7: the stage-vector cross-check reports 126 packets reproduced from raw PCM, which is five runs (four 24-packet runs plus the 30-packet config 1 run), but `tests/vectors/stages/` has six runs. Which stage run was not reproduced from raw PCM, and does it match?
-2. §8 verification covers 48 and 96 kHz only. Is the frame-size rule and allocator also confirmed at 44.1 and 88.2 kHz (`rate_idx` 2, and the 88.2 kHz use of the 96 kHz max-bits tables)?
+2. **Partly answered:** 44.1 kHz is confirmed for configs 0, 1, 3 and 4 (`codec-core.md` §10.A, §10.I, `tests/vectors/parity/`). 88.2 kHz is still not covered. Originally: §8 verification covers 48 and 96 kHz only. Is the frame-size rule and allocator also confirmed at 44.1 and 88.2 kHz (`rate_idx` 2, and the 88.2 kHz use of the 96 kHz max-bits tables)?
 3. §8.1: what exactly is the constant-bitrate clamp with create flag 0, and is that flag otherwise meaningful? (Also `a2dp-integration.md` §3.1 / "from a2dp-integration" Q4.)
-4. §8.1a and §8.2: is the create-time `P_est` computed with the §8.2 clamp applied? The set-bitrate clamp (configs 0/1 up to 300000·nch, config 3 up to 500000·nch) is narrower than the pool clamp (350000·nch, 550000·nch); is that intended, and does a create bitrate above the set-bitrate limit stay unclamped until the first set-bitrate call?
-5. §8.2 alternate flag (config 3, 2 channels, R ≤ 179999) and §8.6 step 5.4 (extra bits when the digital-black total is 1 to 6) are untested. Can either happen with any wrapper table row, including after the three-quarter bitrate drop of the wrapper loop?
+4. **Partly answered:** the create bitrate is clamped to the set-bitrate range at create time, and `nominal`/`target` start at the clamped value (`codec-core.md` §10.G). That the narrower set-bitrate clamp is intended is implied but not stated. Originally: §8.1a and §8.2: is the create-time `P_est` computed with the §8.2 clamp applied? The set-bitrate clamp (configs 0/1 up to 300000·nch, config 3 up to 500000·nch) is narrower than the pool clamp (350000·nch, 550000·nch); is that intended, and does a create bitrate above the set-bitrate limit stay unclamped until the first set-bitrate call?
+5. **Partly answered:** the alternate flag is reachable on the R2 HQ level-1 rows and fully specified in `codec-core.md` §10.E. The three-quarter cut never makes it reachable (§10.H). The §8.6 step 5.4 top-up is still not shown to fire. Originally: §8.2 alternate flag (config 3, 2 channels, R ≤ 179999) and §8.6 step 5.4 (extra bits when the digital-black total is 1 to 6) are untested. Can either happen with any wrapper table row, including after the three-quarter bitrate drop of the wrapper loop?
 6. Carry-over bound (follows "from codec-core implementation" item 7): beyond the frame-size rule holding back carry, does the reference cap the continuation length or drop audio when a frame overflows by more than the next packet can absorb? Our implementation currently caps carry at a quarter of the payload; with §8 implemented, should that cap be removed?
 7. §8.4 offset tables: the channel-config-2 ("stereo") tables and the mono path (`r = 2R` in §8.3) are not covered by any verified run. What channel config produces them, and is mono's 2R correct?
-8. §8.2 config 4 clamp range [100000·nch, 210000·nch] is unverified, as is the rest of §8 for config 4.
+8. **Answered:** the pool clamp is verified, and §8 for config 4 is specified in `codec-core.md` §10.F. Originally: §8.2 config 4 clamp range [100000·nch, 210000·nch] is unverified, as is the rest of §8 for config 4.
 
 ## answers to "from the spec allocator implementation" (2026-10-13)
 
@@ -276,3 +276,18 @@ btmon, time from sending each media ACL packet to the controller's Number of Com
 - An all-cores CPU busy loop for 20 s doesn't reproduce it; the BT data loop runs SCHED_FIFO 83.
 - The user associates it with "CPU spikes" of unknown kind. Candidates: USB contention on the Dell dock (the RTL8922 Bluetooth sits behind it, with Ethernet, camera and audio), memory or IO pressure, multipoint.
 - Parked by the user. Revisit after parity work.
+
+## from batch 5
+
+Resolved by `codec-core.md` §10 (2026-10-13): config 4 (§10.F; "from codec-core" 1 and "from codec-core allocator" 8), the alternate flag (§10.E; "from codec-core allocator" 5), 44.1 kHz packet loop and allocator (§10.A, §10.B, §10.I; "from codec-core allocator" 2, and the "packet sizing and sample counts at 44.1 kHz" item in `a2dp-integration.md` §7H). Still open:
+
+1. **Tail of the input in the parity vectors.** 44100 frames is not a whole number of 44-frame chunks (12 left over), and 48000 is not a whole number of 13-frame chunks (4 left over). Was the tail offered as a short final chunk, or dropped? Was any final flush made? The packet counts suggest no extra packet came from it, but the README can't state the rule.
+2. **Chunk dependence at 48 kHz.** Chunks of 13 and 100 frames change the output, but many others (5, 7, 9, 16, …) don't. Is there a simple condition for when the chunk size matters (for example, chunk size against block-pair size and P)? Useful for choosing test chunkings; not needed for correctness.
+3. **The LL extra flush call (§10.C).** The reference's extra flush into an already-full window produced nothing in every run. Can it ever produce bytes, for example when a packet closed with a partial frame still pending? We leave it out.
+4. **R1 sink in LL (§10.D)** rests on analysis of the source, not on running it. Combined with the live result that the Px7 decodes our config-0 stream, is there any capture of a phone in LL mode with an R1 sink that confirms frame type 1 on air?
+5. **Profile 2 or 6 with the R1 decoder level** reports config 1 but gives a different stream from profile 1. What is that stream? Not needed unless something creates that combination.
+6. **Config 4 not covered:** 88.2/96 kHz (encoder accepts, source never creates), mono, and the split-TX LL rows. Also, is config 4's 4-bit allocation header ever given the "+4" bit that configs 0/1 have for channel config 2?
+7. **§8.6 step 5.4 top-up** (digital-black total of 1 to 6): still not shown to fire in any vector, including the alternate-flag rows where channel 1 is zeroed. Is it reachable?
+8. **Config 4 at most 9 bits per band** is stated for "any rate a source can reach (target ≤ 5/4 × 320000)". With `max_bits_8band_420` as the tonal override and the non-tonal chain capped at that rate, confirm the bound also holds for mono (r = 2R) if mono is ever used.
+9. **The three-quarter cut (§10.H)** has no verified effect on any byte. For HQ rows above 266666 bps with an under-feeding caller it would act; is there a vector for that, or should the plugin just never under-feed?
+10. `codec-core.md` §8 still lists "five more HQ table rows" and "five LL table rows" checked without clean-side vectors. Are those the same runs now shipped in `tests/vectors/parity/`, or different ones?

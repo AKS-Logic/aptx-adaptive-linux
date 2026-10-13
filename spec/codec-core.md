@@ -1,6 +1,6 @@
 # aptX Adaptive R1/R2 core encoder: bitstream and signal path
 
-Status: clean-side spec, 2026-10-12.
+Status: clean-side spec, 2026-10-12. Batch 5 corrections and the config 4 specification (2026-10-13) are in §10, which supersedes earlier sections where they differ.
 
 - **Verification:** every stage marked **[VERIFIED]** was modelled independently and compared bit for bit against the reference encoder, using intermediate values captured between stages.
 - **Test vectors:** `tests/vectors/stages/` (see its README).
@@ -36,17 +36,17 @@ The encoder supports four music configurations, numbered 0, 1, 3 and 4 (config 2
 | profile | decoder level | sample rate | config | frame type | filterbank | subbands/ch | samples/block | predictor mode |
 |---|---|---|---|---|---|---|---|---|
 | HQ (profile 0, 3 or 5) | R1 | 44.1/48k | **config 0** | 1 | 4-band tree QMF, 16 taps (§3.1) | 4 | 4 | normal (§6) |
-| LL (profile 1 always; profile 2/6 with R1) | R1 | 44.1/48k | **config 1** | 2 | 4-band tree QMF, 12 taps | 4 | 4 | low-power (§6.3) |
+| LL (profile 1 always; profile 2/6 with R1; but see §10.D: the source never uses these for an R1 sink) | R1 | 44.1/48k | **config 1** | 2 | 4-band tree QMF, 12 taps | 4 | 4 | low-power (§6.3) |
 | HQ | R2 | 44.1/48k | **config 3** | 3 | 8-band cosine-modulated, 256-tap prototype (§3.2) | 8 | 8 | normal |
 | HQ | any | 88.2/96k | **config 3** | 3 | same as above | 8 | 8 | normal, some bands predictor off |
-| LL (profile 2/6) | R2 | 44.1/48k | config 4 | 4 | cosine-modulated, 128-tap prototype (UNCERTAIN, not verified) | 8 | 8 | UNCERTAIN |
+| LL (profile 2/6) | R2 | 44.1/48k | **config 4** | 4 | cosine-modulated, 128-tap prototype (§10.F) | 8 | 8 | normal |
 
 The companion spec establishes that the **Px7 S2e is an R1 sink**. That means:
 
 - **config 0** for HQ — verified bit-exact end to end.
 - **config 1** for low latency — verified bit-exact end to end.
 
-Config 3 (R2 sinks) is also verified, at 48 kHz and 96 kHz. Config 4 is not covered.
+Config 3 (R2 sinks) is also verified, at 44.1, 48 and 96 kHz. Config 4 is verified at 44.1 and 48 kHz (§10.F). **Correction (§10.D):** an R1 sink in LL gets config 0 on the LL table row, not config 1.
 
 **How the config is selected:**
 
@@ -507,7 +507,7 @@ These are encoder choices; a decoder does not depend on them. Following this sec
 
 Only the `tests/vectors/` runs are available on the clean side; the other table rows were checked by the spec side and have no vectors here.
 
-Input was fed in 48-, 672- and 1000-frame chunks. The output does not depend on chunking.
+Input was fed in 48-, 672- and 1000-frame chunks. **Correction (§10.B):** the output does depend on chunking in general; a bit-exact test must use each vector's stated chunk size.
 
 **Tables:** `spec/tables/allocator.json`. It replaces the earlier informative `allocator_hints.json`; every value carried over is unchanged.
 
@@ -596,7 +596,7 @@ All arithmetic here is unsigned 32-bit, and `>>` is a logical shift.
 5. `v = nominal − m + target`.
 6. Set `target`:
    - if `nominal > v`: `target = nominal`;
-   - otherwise, for config 3: `target = min(v, (5·nominal) >> 2)`;
+   - otherwise, for configs 3 and 4: `target = min(v, (5·nominal) >> 2)`;
    - otherwise (configs 0 and 1): `target = v`.
 
 `target` feeds the frame-size rule (above), the bit pool (§8.2) and the max-bits table choice (§8.3). `nominal` only feeds the frame-size rule and the clamps.
@@ -604,15 +604,17 @@ All arithmetic here is unsigned 32-bit, and `>>` is a logical shift.
 **Set-bitrate operation** (the wrapper calls it after every packet, `a2dp-integration.md` §5 step 7):
 
 1. Clamp the requested bitrate b to the range derived at create time:
-   - configs 0 and 1: [100000·nch, 300000·nch];
+   - configs 0, 1 and 4: [100000·nch, 300000·nch];
    - config 3: [90000, 500000·nch].
+
+   The create bitrate is clamped to the same range (§10.G).
 2. Set `nominal = target = b` and `A = Ap = Bq = Bp = b`.
 
 This resets the filter. Under the wrapper loop, therefore, the rate check only acts within one packet, and it changes the next packet's sizing only when the set-bitrate operation is not called in between.
 
 The stage vectors (encoder called once per packet with all remaining input, no flush, no set-bitrate call) need §8.1a to reproduce. The `tests/vectors/r2` runs do not.
 
-**Wrapper loop.** This is the per-packet loop of `a2dp-integration.md` §5, restated in terms of the calls above. P is the number of samples per channel per packet.
+**Wrapper loop.** This is the per-packet loop of `a2dp-integration.md` §5, restated in terms of the calls above. **Correction (§10.A, §10.C):** P is the period in **interleaved** samples, `floor(period_ms · fs · 2 / 1000)`, which can be odd at 44.1 kHz, and in LL the deficit is zeroed after every packet.
 
 1. Call encode with all buffered input.
 2. If the period (P plus the deficit) has not been reached and no packet came out, wait for more input.
@@ -629,7 +631,7 @@ Clamp the current **target** bitrate R (bit/s for the whole stream, §8.1a):
 |---|---|
 | configs 0 and 1 | [100000·nch, 350000·nch] |
 | config 3 | [90000, 550000·nch] |
-| config 4 (UNCERTAIN) | [100000·nch, 210000·nch] |
+| config 4 | [100000·nch, 210000·nch] (verified, §10.F) |
 
 Here nch is the channel count of the group (2 for stereo). The lower clamp for config 3 is not scaled by nch. Note that this clamp is wider than the set-bitrate clamp of §8.1a, so it only matters when `target` has risen above `nominal`.
 
@@ -639,7 +641,7 @@ The pool, in bits per block for both channels together, is
 
 Examples: config 0 at 364 kbps / 48 kHz gives 30; config 1 at 265 kbps gives 22; config 3 at 420 kbps gives 70.
 
-**Alternate flag.** Config 3 with a 2-channel group and R ≤ 179999 sets an "alternate" flag; any other case clears it. The flag only changes the digital-black step (§8.6 step 5) and makes the 96 kHz allocator unusable. Such bitrates are below every wrapper table row, so this path is **UNCERTAIN** and not covered.
+**Alternate flag.** Config 3 with a 2-channel group and R ≤ 179999 sets an "alternate" flag; any other case clears it. The flag only changes the digital-black step (§8.6 step 5) and makes the 96 kHz allocator unusable. **Superseded by §10.E:** the flag is reachable (R2 HQ level-1 rows at 104, 128 and 142 kbps), is decided on the nominal bitrate, zeroes channel 1's scale factors and skips one digital-black step.
 
 ### 8.3 Max-bits table
 
@@ -676,7 +678,7 @@ Let `r` be the clamped target R of §8.2 (not the nominal rate), or 2R for mono.
 | ≤ 649999 | `max_bits_8band_96k_650` |
 | otherwise | `max_bits_8band_96k_max` |
 
-**Tonal override.** If the tonal flag (§8.4) is set, config 3 uses `max_bits_8band_max` at 44.1 / 48 kHz and `max_bits_8band_96k_max` at 88.2 / 96 kHz, whatever the rate. This override table is also the `maxb` used by §8.5 and §8.6.
+**Tonal override.** If the tonal flag (§8.4) is set, config 4 uses `max_bits_8band_420` (§10.F), and config 3 uses `max_bits_8band_max` at 44.1 / 48 kHz and `max_bits_8band_96k_max` at 88.2 / 96 kHz, whatever the rate. This override table is also the `maxb` used by §8.5 and §8.6.
 
 ### 8.4 Scale factors, tonal flag and bit need
 
@@ -797,10 +799,191 @@ Recommendation: choose the bitrate from the packet size the same way, and treat 
 
 Out of scope / not done:
 
-- config 4 (R2 low latency)
+- config 4 at 88.2/96 kHz (config 4 at 44.1/48 kHz is covered in §10.F)
 - config 2 (speech)
 - mono
 - joint stereo
 - metadata chunks
 - the voice / true-wireless packet formats
 - end-of-stream flush behaviour (the per-packet flush call of §8.1 is covered; a final drain at stream end is not)
+
+---
+
+## 10. Verified parity cases and corrections (batch 5)
+
+Status: clean-side summary of a spec-side verification round, 2026-10-13. Where this section differs from §1–§9 it supersedes them.
+
+**Method.** Each case was run on the reference encoder, driven by the packet loop of §10.A–§10.C. An independent model following §3–§8 plus the corrections below was compared with the output byte for byte: whole streams from raw PCM, with no reference-side state fed in. Every gap found is listed here with the smallest change that makes the model byte-exact on every vector.
+
+**Result.** All 44 streams in `tests/vectors/parity/` (see its README), plus the 21 earlier regression runs, are byte-exact with these corrections.
+
+### 10.0 Summary
+
+| case | what was checked | verdict |
+|---|---|---|
+| 1a | config 0, 48 kHz, R1 sink, HQ table index 0, levels 1–4 (levels 5–7 use the level-4 row) | confirmed |
+| 1b | config 0, 48 kHz, R1 sink with QHS, HQ table index 2, levels 1–5 (760-byte packets) | confirmed |
+| 1c | config 0, 44.1 kHz, levels 1–4 | codec confirmed; packet loop needed the period rule (A) and the chunking rule (B) |
+| 2a | config 1 on the R1 LL row (265 kbps / 10 ms / 348 B), 48 kHz | confirmed |
+| 2b | the same at 44.1 kHz | needed the LL loop rule (C) |
+| 2c | which config an R1 sink gets in LL | §1 was wrong: config 0, not config 1 (D) |
+| 3 | config 3 on every 96 kHz row (HQ indices 5 and 6, levels 1–5), and an R1 sink at 96 kHz | confirmed for levels 2–5; level 1 (128k, 142k) needed the alternate flag (E) |
+| 4 | config 4 (R2 low latency) | reachable; fully specified in F; byte-exact on 10 LL rows at 48 and 44.1 kHz |
+| 5 | rate control and allocation away from level 3 | pool, max-bits and frame-size rules confirmed on every row; see E, G, H |
+
+### 10.A Period length in interleaved samples
+
+§8.1a's wrapper loop states the period as samples per channel per packet, and `a2dp-integration.md` §4 lists samples per channel per table row. Those numbers are for 48 kHz (96 kHz on the 96 kHz rows) and are wrong at 44.1 kHz.
+
+**Rule.** Keep every counter of the packet loop in **interleaved** samples (both channels counted).
+
+- The period is `Pi = floor(period_ms · fs · 2 / 1000)`. The reference computes this in single-precision floating point; for every table row at 44.1, 48 and 96 kHz that gives the same value as exact integer arithmetic. The values are in `spec/tables/period_interleaved.json`.
+- At 44.1 kHz `Pi` can be **odd**: 18 ms → 1587, 16 ms → 1411, 15 ms → 1323, 19 ms → 1675. Others: 14 ms → 1234, 12 ms → 1058, 10 ms → 882.
+- A packet is due when `consumed ≥ Pi + deficit`. After the packet, `deficit = deficit + Pi − consumed`. `consumed` counts interleaved samples, so it is always even.
+- The set-bitrate rule's "deficit above 96" is in the same units.
+- The table's samples-per-channel column is **not** used for the period. Do not round `Pi` to whole stereo frames: using 793 frames (1586) instead of 1587 makes the 281 kbps / 18 ms row diverge at packet 26.
+
+At 48 and 96 kHz `Pi` is always even and the deficit stays 0 in every vector, so this only shows at 44.1 kHz. It is consistent with `a2dp-integration.md` §4.3 ("interleaved samples per packet") and §7J ("samples per packet = period × rate").
+
+### 10.B The output depends on input chunking
+
+This replaces "The output does not depend on chunking" in §8 (and the matching sentences in `a2dp-integration.md` §3.4 and §5, and `tests/vectors/r2/README.md`).
+
+The state machine of §8.1 is exact and reproduces every chunking tried. But two of its properties make the output depend on where the caller's chunks end:
+
+1. In an encode call, the encoder analyses only a whole, **even** number of blocks out of the input it is offered (§8.1 step 2). Leftover input is not consumed and must be offered again in the next call.
+2. The packet loop compares `consumed` with the period only **between** encode calls. So the chunk boundaries decide at which call a period is found to have ended, and therefore when the flush call happens and how many blocks the flushed frame holds.
+
+Observed:
+
+- At 44.1 kHz the output always depends on the chunk size, because `Pi` is never a whole number of block pairs. `c0_44k_L3` (44-frame chunks) and `c0_44k_L3_chunk441` (441-frame chunks) differ from packet 0.
+- At 48 kHz, chunks of 5, 7, 9, 16, 24, 48, 56, 96, 112, 336 and 672 frames gave identical output on the parity signal. Chunks of 13 and 100 frames did not, both on the parity signal and on `tests/vectors/r2/noise.s32le`. `c0_48k_L3_chunk13` differs from `c0_48k_L3`.
+
+**Rule.** The output depends on how the input is split into encode calls. The reference source feeds 1 ms chunks: 48 frames at 48 kHz, 44 frames at 44.1 kHz, 96 frames at 96 kHz. Each vector states its chunk size, and a bit-exact test must use that chunk size. For a live source this is not a correctness problem: any chunking produces a valid stream.
+
+### 10.C LL packet loop: the deficit is zeroed after every packet
+
+When the source runs in LL mode (any sink, any config), the loop has one extra step, after the deficit update and before the set-bitrate call:
+
+- if the deficit is not 0, set it to 0.
+
+So in LL the deficit is always 0 at the start of each period and the three-quarter bitrate cut never fires. HQ mode does not do this.
+
+The reference also makes one more flush call at this point, on an output window that is already full. In every run it produced no bytes and changed no encoder state, so a clean implementation should not make that call.
+
+At 48 kHz the LL deficit is always 0 anyway. At 44.1 kHz it matters: on the R1 LL row the loop gives 91 packets per second with the reset and 99 without, and the bytes differ from packet 2. This agrees with `a2dp-integration.md` §7K ("LL never carries a deficit").
+
+### 10.D An R1 sink in LL gets config 0
+
+This corrects the config-1 row of the §1 table. It agrees with `a2dp-integration.md` §7J.
+
+- The source creates the encoder with the LL profile (6) **only** when the mode is LL **and** the sink is R2. Otherwise it uses the HQ profile (3), including LL with an R1 sink.
+- An R1 sink in LL therefore gets **config 0** (frame type 1): the HQ algorithm, on the LL table row (265 kbps, 10 ms, 348-byte packets), with the LL loop of 10.C. The 8-byte header still carries the LL mode byte (0xAD) and the LL cfg byte.
+- The source-side choice is UNCERTAIN in the sense that it couldn't be observed end to end on a sink. The resulting streams (`c0_48k_ll`, `c0_44k_ll`) are reproduced exactly by the config-0 rules.
+- Config 1 (low-power, frame type 2) is what the encoder produces when created with profile 1. That is verified (`c1_48k_ll`, `c1_44k_ll`, and the five earlier LL rows), but the reference source does not appear to use it for A2DP.
+- Creating with profile 2 or 6 and the R1 decoder level also reports config 1, but gives a **different** stream from profile 1: not the low-power stream, and not modelled. Do not use that combination.
+
+Corrected §1 table row: "LL, R1 sink: config 0 (the source creates the encoder with the HQ profile); config 1 only if created with profile 1."
+
+### 10.E The alternate flag at low config-3 rates
+
+This replaces the "Alternate flag" paragraph of §8.2 and step 3 of §8.6 step 5. The path is reachable: R2 HQ table index 1 level 1 (104 kbps), index 5 level 1 (128 kbps) and index 6 level 1 (142 kbps) all use it.
+
+**When it applies.** The flag is set for a frame when all of these hold, and is clear otherwise:
+
+- the config is 3;
+- the stream has 2 channels;
+- the **nominal** bitrate (the create or set-bitrate value, not the rate-controlled target of §8.1a) is at most 179999.
+
+It is evaluated for every frame. It is never set for config 4.
+
+**What it changes.** Two things, both required:
+
+1. **Channel 1 scale factors are zeroed.** After the tonal-flag decision (§8.4) and before bit need, every channel-1 scale factor `sf[S..2S−1]` is replaced by 0. Every channel-1 band therefore gets `need = −5`. The tonal flag itself is decided on the original scale factors.
+2. **One digital-black step is skipped.** In §8.6 step 5:
+   - sub-step 2 zeroes every band whose (replaced) scale factor is 0, which now includes all of channel 1;
+   - sub-step 3 (setting `out[S] = 2` when channel 1's sum is 0, and `out[0] = 2` when channel 0's sum is 0) is **skipped** entirely;
+   - sub-step 4 (the top-up when the total is 1 to 6) still applies.
+
+Distribution steps 1–4 of §8.6 are unchanged. The net effect is that channel 1 is sent with an all-zero allocation in every frame at these rates.
+
+Dropping either change breaks the 104k and 128k streams within a few packets. The 96 kHz allocator, which §8.2 called unusable with the flag, works with the same two changes.
+
+### 10.F Config 4 (R2 low latency)
+
+**Reachability.** An R2 sink in LL mode, at 44.1 or 48 kHz, gets the LL create profile (6) and the R2 decoder level, which selects config 4 (frame type 4). The source refuses LL at 96 kHz. Verified on LL table indices 1–5 at 48 kHz and indices 1–2 at 44.1 kHz (`c4_*` vectors), using the LL loop of 10.C.
+
+Everything not listed here is as for config 3 at 44.1/48 kHz.
+
+**1. Filterbank: 8-band, 128-tap prototype.** Use `spec/tables/filterbank_8band_prototype_128.json` (128 values `P128[0..127]`), now verified identical to the reference's table. The channel state holds the last 128 input samples. §3.2 step 2 becomes, for i = 0..15:
+
+- `acc = −Σ_{k=0}^{7} P128[i+16k] · h(i+16k)`, accumulated in 64 bits with wraparound;
+- `u[i] = R64( lo64(acc · 64) )`, as before.
+
+Steps 3–6 (cosine-modulation front end, 8-point DCT, post-processing, output) are unchanged. Verified on 10,192 stereo blocks of intermediate values.
+
+**2. Quantiser (§5).** Normal mode with dither, exactly as config 3. The dither shifts are `s_k = 2k`.
+
+**3. Predictor (§6).** Normal mode: both channels, all 8 bands run every block. Zero-tap counts `predictor_taps.8band_48k`, the same as config 3 at 44.1/48 kHz (`8band_48k` in `predictor_taps.json`).
+
+**4. Allocation (§8.2–§8.6).**
+
+- Pool clamp: `[100000·nch, 210000·nch]` (the §8.2 row is correct). The pool formula is unchanged, with S = 8.
+- Max-bits: the S = 8, 44.1/48 kHz threshold chain of §8.3.
+- **Tonal override:** when the tonal flag is set, use `max_bits_8band_420`, not `max_bits_8band_max`. This table is also the `maxb` used by §8.5 and §8.6.
+- Offset tables, scale factors, tonal flag, bit need, water level and distribution steps 1–4: as for config 3.
+- **No digital-black step** (§8.6 step 5 is config 3 only) and **no alternate flag**.
+- With these tables config 4 never allocates more than 9 bits per band at any rate a source can reach (target at most 5/4 × 320000).
+
+**5. Rate check and set-bitrate (§8.1a).**
+
+- The set-bitrate clamp is `[100000·nch, 300000·nch]`, as for configs 0 and 1.
+- In step 6 of the rate check, config 4 takes the config-3 branch: `target = min(v, (5·nominal) >> 2)`. Read "for config 3" there as "for configs 3 and 4".
+- The frame-size rule (§8.1) is unchanged.
+
+**6. Bitstream (§7).**
+
+- Packet byte 1 = 4, plus 0x80 if the packet ends with padding.
+- **Absolute allocation (§7.2).** The 4-bit header is the sample-rate code (44.1 kHz → 0, 48 kHz → 2) plus 8 for 2 channels. Then the 8 band pairs, using the **configs 0/1 symbol coding** (symbol `(α << 4) | β`, no escapes) but the **8-band table choice** (`pair_table_8band`). There is **no** zero-allocation escape.
+- **Differential allocation (§7.3).** The **configs 0/1 rule**: write `table[(v − pv) & 15]`, with no clamping, no escapes and **no** zero-allocation escape.
+- **Codewords (§7.4).** As config 3, **without** the configs 0/1 top-band substitution.
+- Packet layout, continuation and padding: unchanged.
+
+Since the allocation never exceeds 9 bits, ρ is at most 8 and the escape-free absolute coding is always sufficient.
+
+**Not covered:** config 4 at 88.2/96 kHz (the encoder accepts it, but the source never creates it), mono, and the LL rows with split-TX doubling.
+
+Corrected §1 table row: "LL (profile 6), R2 sink, 44.1/48k: config 4, frame type 4, 8-band cosine-modulated filterbank with the 128-tap prototype, 8 subbands, 8 samples per block, normal predictor mode."
+
+### 10.G Create-time bitrate clamp
+
+The create bitrate is clamped at create time to the same range as set-bitrate (§8.1a):
+
+| config | range |
+|---|---|
+| 0, 1, 4 | [100000·nch, 300000·nch] |
+| 3 | [90000, 500000·nch] |
+
+`nominal` and `target` start at the clamped value, and the create-time `P_est` is computed from it. Seen on the R1 + QHS level-1 row: 110000 is raised to 200000. In the parity runs the first packet was the same either way, but the clamped value is what the encoder reports.
+
+### 10.H The three-quarter bitrate cut
+
+The loop's "deficit above 96 → set bitrate − bitrate/4" step fired in only one run of the whole set, the R1 + QHS level-1 row. There it asked for 82500, which the set-bitrate clamp raises back to 200000, so it had no effect. With the period rule of 10.A and 1 ms chunks, the deficit stays at or below 96 on every other table row at every rate. The cut therefore has **no verified effect on any byte**; it only matters when the caller under-feeds the encoder. (Derived, not separately tested: in stereo the 200000 clamp floor makes the cut a no-op for configs 0, 1 and 4 whenever the table bitrate is at most 266666.)
+
+### 10.I Confirmed unchanged
+
+Across all 44 streams these needed no change: §3.1, §3.2 (256-tap), §4–§6, §7 for configs 0, 1 and 3, the 44.1 kHz allocation header codes (config 0: 0x8; config 3: 0x8), the 96 kHz predictor and max-bits chain (including `max_bits_8band_96k_650` at 646 kbps and `max_bits_8band_96k_max` at 820 kbps), §8.1 frame sizing with its carry and padding histories, §8.1a's A/B filters, and §8.2's pool formula. HQ at 96 kHz with an R1 sink gives config 3 (§1 step 5), checked at 364 kbps / 14 ms. This also answers "from codec-core allocator" item 2: the allocator and frame-size rule are confirmed at 44.1 kHz (`rate_idx` 2). 88.2 kHz is still not covered by a parity vector.
+
+### 10.J Verification status per case
+
+| case | vectors | status |
+|---|---|---|
+| A, period in interleaved samples | `c0_44k_L1`–`L4`, `c3_44k_i1_*`, `c4_44k_*` | byte-exact |
+| B, chunk dependence | `c0_48k_L3_chunk13`, `c0_44k_L3_chunk441` (against `c0_48k_L3`, `c0_44k_L3`) | byte-exact with the stated chunk sizes |
+| C, LL deficit reset | `c0_44k_ll`, `c1_44k_ll`, `c4_44k_*` | byte-exact; without the reset, 44.1 kHz LL diverges at packet 2 |
+| D, R1 sink in LL → config 0 | `c0_48k_ll`, `c0_44k_ll` | byte-exact as config 0. The source's profile choice is from analysis of the source, not from running it |
+| E, alternate flag | `c3_48k_i1_L1`, `c3_96k_i5_L1`, `c3_96k_i6_L1` | byte-exact; whether the sub-step-4 top-up fires in these runs is not reported |
+| F, config 4 | `c4_48k_i1_L1` … `c4_44k_i2_L1` (10 runs) | byte-exact, 48 and 44.1 kHz |
+| G, create clamp | `c0_48k_qhs_L1` | consistent; no byte depends on it in the vectors |
+| H, three-quarter cut | `c0_48k_qhs_L1` | fires once, no effect after the clamp |
+| config 0 / 3 / 1 rows | every other parity vector | byte-exact |

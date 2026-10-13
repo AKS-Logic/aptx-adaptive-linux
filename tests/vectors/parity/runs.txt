@@ -1,0 +1,56 @@
+# name            level profile rate  bitrate period_ms pkt_bytes chunk_frames ll_loop
+# level: decoder compatibility level of the sink (R1 or R2). profile: create-parameter profile byte.
+# ll_loop: 1 = the LL packet loop (deficit zeroed after every packet). See README.md.
+# R1 sink, HQ table index 0 (levels 5-7 use the level-4 row)
+c0_48k_L1         R1 3 48000 281000 18 656 48 0
+c0_48k_L2         R1 3 48000 318000 16 656 48 0
+c0_48k_L3         R1 3 48000 364000 14 656 48 0
+c0_48k_L4         R1 3 48000 427000 12 656 48 0
+c0_44k_L1         R1 3 44100 281000 18 656 44 0
+c0_44k_L2         R1 3 44100 318000 16 656 44 0
+c0_44k_L3         R1 3 44100 364000 14 656 44 0
+c0_44k_L4         R1 3 44100 427000 12 656 44 0
+# R1 sink with QHS, HQ table index 2
+c0_48k_qhs_L1     R1 3 48000 110000 50 760 48 0
+c0_48k_qhs_L2     R1 3 48000 235000 25 760 48 0
+c0_48k_qhs_L3     R1 3 48000 290000 20 760 48 0
+c0_48k_qhs_L4     R1 3 48000 350000 16 760 48 0
+c0_48k_qhs_L5     R1 3 48000 430000 13 760 48 0
+# chunking dependence (same rows as c0_48k_L3 / c0_44k_L3, different chunk size)
+c0_48k_L3_chunk13 R1 3 48000 364000 14 656 13 0
+c0_44k_L3_chunk441 R1 3 44100 364000 14 656 441 0
+# R1 sink, LL table index 0, as the reference source runs it (profile 3 -> config 0)
+c0_48k_ll         R1 3 48000 265000 10 348 48 1
+c0_44k_ll         R1 3 44100 265000 10 348 44 1
+# same LL row with the low-power config 1 (profile 1)
+c1_48k_ll         R1 1 48000 265000 10 348 48 1
+c1_44k_ll         R1 1 44100 265000 10 348 44 1
+# R2 sink, 96 kHz, HQ table index 5 (no QHS) and 6 (QHS)
+c3_96k_i5_L1      R2 3 96000 128000 40 656 96 0
+c3_96k_i5_L2      R2 3 96000 255000 20 656 96 0
+c3_96k_i5_L3      R2 3 96000 340000 15 656 96 0
+c3_96k_i5_L4      R2 3 96000 420000 12 656 96 0
+c3_96k_i5_L5      R2 3 96000 646000 8 656 96 0
+c3_96k_i6_L1      R2 3 96000 142000 40 760 96 0
+c3_96k_i6_L2      R2 3 96000 284000 20 760 96 0
+c3_96k_i6_L3      R2 3 96000 460000 16 960 96 0
+c3_96k_i6_L4      R2 3 96000 570000 13 960 96 0
+c3_96k_i6_L5      R2 3 96000 820000 9 960 96 0
+# R2 sink, 48/44.1 kHz HQ table index 1 (low rows exercise the alternate flag)
+c3_48k_i1_L1      R2 3 48000 104000 50 656 48 0
+c3_48k_i1_L2      R2 3 48000 204000 25 656 48 0
+c3_44k_i1_L3      R2 3 44100 270000 19 656 44 0
+c3_44k_i1_L5      R2 3 44100 427000 12 656 44 0
+# R1 sink at 96 kHz still gets config 3 (index-0 L3 row)
+c3_96k_r1_L3      R1 3 96000 364000 14 656 96 0
+# R2 sink, LL (encoder profile 6 -> config 4), LL table indices 1..5
+c4_48k_i1_L1      R2 6 48000 220000 12 348 48 1
+c4_48k_i1_L3      R2 6 48000 270000 10 348 48 1
+c4_48k_i2_L1      R2 6 48000 290000 15 560 48 1
+c4_48k_i2_L3      R2 6 48000 320000 12 560 48 1
+c4_48k_i2_L4      R2 6 48000 320000 10 560 48 1
+c4_48k_i3         R2 6 48000 214000 13 348 48 1
+c4_48k_i4_L3      R2 6 48000 320000 13 560 48 1
+c4_48k_i5         R2 6 48000 300000 8 348 48 1
+c4_44k_i1_L3      R2 6 44100 270000 10 348 44 1
+c4_44k_i2_L1      R2 6 44100 290000 15 560 44 1
