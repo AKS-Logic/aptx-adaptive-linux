@@ -329,3 +329,11 @@ Where we deviate from or can't follow the spec exactly:
 2. **Reversal mid-switch.** §7K says asking for the opposite mode reverses the switch, but not how. We continue from the current gain: during the fade-out we fade back in from the same table entry; in the silence before the reset we go straight to the fade-in; after the reset, the request becomes a new switch. Is that right?
 3. **R2.1 "800 blocks for a switch to LL".** Not implemented: R2 switches use 900 ms of silence like R1. Our R2 detection doesn't tell R2.0 from R2.1 in the session, and §7K only gives the number. Is 800 for R2.1 sinks only (features bit 1), and only for HQ → LL?
 4. **Chunk size.** The parity vectors use 1 ms chunks. R2 gets 1 ms blocks, the same as the reference. R1 gets 2 ms blocks; at 48 kHz codec-core §10.B lists 96-frame chunks as giving identical output, so the stream matches the reference's, but this rests on that observation.
+
+## live test after #16/#19/#20/#21/#22 (2026-10-13 10:54–10:58)
+
+- Connect: a single SetConfiguration straight to SEID 9 (aptX Adaptive) with `12 02 50 6a 64 af 64 4b 00 00 aa` + zeros. No aptX HD first; only the normal connect chime.
+- HQ: 71.4 packets/s, completion med 23 / p90 41 ms, 0 missing, header `80 60 … 00 00 02 a0 00 00 00 a3`. Drift log ±1 ppm. Plays fine.
+- Switch HQ → LL via `pw-cli set-param <node> Props '{ quality = 1 }'`: audible fade/gap, then LL plays fine. 100 packets/s, 360 bytes (12 + 348), header `… 00 00 01 e0 00 00 00 a1`, completion med 19 / p90 49 ms.
+- Switch LL → HQ: audible fade/gap, back to 668-byte `a3` packets, 0 missing sequence numbers across the switch.
+- With stock BlueZ (A2DP 1.4) the Px7 doesn't offer Delay Reporting, so no Delay Report to check the target latency on air.
