@@ -298,7 +298,8 @@ impl<C: Core> Session<C> {
         })
     }
 
-    /// Whether this link can run `profile` (LL needs an R1 sink and a packet that fits).
+    /// Whether this link can run `profile`: the encoder has a row for it (R1 LL is config 0,
+    /// R2 LL config 4) and its packet fits the MTU. Replay sessions only run HQ.
     pub fn can_run(&self, profile: Profile) -> bool {
         self.rows[profile.index()].is_some()
     }
@@ -1290,11 +1291,20 @@ mod tests {
         assert_eq!((s.profile(), s.fade), (Profile::Ll, Fade::Steady));
     }
 
-    /// The whole HQ → LL → HQ round trip through media-sink's loop on the real encoder:
-    /// every packet is a valid config 0 packet of the running row, with matching RTP fields.
-    #[test]
-    fn switch_hq_ll_hq_real_encoder() {
-        let mut s = Session::new(DecoderLevel::R1, Profile::Hq, MTU).unwrap();
+    /// What one profile's packets look like: codec packet size, RTP header bytes 4..12
+    /// (timestamp and SSRC) and frame type.
+    struct Expect {
+        size: usize,
+        fields: [u8; 8],
+        frame_type: u8,
+    }
+
+    /// Runs 4 s of a sine through media-sink's loop on the real encoder, asking for LL from
+    /// packet 10 to 120 and HQ otherwise, and checks the packets: each is exactly an HQ or an
+    /// LL packet (size, RTP timestamp and SSRC, frame type), sequence numbers run on, the
+    /// block size never changes, and the stream goes HQ, LL, HQ with no mixing.
+    fn check_hq_ll_hq(level: DecoderLevel, hq: &Expect, ll: &Expect) {
+        let mut s = Session::new(level, Profile::Hq, MTU).unwrap();
         let block = s.block_size();
         let sent = media_sink(&mut s, &sine_pcm(4 * 48_000), |s, n| {
             let want = if (10..120).contains(&n) {
@@ -1305,51 +1315,63 @@ mod tests {
             s.request(want).unwrap();
             assert_eq!(s.block_size(), block);
         });
-        let mut kinds = Vec::new();
-        for (i, p) in sent.iter().enumerate() {
-            let kind = match (p.len(), &p[4..12]) {
-                (668, [0, 0, 0x02, 0xa0, 0, 0, 0, 0xa3]) => 'H',
-                (360, [0, 0, 0x01, 0xe0, 0, 0, 0, 0xa1]) => 'L',
-                _ => panic!("packet {i}: {:02x?}", &p[..12]),
-            };
-            assert_eq!(p[2..4], (i as u16).to_be_bytes());
-            assert_eq!(p[12] & 0x7f, 1, "packet {i}: config 0");
-            kinds.push(kind);
-        }
-        let runs: String = kinds.iter().fold(String::new(), |mut acc, k| {
-            if !acc.ends_with(*k) {
-                acc.push(*k);
-            }
-            acc
-        });
-        assert_eq!(runs, "HLH");
-    }
-
-    /// R2 HQ → LL → HQ on the real encoder: config 3 (19 ms, 656 bytes, SSRC A3) and config 4
-    /// (10 ms, 348 bytes, SSRC A1), switched in place with the §7K sequence.
-    #[test]
-    fn switch_r2_hq_ll_hq_real_encoder() {
-        let mut s = Session::new(DecoderLevel::R2, Profile::Hq, MTU).unwrap();
-        let sent = media_sink(&mut s, &sine_pcm(4 * 48_000), |s, n| {
-            let want = if (10..120).contains(&n) {
-                Profile::Ll
-            } else {
-                Profile::Hq
-            };
-            s.request(want).unwrap();
-        });
         let mut runs = String::new();
         for (i, p) in sent.iter().enumerate() {
-            let kind = match (p.len(), &p[4..12], p[12] & 0x7f) {
-                (668, [0, 0, 0x03, 0x90, 0, 0, 0, 0xa3], 3) => 'H',
-                (360, [0, 0, 0x01, 0xe0, 0, 0, 0, 0xa1], 4) => 'L',
-                _ => panic!("packet {i}: {:02x?}", &p[..14]),
+            let is = |e: &Expect| {
+                p.len() == RTP_HEADER_LEN + e.size
+                    && p[4..12] == e.fields
+                    && p[12] & 0x7f == e.frame_type
             };
+            let kind = if is(hq) {
+                'H'
+            } else if is(ll) {
+                'L'
+            } else {
+                panic!("{level:?} packet {i}: {:02x?}", &p[..14])
+            };
+            assert_eq!(p[2..4], (i as u16).to_be_bytes());
             if !runs.ends_with(kind) {
                 runs.push(kind);
             }
         }
-        assert_eq!(runs, "HLH");
+        assert_eq!(runs, "HLH", "{level:?}");
+    }
+
+    /// R1: config 0 both ways (§7J), 14 ms / 656 bytes / A3 and 10 ms / 348 bytes / A1.
+    #[test]
+    fn switch_hq_ll_hq_real_encoder() {
+        check_hq_ll_hq(
+            DecoderLevel::R1,
+            &Expect {
+                size: 656,
+                fields: [0, 0, 0x02, 0xa0, 0, 0, 0, 0xa3],
+                frame_type: 1,
+            },
+            &Expect {
+                size: 348,
+                fields: [0, 0, 0x01, 0xe0, 0, 0, 0, 0xa1],
+                frame_type: 1,
+            },
+        );
+    }
+
+    /// R2: config 3 (19 ms, 656 bytes, A3) and config 4 (10 ms, 348 bytes, A1), switched in
+    /// place with the §7K sequence.
+    #[test]
+    fn switch_r2_hq_ll_hq_real_encoder() {
+        check_hq_ll_hq(
+            DecoderLevel::R2,
+            &Expect {
+                size: 656,
+                fields: [0, 0, 0x03, 0x90, 0, 0, 0, 0xa3],
+                frame_type: 3,
+            },
+            &Expect {
+                size: 348,
+                fields: [0, 0, 0x01, 0xe0, 0, 0, 0, 0xa1],
+                frame_type: 4,
+            },
+        );
     }
 
     /// A refused request is counted, changes nothing and is reported as the running profile.

@@ -34,8 +34,6 @@ const MTU: usize = 895;
 /// 2 ms of stereo `S24_32`: divides both the 14 ms HQ and the 10 ms LL packet (spec
 /// `a2dp-integration.md` §4.1, §4.2).
 const BLOCK_SIZE: c_int = 96 * 2 * 4;
-/// One 14 ms HQ packet.
-const HQ_PACKET: usize = 672 * 2 * 4;
 
 type EnumFn = unsafe extern "C" fn(*mut *const spa_handle_factory, *mut u32) -> c_int;
 
@@ -343,9 +341,8 @@ fn init_and_encode_a_real_packet() {
             out[..12],
             [0x80, 0x60, 0, 1, 0, 0, 0x02, 0xa0, 0, 0, 0, 0xa3]
         );
-        let pcm = vec![0u8; HQ_PACKET];
-        let (written, flush) = encode_packet(c, data, &pcm, &mut out[12..]);
-        assert_eq!((written, flush), (656, 1));
+        // 14 ms of 2 ms blocks.
+        assert_eq!(encode_until_flush(c, data, &mut out[12..], 7), (656, 7));
         // Swapped config 0 packet: 00 01 a1 .. becomes 01 00 .. a1 (0x80 on byte 1 if padded).
         assert_eq!((out[12] & 0x7f, out[13], out[15]), (0x01, 0x00, 0xa1));
         assert_eq!(c.abr_process.unwrap()(data, 0), 0);
@@ -386,64 +383,50 @@ fn r2_config_streams() {
             12
         );
         assert_eq!(out[4..12], [0, 0, 0x03, 0x90, 0, 0, 0, 0xa3]);
-        let pcm = vec![0u8; 912 * 2 * 4];
-        let mut blocks = 0;
-        let mut written = 0;
-        for chunk in pcm.chunks_exact(block as usize) {
-            let mut flush = 0;
-            let res = c.encode.unwrap()(
-                data,
-                chunk.as_ptr().cast(),
-                chunk.len(),
-                out.as_mut_ptr().add(12).cast(),
-                out.len() - 12,
-                &raw mut written,
-                &raw mut flush,
-            );
-            assert_eq!(res, block);
-            blocks += 1;
-            if flush != 0 {
-                break;
-            }
-        }
-        assert_eq!((written, blocks), (656, 19));
+        // 19 ms of 1 ms blocks.
+        assert_eq!(encode_until_flush(c, data, &mut out[12..], 19), (656, 19));
         // Swapped config 3 packet: 00 83 a1 .. (spec §3.2).
         assert_eq!((out[12] & 0x7f, out[13], out[15]), (0x03, 0x00, 0xa1));
         c.deinit.unwrap()(data);
     }
 }
 
-/// Feeds `pcm` a block at a time until a packet comes out, like `media-sink.c`.
+/// Feeds silence a block at a time (the codec's own block size) until a packet comes out,
+/// like `media-sink.c`, writing the packet to `out`. Returns its length and the number of
+/// blocks it took. Panics if no packet comes out within `max_blocks`.
 ///
 /// # Safety
 /// `data` must come from `init`.
-unsafe fn encode_packet(
+unsafe fn encode_until_flush(
     c: &media_codec,
     data: *mut c_void,
-    pcm: &[u8],
     out: &mut [u8],
-) -> (usize, c_int) {
-    for block in pcm.as_chunks::<{ BLOCK_SIZE as usize }>().0 {
+    max_blocks: usize,
+) -> (usize, usize) {
+    // SAFETY: caller contract.
+    let block = unsafe { c.get_block_size.unwrap()(data) };
+    let pcm = vec![0u8; block as usize];
+    for n in 1..=max_blocks {
         let (mut written, mut flush) = (0usize, 0);
         // SAFETY: caller contract; buffers are valid for their lengths.
         let res = unsafe {
             c.encode.unwrap()(
                 data,
-                block.as_ptr().cast(),
-                block.len(),
+                pcm.as_ptr().cast(),
+                pcm.len(),
                 out.as_mut_ptr().cast(),
                 out.len(),
                 &raw mut written,
                 &raw mut flush,
             )
         };
-        assert_eq!(res, BLOCK_SIZE);
+        assert_eq!(res, block);
         if flush != 0 {
-            return (written, flush);
+            return (written, n);
         }
         assert_eq!(written, 0);
     }
-    (0, 0)
+    panic!("no packet in {max_blocks} blocks");
 }
 
 fn init_props(c: &media_codec, mode: Option<&CStr>) -> *mut c_void {
@@ -559,7 +542,6 @@ unsafe fn next_packet(
     seq: u16,
 ) -> (usize, [u8; 8]) {
     let mut out = [0u8; 1024];
-    let block = [0u8; BLOCK_SIZE as usize];
     // SAFETY: caller contract.
     unsafe {
         if changed {
@@ -568,22 +550,9 @@ unsafe fn next_packet(
         let hdr = c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), seq, 0);
         assert_eq!(hdr, 12);
         let fields: [u8; 8] = out[4..12].try_into().unwrap();
-        loop {
-            let (mut written, mut flush) = (0usize, 0);
-            let res = c.encode.unwrap()(
-                data,
-                block.as_ptr().cast(),
-                block.len(),
-                out.as_mut_ptr().add(12).cast(),
-                out.len() - 12,
-                &raw mut written,
-                &raw mut flush,
-            );
-            assert_eq!(res, BLOCK_SIZE);
-            if flush != 0 {
-                return (written, fields);
-            }
-        }
+        // At most one 14 ms HQ packet's worth of blocks.
+        let (written, _) = encode_until_flush(c, data, &mut out[12..], 7);
+        (written, fields)
     }
 }
 
@@ -669,23 +638,8 @@ fn r2_sink_runs_ll() {
             12
         );
         assert_eq!(out[4..12], LL_FIELDS);
-        let block = [0u8; 48 * 2 * 4];
-        loop {
-            let (mut written, mut flush) = (0usize, 0);
-            c.encode.unwrap()(
-                data,
-                block.as_ptr().cast(),
-                block.len(),
-                out.as_mut_ptr().add(12).cast(),
-                out.len() - 12,
-                &raw mut written,
-                &raw mut flush,
-            );
-            if flush != 0 {
-                assert_eq!(written, 348);
-                break;
-            }
-        }
+        // 10 ms of 1 ms blocks.
+        assert_eq!(encode_until_flush(c, data, &mut out[12..], 10), (348, 10));
         // Swapped config 4 packet: frame type 4.
         assert_eq!(out[12] & 0x7f, 4);
         c.deinit.unwrap()(data);

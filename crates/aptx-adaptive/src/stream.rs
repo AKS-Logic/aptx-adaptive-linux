@@ -147,12 +147,6 @@ impl<C: Core> Stream<C> {
         &self.core
     }
 
-    /// Input taken but not yet consumed by the encoder.
-    #[must_use]
-    pub fn pending(&self) -> &[i32] {
-        &self.pcm
-    }
-
     /// Feeds interleaved 24-bit PCM. If a packet is out, writes it byte-swapped (no header) to
     /// `out` and returns its length.
     ///
