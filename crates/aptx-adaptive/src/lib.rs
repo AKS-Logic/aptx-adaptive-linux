@@ -124,7 +124,6 @@ pub fn min_bitrate(config: Config) -> Result<u32> {
 pub fn delay_frames(config: Config) -> Result<Option<u32>> {
     Ok(match params(config)?.variant {
         Variant::Cfg0 => Some(90),
-        // Unreachable from `params`, kept for completeness.
         Variant::Cfg1 => Some(66),
         Variant::Cfg3 => Some(255),
         Variant::Cfg4 => None,
@@ -365,8 +364,6 @@ mod tests {
             level: DecoderLevel::R2,
             ..STEREO_48K
         };
-        // Loud noise, then a loud low tone over quiet noise: one hot band that isn't tonal
-        // enough to set the flag, the case that wanted 10 bits from the 520 table.
         let mut s = 1u32;
         let pcm: Vec<i32> = (0..96_000)
             .map(|i| {
@@ -485,7 +482,6 @@ mod tests {
         run(&mut enc, 656);
         enc.reset(ll, 265_000, 348).unwrap();
         assert_eq!(run(&mut enc, 348), want);
-        // A bad reset changes nothing.
         let ll_96k = Config {
             sample_rate: 96_000,
             ..ll
@@ -526,7 +522,6 @@ mod tests {
         );
         assert_eq!(enc.flush(&mut out), Ok(656));
         assert_eq!(out[..3], [0x00, 0x81, 0xA1]);
-        // Continuation 0 is the single bit 1, then header 0xA.
         assert_eq!(out[3] >> 3, 0b1_1010);
     }
 
@@ -538,12 +533,10 @@ mod tests {
         assert_eq!(enc.flush(&mut [0; 658 + 64]), Err(Error::WindowSize));
         assert_eq!(enc.flush(&mut [0; 1036 + 64]), Err(Error::WindowSize));
         let mut window = [0; 1032 + 64];
-        // Nothing pending: nothing out (§7I).
         assert_eq!(enc.flush(&mut window), Ok(0));
         enc.encode_packet(&[0; 16], &mut window).unwrap();
         assert_eq!(enc.flush(&mut window), Ok(1032));
         assert_eq!(window[2], 0xFF);
-        // The packet size is fixed by the first call.
         assert_eq!(enc.flush(&mut [0; 12 + 64]), Err(Error::WindowSize));
     }
 }

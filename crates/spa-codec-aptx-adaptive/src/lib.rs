@@ -1,8 +1,6 @@
 //! PipeWire bluez5 media codec plugin for aptX Adaptive.
 //!
-//! Loaded in place of LC3plus HR, with the codec id from `slot` (see `docs/adr/0001-architecture.md`
-//! and `0002-codec-autoselect.md`), plus a low-latency alias entry (`0003-ll-profile.md`). This
-//! file is only the C ABI glue; codec behaviour lives in `caps` and `session`.
+//! C ABI glue for the plugin; codec behaviour lives in `caps` and `session`.
 
 #[cfg(test)]
 #[path = "../../aptx-adaptive/tests/support/alloc_count.rs"]
@@ -38,9 +36,6 @@ use props::Props;
 use session::{Session, SessionError};
 use slot::{DefaultMode, Slot};
 
-// A panic in any extern "C" fn below aborts the process instead of unwinding into PipeWire;
-// we rely on that rather than catch_unwind.
-
 /// Lets FFI structs holding raw pointers live in statics.
 #[repr(transparent)]
 struct SyncStatic<T>(T);
@@ -57,13 +52,7 @@ fn set_errno(e: c_int) {
     unsafe { *__errno_location() = e };
 }
 
-/// One of the two entries (`docs/adr/0003-ll-profile.md`): `mode` sets its name and the mode
-/// its streams start in. With `owner = Some(slot)` it owns the `aptx_adaptive` endpoint: it
-/// claims the slot's id and has `fill_caps`, so `bluetoothd` configures it on connect. With
-/// `None` it's an alias on that endpoint (the SBC / SBC-XQ pattern): no `fill_caps`, so
-/// PipeWire registers nothing for it and binds it only when picked as a profile.
-/// `bluez5-device.c` keys profiles by id, so the alias needs an id of its own that no stock
-/// plugin uses: MPEG.
+/// Builds an HQ or LL entry; an entry without an owner is an alias profile.
 const fn codec(mode: slot::DefaultMode, owner: Option<slot::Slot>) -> media_codec {
     let (name, description) = match mode {
         slot::DefaultMode::Hq => (ids::CODEC_NAME, ids::CODEC_DESCRIPTION),
@@ -87,7 +76,6 @@ const fn codec(mode: slot::DefaultMode, owner: Option<slot::Slot>) -> media_code
         },
         name: name.as_ptr(),
         description: description.as_ptr(),
-        // Both modes keep this endpoint path, so BlueZ sees the same endpoint either way.
         endpoint_name: ids::CODEC_NAME.as_ptr(),
         info: ptr::null(),
         send_buf_size: ids::SEND_BUF_SIZE,
@@ -149,9 +137,7 @@ static CODECS_LL_LC3PLUS_HR: CodecList = SyncStatic([
     ptr::null(),
 ]);
 
-/// The mode a stream created through `codec` starts in, or `None` for the HQ entry that owns
-/// the endpoint, which follows the device's `bluez5.a2dp.aptx-adaptive.mode` setting. Every
-/// other entry starts in the mode its name and label say.
+/// Returns the fixed start mode for profile entries; the owning HQ entry follows the device setting.
 fn entry_profile(codec: *const media_codec) -> Option<aptx_adaptive::Profile> {
     let is =
         |list: &[&SyncStatic<media_codec>]| list.iter().any(|c| ptr::eq(codec, &raw const c.0));
@@ -164,9 +150,7 @@ fn entry_profile(codec: *const media_codec) -> Option<aptx_adaptive::Profile> {
     }
 }
 
-/// The codec list for `APTX_ADAPTIVE_SLOT` and `APTX_ADAPTIVE_DEFAULT_MODE`, read when the
-/// loader instantiates us. The default mode's entry owns the endpoint, so it's what a fresh
-/// connection gets. Bad values are logged once per library load.
+/// Selects the codec list from the environment, logging invalid values once per library load.
 fn codecs() -> *const *const media_codec {
     static BAD_ENV_LOGGED: Once = Once::new();
     let var = |k: &str| std::env::var_os(k);
@@ -256,9 +240,7 @@ unsafe extern "C" fn codec_select_config(
     }
 }
 
-/// Appends `data` to `b` like `spa_pod_builder_raw`: on overflow the offset and frame sizes
-/// still advance (so callers can see how much space was needed) and `-ENOSPC` is returned
-/// unless the overflow callback grew the buffer.
+/// Appends raw data, returning `-ENOSPC` on overflow unless the callback grows the buffer.
 ///
 /// # Safety
 /// `b` must be a valid, initialised builder.
@@ -376,8 +358,6 @@ unsafe extern "C" fn codec_validate_config(
     }
 }
 
-/// Looks `key` up in a settings dict.
-///
 /// # Safety
 /// `dict` must be null or a valid `spa_dict` whose strings are NUL-terminated.
 unsafe fn dict_lookup<'a>(dict: *const spa_dict, key: &str) -> Option<&'a str> {
@@ -409,9 +389,7 @@ unsafe fn shared_props<'a>(props: *mut c_void) -> Option<&'a Props> {
     unsafe { props.cast::<Props>().as_ref() }
 }
 
-/// The HQ entry that owns the endpoint starts in the mode from the device setting. Every other
-/// entry ignores it and starts in its own mode: picking that profile is the user's choice, and
-/// its label must match what runs.
+/// Applies the device mode only to the HQ entry that owns the endpoint.
 unsafe extern "C" fn codec_init_props(
     codec: *const media_codec,
     _flags: u32,
@@ -486,9 +464,7 @@ unsafe extern "C" fn codec_set_props(props: *mut c_void, param: *const spa_pod) 
     c_int::from(props.set(pod))
 }
 
-/// Runs on the data thread between packets: no allocation, no locks, no logging. A refused
-/// request is counted by the session (and shows in the drift line), and Props then reports
-/// the profile actually running.
+/// Runs on the data thread between packets without allocation, locking, or logging.
 unsafe extern "C" fn codec_update_props(data: *mut c_void, props: *mut c_void) -> c_int {
     // SAFETY: PipeWire passes the pointers from init and init_props.
     let (Some(props), false) = (unsafe { shared_props(props) }, data.is_null()) else {
@@ -527,8 +503,7 @@ unsafe extern "C" fn codec_init(
         };
         let level = caps::check_stream(config, &stream).map_err(caps_err)?;
         let var = |k: &str| std::env::var_os(k);
-        // stderr lands in the journal of whichever service loaded us. Write errors are ignored
-        // so nothing can panic here.
+        // Write errors are ignored so logging cannot panic here.
         let opts = dev::Options::from_env(var).map_err(|e| {
             let _ = writeln!(std::io::stderr(), "aptx-adaptive: {e}");
             -EINVAL
@@ -596,16 +571,13 @@ unsafe extern "C" fn codec_abr_process(data: *mut c_void, unsent: usize) -> c_in
     0
 }
 
-/// `media-sink.c` calls this when a send hits `EAGAIN`, at most every ½ s, and only logs the result.
-/// One level down from the next packet (§7L); returns the level that will run, or `-ENOTSUP`
-/// for a replay session (the convention of SBC, LDAC and aptX in PipeWire).
+/// Reduces one level for the next packet (§7L); replay sessions return `-ENOTSUP`.
 unsafe extern "C" fn codec_reduce_bitpool(data: *mut c_void) -> c_int {
     // SAFETY: PipeWire passes the pointer from init.
     unsafe { step_level(data, true) }
 }
 
-/// Called after a send with an empty socket queue, at most every 1 s since the last change. One
-/// level up, otherwise as [`codec_reduce_bitpool`].
+/// Increases one level after a send with an empty socket queue, otherwise as [`codec_reduce_bitpool`].
 unsafe extern "C" fn codec_increase_bitpool(data: *mut c_void) -> c_int {
     // SAFETY: PipeWire passes the pointer from init.
     unsafe { step_level(data, false) }

@@ -1,6 +1,4 @@
-//! Raw PCM to packets against the reference vectors, with no reference allocations or frame
-//! sizes: `tests/vectors/r2` through the wrapper loop of its README, and the stage vectors'
-//! `packets.bin` with one encode call per packet (`codec-core.md` §8.7).
+//! Raw PCM packet checks against `tests/vectors/r2` and stage `packets.bin` (§8.7).
 
 use std::fs;
 use std::path::PathBuf;
@@ -34,7 +32,7 @@ fn first_difference(what: &str, len: usize, got: &[u8], want: &[u8]) {
     assert_eq!(got.len(), want.len(), "{what}: length");
 }
 
-/// The README's packet loop: 672-frame blocks, flush when due, deficit and set-bitrate.
+/// Runs the README packet loop: 672-frame blocks, flush, deficit and set-bitrate.
 /// Returns the packets and whether each was forced.
 fn wrapper_loop(
     enc: &mut Encoder,
@@ -113,7 +111,7 @@ fn r2_vectors_r2_from_pcm() {
     }
 }
 
-/// One encode call per packet with all remaining input; no flush, no set-bitrate.
+/// Checks one encode call per packet with all remaining input.
 fn check_stage(name: &str, config: Config, bitrate: u32) {
     check_stage_with(name, Encoder::new(config, bitrate).unwrap());
 }
@@ -154,7 +152,6 @@ const fn cfg(profile: Profile, level: DecoderLevel, sample_rate: u32) -> Config 
     }
 }
 
-/// One line of `tests/vectors/parity/runs.txt`.
 struct Run {
     name: String,
     /// Create profile 1: config 1 through the test-only constructor.
@@ -198,8 +195,7 @@ fn parity_runs() -> Vec<Run> {
         .collect()
 }
 
-/// The parity README's loop, which is the r2 loop with the period in interleaved samples
-/// (§10.A) and, in LL, the deficit zeroed after every packet (§10.C).
+/// Parity loop with period in interleaved samples (§10.A) and LL deficit reset (§10.C).
 fn parity_loop(enc: &mut Encoder, run: &Run, pcm: &[i32]) -> (Vec<u8>, Vec<bool>) {
     let period = i64::from(run.period_ms) * i64::from(run.config.sample_rate) * 2 / 1000;
     let len = run.len;
@@ -232,7 +228,7 @@ fn parity_loop(enc: &mut Encoder, run: &Run, pcm: &[i32]) -> (Vec<u8>, Vec<bool>
     (packets, forced)
 }
 
-/// Every run in `tests/vectors/parity`, from raw PCM with its stated chunk size and loop.
+/// Checks every parity run from raw PCM using its stated chunk size and loop.
 #[test]
 fn parity_vectors() {
     let dir = vectors("parity");
@@ -355,7 +351,6 @@ fn check_stream_ll(name: &str, level: DecoderLevel, rate: u32, chunk_frames: usi
     let mut got = Vec::new();
     for chunk in pcm.chunks(chunk_frames * 2) {
         if let Some(n) = s.push(chunk, &mut out).unwrap() {
-            // The stream swaps for air; the vectors are as the encoder wrote them.
             let mut p = [0u8; 348];
             crate::frame::swap16(&out[..n], &mut p);
             got.extend_from_slice(&p);
@@ -372,18 +367,14 @@ fn stream_ll_matches_parity() {
     check_stream_ll("c4_44k_i1_L3", DecoderLevel::R2, 44_100, 44);
 }
 
-/// `tests/vectors/levels/`: mid-stream level changes (§7L) through [`crate::Stream`], R1 HQ
-/// index 0 from level 3. `k:L` asks for L between packets k−1 and k, so the request is made
-/// before the push that emits packet k−1. Checks the packets byte for byte and every `.sizes`
-/// line: bytes, forced, level, P and the deficit after the packet.
+/// Checks mid-stream level changes (§7L), packets and `.sizes` fields: bytes, forced, level, P,
+/// and post-packet deficit. `k:L` requests L between packets k−1 and k.
 fn check_levels(name: &str, rate: u32, chunk_frames: usize, map_1: bool, schedule: &[(usize, u8)]) {
     check_levels_with(name, rate, chunk_frames, map_1, schedule, false);
     check_levels_with(name, rate, chunk_frames, map_1, schedule, true);
 }
 
-/// With `now`, each request is made right after packet k−1 comes out and applied at once with
-/// [`crate::Stream::apply_level_now`], as the plugin does between packets: the output must be
-/// the same.
+/// With `now`, requests are applied after packet k−1 using [`crate::Stream::apply_level_now`].
 fn check_levels_with(
     name: &str,
     rate: u32,
@@ -410,7 +401,6 @@ fn check_levels_with(
         if !now && let Some(&(_, level)) = schedule.iter().find(|(k, _)| *k == n + 1) {
             assert!(s.request_level(level), "{name}: request {level}");
         }
-        // The level and P this packet is made with.
         let (level, p) = (s.level(), s.samples_per_packet());
         if let Some(len) = s.push(chunk, &mut out).unwrap() {
             let mut packet = [0u8; 656];
@@ -426,7 +416,6 @@ fn check_levels_with(
     let name = &format!("{name}{}", if now { " (applied now)" } else { "" });
     first_difference(name, 656, &got, &want);
     let want_sizes: Vec<&str> = want_sizes.lines().collect();
-    // Every packet here is forced (the vectors say so); the loop doesn't report it.
     assert!(want_sizes.iter().all(|l| l.split(' ').nth(2) == Some("1")));
     assert_eq!(sizes, want_sizes, "{name}: sizes");
 }

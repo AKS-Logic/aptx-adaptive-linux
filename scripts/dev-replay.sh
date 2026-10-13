@@ -38,7 +38,6 @@ dropin=$config_home/systemd/user/wireplumber.service.d/aptx-adaptive-dev-replay.
 	exit 1
 }
 
-# install-plugin.sh removes any old replay drop-in; ours is written after it.
 CARGO_FEATURES=dev-replay "$repo/scripts/install-plugin.sh" >/dev/null
 
 mkdir -p "$(dirname "$dropin")"

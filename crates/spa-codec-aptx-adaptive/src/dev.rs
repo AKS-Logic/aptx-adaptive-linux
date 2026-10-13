@@ -1,4 +1,4 @@
-//! Dev-only switches, read from the environment of the process that loads the plugin.
+//! Development switches read from the plugin host process environment.
 //!
 //! - `APTX_ADAPTIVE_REPLAY=/path/to/file.bin`, only with the `dev-replay` feature: ignore PCM and
 //!   send the file's raw codec packets (e.g. `tests/vectors/r2/sine1k.r1.bin`, or packets
@@ -21,9 +21,7 @@ pub const REPLAY_VAR: &str = "APTX_ADAPTIVE_REPLAY";
 pub const SCMST_VAR: &str = "APTX_ADAPTIVE_SCMST";
 pub const SCMST_BYTE_VAR: &str = "APTX_ADAPTIVE_SCMST_BYTE";
 
-/// The A2DP content protection header for SCMS-T: bit 0 is the L-bit, bit 1 the Cp-bit (Bluetooth
-/// Assigned Numbers, A/V content protection, note 3). Cp = 1, L = 0 is "copy freely", what
-/// Android sends when it doesn't restrict copying.
+/// SCMS-T copy-free header (Bluetooth Assigned Numbers, A/V content protection, note 3).
 pub const SCMST_COPY_FREE: u8 = 0x02;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,8 +93,7 @@ impl Options {
     }
 }
 
-/// Sends pre-encoded packets instead of encoding. Consumes PCM like the reference in steady
-/// state (one period's worth, then waits for the flush), so the packet loop's timing is real.
+/// Sends pre-encoded packets while preserving the reference's steady-state timing.
 #[derive(Debug)]
 pub struct Replay {
     packets: Vec<u8>,
@@ -200,7 +197,6 @@ impl Core for AnyCore {
             Self::Replay(_) => Ok(()),
         }
     }
-    /// The replay file holds one profile's packets, so it can't reset to another.
     fn reset(&mut self, config: aptx_adaptive::Config, row: &aptx_adaptive::Row) -> CoreResult<()> {
         match self {
             Self::Encoder(c) => Core::reset(c, config, row),

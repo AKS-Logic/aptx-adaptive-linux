@@ -1,4 +1,4 @@
-//! One encoding stream: RTP framing around an [`aptx_adaptive::Stream`]. Safe Rust, no FFI.
+//! RTP framing around an [`aptx_adaptive::Stream`].
 //!
 //! On air (spec §7D, §7F, §7H): a 12-byte RTP header, `80 60` (V=2, PT 96), PipeWire's
 //! sequence number, timestamp = samples per channel in the packet (TTP adjust 0 in the high
@@ -28,7 +28,7 @@ const RTP_PAYLOAD_TYPE: u8 = 96;
 
 const BYTES_PER_SAMPLE: usize = 4;
 
-/// The raised-cosine fades (spec §7I, §7K): 4800 frames whatever the rate.
+/// Raised-cosine fades (spec §7I, §7K): 4800 frames at every rate.
 const FADE_FRAMES: u32 = 4800;
 
 /// Gain for frame `j` of a fade-in: 0.5·(1 − cos(π·(j+1)/4801)) (§7I). A fade-out reads the
@@ -48,15 +48,14 @@ fn silence_frames(rate: u32) -> u32 {
     900 * rate / 1000
 }
 
-/// Where in the silence the encoder is reset (§7K: about 200 blocks of 1 ms in), in frames.
+/// Reset point in the silence (§7K), in frames.
 fn reset_frames(rate: u32) -> u32 {
     200 * rate / 1000
 }
 
-/// Where the input gain is, frame by frame (§7I start of stream, §7K HQ↔LL switch).
+/// Input gain state (§7I, §7K).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fade {
-    /// Full level.
     Steady,
     /// Start of stream: frames muted so far, then a fade-in.
     StartMute(u32),
@@ -64,7 +63,6 @@ enum Fade {
     Out(u32),
     /// Switch: silent frames so far. The encoder is reset in here.
     Silence(u32),
-    /// The next frame of the fade-in.
     In(u32),
 }
 
@@ -103,7 +101,7 @@ pub struct EncodeResult {
 
 pub struct Session<C> {
     stream: Stream<C>,
-    /// DEV ONLY: an SCMS-T content protection byte between the RTP header and the payload.
+    /// SCMS-T content protection byte between the RTP header and payload.
     scmst: Option<u8>,
     /// What's left of the MTU after the SCMS-T byte.
     mtu: usize,
@@ -126,7 +124,6 @@ pub struct Session<C> {
     /// Whether `reduce_bitpool` / `increase_bitpool` change the level. Off for replay, whose
     /// packets are what they are.
     abr: bool,
-    /// The level and row bitrate last logged (or started with).
     logged: (Profile, (u8, u32)),
 }
 
@@ -223,10 +220,8 @@ impl Session<AnyCore> {
             mtu,
         )?;
         if opts.replay.is_some() {
-            // Whole packets per block, as before, and no switching.
             s.pcm = vec![0; s.stream.samples_per_packet()];
             s.rows[Profile::Ll.index()] = None;
-            // The replayed packets are what they are.
             s.fade = Fade::Steady;
             s.abr = false;
         }
@@ -252,7 +247,6 @@ impl<C: Core> Session<C> {
         let c = stream.config();
         let mut rows = Profile::ALL.map(|p| link_row(c.level, p, mtu));
         rows[c.profile.index()] = Some(stream.row());
-        // Every period a level change can reach too, in either profile.
         let block = Profile::ALL
             .iter()
             .zip(rows)
@@ -445,7 +439,6 @@ impl<C: Core> Session<C> {
         if now == self.logged.1 {
             return;
         }
-        // Unit tests write nothing: this goes straight to fd 2, past the test harness.
         if !cfg!(test) && self.logged.0 == self.profile() {
             let _ = std::io::stderr().write(level_line(self.logged.1, now).as_bytes());
         }

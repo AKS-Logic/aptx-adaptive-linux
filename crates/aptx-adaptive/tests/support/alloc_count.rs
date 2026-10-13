@@ -1,7 +1,5 @@
-//! Test support: a global allocator that counts allocations, reallocations and frees made by
-//! the current thread while [`count`] runs, so tests running in parallel don't interfere.
-//! Used by `tests/no_alloc.rs` here and, through `#[path]`, by the plugin's unit tests. It
-//! lives outside `src/` so the encoder library stays `forbid(unsafe_code)`.
+//! Thread-local allocation counting for integration and plugin tests, outside `src/` to keep
+//! the encoder library under `forbid(unsafe_code)`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -14,7 +12,7 @@ thread_local! {
 struct Counting;
 
 fn note() {
-    // `try_with`: thread-local storage may be gone while a thread exits.
+    // Thread-local storage may be gone while a thread exits.
     if ARMED.try_with(Cell::get).unwrap_or(false) {
         let _ = CALLS.try_with(|c| c.set(c.get() + 1));
     }

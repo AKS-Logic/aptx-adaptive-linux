@@ -1,4 +1,4 @@
-//! Loads the built cdylib and walks it the way PipeWire's `codec-loader.c` does.
+//! Loads the cdylib through PipeWire's codec-loader interface.
 
 #[expect(
     dead_code,
@@ -38,13 +38,11 @@ const BLOCK_SIZE: c_int = 96 * 2 * 4;
 
 type EnumFn = unsafe extern "C" fn(*mut *const spa_handle_factory, *mut u32) -> c_int;
 
-/// Builds the cdylib once per test run. `cargo test` doesn't build cdylib targets for
-/// integration tests, so do it here rather than relying on a prior `cargo build`.
+/// Builds and locates the cdylib once per test run.
 fn plugin_path() -> &'static PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        // Match the profile of this test binary, since the .so is loaded from beside it.
         let mut build = Command::new(cargo);
         build.args(["build", "-p", env!("CARGO_PKG_NAME")]);
         if !cfg!(debug_assertions) {
@@ -62,9 +60,7 @@ fn plugin_path() -> &'static PathBuf {
     })
 }
 
-/// The two entries, in the plugin's order: the one that owns the endpoint first, then the
-/// alias. Tests other than the env ones run with `APTX_ADAPTIVE_DEFAULT_MODE` unset, so `codec`
-/// is the HQ owner and `ll` the LL alias.
+/// The two entries in plugin order: endpoint owner, then alias.
 struct Loaded {
     _lib: libloading::Library,
     _handle: Vec<u64>,
@@ -187,15 +183,13 @@ fn init_with_props(
     }
 }
 
-/// Checks both entries against `APTX_ADAPTIVE_SLOT` and `APTX_ADAPTIVE_DEFAULT_MODE`. The
-/// default mode's entry owns the endpoint; the other is the alias.
+/// Checks both entries against the configured slot and default mode.
 #[test]
 fn codec_metadata() {
     let l = load();
     let owner = l.codec;
     let want = match std::env::var("APTX_ADAPTIVE_SLOT").as_deref() {
         Ok("lc3plus_hr") => SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR,
-        // Unset, and anything unknown, falls back to the LDAC slot.
         _ => SPA_BLUETOOTH_AUDIO_CODEC_LDAC,
     };
     assert_eq!(owner.id, want);
@@ -296,8 +290,7 @@ const SLOT_CHILD_VAR: &str = "APTX_ADAPTIVE_TEST_SLOT_CHILD";
 /// exits 0, so it can't pass by accident.
 const SLOT_CHILD_OK: i32 = 42;
 
-/// Runs test `name` in a child with `env` and expects it to pass. The slot and default mode
-/// are read from the environment at factory init, and tests can't safely set them in-process.
+/// Runs test `name` in a child with `env` and expects it to pass.
 fn run_child(name: &str, env: &[(&str, &str)]) {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args(["--exact", name, "--test-threads=1"])
@@ -615,8 +608,7 @@ fn init_props(c: &media_codec, mode: Option<&CStr>) -> *mut c_void {
     p
 }
 
-/// `spa_pod_builder_add_object(b, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props, SPA_PROP_quality,
-/// SPA_POD_Int(v))`.
+/// Encodes a `SPA_PROP_quality` integer Props pod.
 fn quality_props(v: i32) -> [u32; 10] {
     [
         32,
@@ -694,8 +686,7 @@ fn props_are_ldac_style() {
     unsafe { c.clear_props.unwrap()(props) };
 }
 
-/// One packet's RTP fields and size, driving the codec like `media-sink.c`: `update_props`
-/// (if the props changed) then `start_encode`, then blocks until a flush.
+/// Produces one packet, updating props first when they changed.
 ///
 /// # Safety
 /// `data` and `props` must come from `init` and `init_props`.

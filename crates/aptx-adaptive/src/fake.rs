@@ -1,4 +1,4 @@
-//! A stand-in codec core for testing the packet loop until the real one exists.
+//! A stand-in codec core for testing the packet loop.
 
 use std::collections::HashMap;
 

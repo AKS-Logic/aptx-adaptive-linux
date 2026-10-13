@@ -117,7 +117,6 @@ pub fn table_row_at_level(config: Config, budget: usize, level: u8) -> Result<Ro
 
 impl<C: Core> Stream<C> {
     pub fn with_core(mut core: C, config: Config, row: Row) -> Self {
-        // A core that can't prepare fails on its first packet instead, with the same error.
         let _ = core.prepare(&row);
         let pcm = Vec::with_capacity(PCM_CAPACITY);
         let samples_per_packet =
@@ -156,9 +155,7 @@ impl<C: Core> Stream<C> {
             row.interleaved_samples(config.sample_rate, config.channels.into());
         self.consumed = 0;
         self.deficit = 0;
-        // The budget is the link's, so it stays; it only has to hold the new row.
         self.budget = self.budget.max(row.packet_bytes);
-        // §7K: a switch resets the level to 3; a request that waited for it is dropped.
         self.level = DEFAULT_QUALITY;
         self.pending = None;
         self.bitrate = row.bitrate;
@@ -444,7 +441,6 @@ mod tests {
                     })
                     .collect();
                 let mut s = px7();
-                // Assumes unforced packets came out at exactly one period of input; only the real encoder can confirm.
                 for (i, _) in want.iter().enumerate().filter(|(_, w)| !w.1) {
                     s.core.early.insert(i, 1344);
                 }
@@ -517,7 +513,6 @@ mod tests {
             most = most.max(s.pcm.len());
         }
         assert!(most < 2 * 960, "queue reached {most}");
-        // The queued input never outgrows its first allocation.
         assert_eq!(s.pcm.capacity(), capacity);
         assert!(
             packets <= fed / 960 && packets >= fed / chunk.len(),
@@ -545,7 +540,6 @@ mod tests {
             assert_eq!(s.deficit, 0);
             fed += block.len();
         }
-        // One packet per 960-sample period, give or take the last one in flight.
         assert!(
             packets <= fed / 960 && packets + 1 >= fed / 960,
             "{packets} packets for {fed}"
@@ -672,14 +666,12 @@ mod tests {
         assert_eq!(s.pending_level(), Some(2));
         assert!(s.request_level(4));
         assert!(s.request_level(2));
-        // Nothing changes before a packet.
         assert_eq!((s.level(), s.samples_per_packet()), (3, 1344));
         assert_eq!(packet(&mut s), (656, 3, 1344));
         assert_eq!(
             (s.level(), s.samples_per_packet(), s.pending_level()),
             (2, 1536, None)
         );
-        // Row bitrate, then the per-packet step on it.
         assert_eq!(s.core().bitrates, [318_000, 318_000]);
         assert_eq!(packet(&mut s), (656, 2, 1536));
         assert_eq!(s.core().bitrates, [318_000, 318_000, 318_000]);
@@ -698,7 +690,6 @@ mod tests {
         s.request_level(5);
         assert_eq!(packet(&mut s), (656, 4, 1152));
         assert_eq!((s.level(), s.samples_per_packet()), (5, 1152));
-        // Only the per-packet step.
         assert_eq!(s.core().bitrates.len(), calls + 1);
         // Against a ¾-reduced bitrate the same row isn't equal: it's set again.
         let mut s = px7();
@@ -720,9 +711,7 @@ mod tests {
         let mut out = [0; 656];
         s.push(&[0; 1344], &mut out).unwrap();
         assert_eq!((s.deficit, s.samples_per_packet()), (344, 1536));
-        // Row bitrate, then ¾ of it for the deficit.
         assert_eq!(s.core().bitrates, [318_000, 238_500]);
-        // Due at 1536 + 344.
         assert_eq!(s.push(&[0; 1535], &mut out).unwrap(), None);
         assert_eq!(s.push(&[0; 1], &mut out).unwrap(), Some(656));
         assert_eq!(s.deficit, 0);
@@ -797,7 +786,6 @@ mod tests {
             };
             let config = Config { level, ..PX7 };
             for name in ["silence", "sine1k", "noise"] {
-                // The vectors use the index-0 row (364 kbps, 14 ms) for both levels.
                 let row = table_row(PX7, 887).unwrap();
                 let core = Encoder::new(config, row.bitrate).unwrap();
                 let mut s = Stream::with_core(core, config, row);

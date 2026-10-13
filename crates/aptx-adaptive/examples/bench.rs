@@ -1,5 +1,4 @@
-//! Encoder speed against real time: `cargo run --release -p aptx-adaptive --example bench`.
-//! Encodes 60 s of 48 kHz stereo noise per config through the per-packet loop.
+//! Measures encoder speed against real time: `cargo run --release -p aptx-adaptive --example bench`.
 
 use std::time::Instant;
 

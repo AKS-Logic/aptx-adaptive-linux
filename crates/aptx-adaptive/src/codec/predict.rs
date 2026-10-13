@@ -4,7 +4,6 @@
 
 use super::arith::{cr32, sat24, sext24};
 
-/// Most zero taps of any band (`predictor_taps.json`).
 pub const MAX_TAPS: usize = 24;
 
 #[derive(Debug, Clone, Copy)]

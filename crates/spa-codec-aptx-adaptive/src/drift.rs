@@ -1,16 +1,6 @@
-//! Clock drift instrumentation.
-//!
-//! With source type 2 the sink advances its time-to-play purely by the sample count in each
-//! packet (spec §7F). If the host audio clock that paces our encoding runs faster or slower than
-//! the sink's, the sink's buffered latency creeps until it leaves its window and resets, an
-//! audible glitch. This module measures how fast audio is sent against `CLOCK_MONOTONIC`
-//! ([`Instant`] on Linux) and the socket backlog PipeWire reports through `abr_process`, and logs
-//! a line to stderr every [`REPORT_INTERVAL`] (in release builds too, for diagnosing stutter;
-//! `APTX_ADAPTIVE_DRIFT_LOG=0` silences it). The sink's Delay Report isn't visible to a
-//! `media_codec` (only `media-sink.c` sees the transport), so it isn't used.
-//!
-//! It's only a diagnostic. The sink corrects drift itself, so a source sends a TTP adjust of 0
-//! (§7G, §7H).
+//! Measures packet pacing against `CLOCK_MONOTONIC` and logs socket backlog periodically.
+//! With source type 2, sink timing follows packet sample count (spec §7F); the sink corrects
+//! drift, so a source sends TTP adjust 0 (§7G, §7H).
 
 use std::fmt::{self, Write as _};
 use std::io::Write as _;
@@ -50,17 +40,14 @@ impl Backlog {
 /// One [`REPORT_INTERVAL`]'s summary.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Report {
-    /// Host audio clock against `CLOCK_MONOTONIC`, `None` in the first (settling) interval.
+    /// Host audio clock drift against `CLOCK_MONOTONIC`; absent in the settling interval.
     pub ppm: Option<f64>,
-    /// Audio sent ahead of `CLOCK_MONOTONIC` since the first interval, in ms.
+    /// Audio sent ahead of `CLOCK_MONOTONIC`, in ms.
     pub drift_ms: Option<f64>,
-    /// min/avg/max of `abr_process(unsent)`, in bytes. Which quantity this is depends on
-    /// `media-sink.c`: with TX timestamping it's payload sent but not yet completed by the
-    /// controller; without, it's `TIOCOUTQ`, socket memory in use (kernel `skb` accounting, so
-    /// larger than the payload). The plugin can't tell which, hence "PipeWire unsent".
+    /// Min/avg/max `abr_process(unsent)` in bytes; the plugin cannot distinguish payload outstanding
+    /// from socket memory (`TIOCOUTQ`), hence "PipeWire unsent".
     pub backlog: (usize, usize, usize),
-    /// HQ/LL switch requests refused since the stream started (logged when non-zero; the
-    /// data thread doesn't log them itself).
+    /// HQ/LL switch requests refused since the stream started.
     pub refused_switches: u32,
     /// The quality level running when the line is logged (§7L), if known.
     pub level: Option<u8>,
@@ -93,14 +80,9 @@ impl fmt::Display for Report {
 
 /// Measures the host audio clock and backlog.
 ///
-/// Fed from `abr_process`, which `media-sink.c` calls in `send_buffer` right before each
-/// `send()`, so the clock is read at the moment of each send (what a btmon capture measures).
-/// At each send, *ahead* = audio sent before this packet − time since the first send. The flush
-/// timer paces sends by the graph clock, plus wakeup jitter, so *ahead* is noisy by a few
-/// 100 µs; its minimum over an interval is steady to about one wakeup's jitter. The first
-/// interval's minimum is the baseline (absorbing start-up bursts); after that `drift_ms` = this
-/// interval's minimum − baseline and ppm = `drift_ms` / time since the first report. Positive =
-/// the host audio clock runs fast, i.e. we send more audio than real time.
+/// Measures packet pacing and backlog from `abr_process` calls immediately before each send.
+/// Interval minimum pacing error absorbs timer wakeup jitter; positive drift means the host
+/// audio clock runs fast.
 #[derive(Debug, Clone)]
 pub struct Drift {
     rate: u32,
@@ -198,8 +180,7 @@ impl Drift {
             r.level = Some(level);
             let mut line = LineBuf::new();
             let _ = writeln!(line, "{r}");
-            // One write(2), so the line can't interleave with other threads' output. Unbuffered
-            // stderr, no allocation; a short write loses the tail, which is fine for a log.
+            // One write(2) prevents interleaving; stderr is unbuffered and a short write may truncate the log.
             let _ = std::io::stderr().write(line.as_bytes());
         }
     }
@@ -237,7 +218,7 @@ impl fmt::Write for LineBuf {
 mod tests {
     use super::*;
 
-    /// Sends a 672-frame packet every `period` for `secs`, like media-sink's flush timer.
+    /// Sends a 672-frame packet every `period` for `secs`.
     fn run(d: &mut Drift, t0: Instant, period: Duration, secs: u64) -> Vec<Report> {
         let n = Duration::from_secs(secs).as_nanos() / period.as_nanos();
         (0..n)
@@ -259,8 +240,7 @@ mod tests {
         }
     }
 
-    /// The capture's case: the host sends audio 80 ppm faster than real time, so packets of
-    /// 14 ms of audio go out every 14 ms / 1.00008.
+    /// The host sends audio 80 ppm faster than real time.
     #[test]
     fn fast_host_clock_measures() {
         let period = Duration::from_nanos((14_000_000.0 / 1.000_08_f64).round() as u64);

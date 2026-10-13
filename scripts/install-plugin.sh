@@ -28,7 +28,6 @@ config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 user_plugin_dir=$HOME/.local/lib/spa-0.2
 dest=$user_plugin_dir/bluez5/libspa-codec-bluez5-lc3plus.so
 units=(wireplumber.service pipewire.service)
-# Left by scripts/dev-replay.sh.
 dev_dropin=$config_home/systemd/user/wireplumber.service.d/aptx-adaptive-dev-replay.conf
 
 daemon_reload() {
@@ -51,8 +50,7 @@ case ${1-} in
 		remove "$config_home/systemd/user/$unit.d/aptx-adaptive.conf"
 	done
 	remove "$dev_dropin"
-	# Only directories we may have created, and only if nothing else is in them.
-	dirs=()
+dirs=()
 	for unit in "${units[@]}"; do
 		dirs+=("$config_home/systemd/user/$unit.d")
 	done
@@ -90,7 +88,6 @@ hq | ll) ;;
 	;;
 esac
 
-# SPA_PLUGIN_DIR replaces the built-in search path, so the system dir must be right.
 if ! system_plugin_dir=$(pkg-config --variable=plugindir libspa-0.2) || [[ -z $system_plugin_dir ]]; then
 	echo "error: pkg-config can't find libspa-0.2's plugindir (install the libspa dev package)" >&2
 	exit 1
@@ -114,8 +111,6 @@ target_dir=$(cargo metadata --manifest-path "$repo/Cargo.toml" --format-version 
 install -Dm644 "$target_dir/release/libspa_codec_aptx_adaptive.so" "$dest"
 echo "installed $dest"
 
-# The bluez5 monitor, and so the codec loader, runs in wireplumber. pipewire gets the same
-# setting in case bluez5 is ever loaded there (e.g. a pipewire.conf.d bluez context).
 dropin_body="[Service]
 Environment=\"SPA_PLUGIN_DIR=$user_plugin_dir:$system_plugin_dir\"
 Environment=\"APTX_ADAPTIVE_SLOT=$slot\"
@@ -131,7 +126,6 @@ for unit in "${units[@]}"; do
 	echo "wrote $dropin"
 done
 
-# A normal install goes back to the encoder.
 if [[ -e $dev_dropin ]]; then
 	rm -f "$dev_dropin"
 	echo "removed dev replay drop-in $dev_dropin"
@@ -141,8 +135,6 @@ daemon_reload
 
 echo "restart to load it: systemctl --user restart wireplumber pipewire"
 echo
-# PipeWire names the best-ranked codec's profile plain a2dp-sink: in the ldac slot, the
-# default mode's entry.
 hq_profile=a2dp-sink-aptx_adaptive
 ll_profile=a2dp-sink-aptx_adaptive_ll
 if [[ $slot == ldac && $default_mode == hq ]]; then

@@ -1,4 +1,4 @@
-//! Non-uniform adaptive quantiser (spec `codec-core.md` §5).
+//! Non-uniform adaptive quantiser from `codec-core.md` §5.
 
 #![expect(clippy::many_single_char_names, reason = "names follow the spec")]
 

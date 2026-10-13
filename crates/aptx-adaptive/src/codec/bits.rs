@@ -5,7 +5,7 @@ use super::tables::Code;
 #[derive(Debug, Clone, Default)]
 pub struct BitWriter {
     bytes: Vec<u8>,
-    /// Bits used in the last byte, 0 when byte aligned.
+    /// Bits used in the last byte; zero when byte-aligned.
     used: u32,
 }
 
@@ -29,8 +29,7 @@ impl BitWriter {
     }
 
     /// # Panics
-    /// On a zero-length (invalid) code, which means the caller fed a symbol the table can't
-    /// code.
+    /// On a zero-length code unsupported by the table.
     pub fn code(&mut self, c: Code) {
         assert!(c.len > 0, "symbol has no Huffman code");
         self.put(c.code, u32::from(c.len));
@@ -74,7 +73,7 @@ impl BitWriter {
         self.bytes.capacity()
     }
 
-    /// The bytes so far, the last one zero-padded.
+    /// The bytes written so far, with the last byte zero-padded.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }

@@ -1,5 +1,4 @@
-//! Bit allocation (spec `codec-core.md` §8.2–§8.6): bit pool, ceilings, scale factors, bit
-//! need, water level and distribution.
+//! Bit allocation from `codec-core.md` §8.2–§8.6.
 
 use super::tables::{
     MAX_BITS_4BAND_320, MAX_BITS_4BAND_370, MAX_BITS_4BAND_MAX, MAX_BITS_8BAND_96K_420,
@@ -380,8 +379,7 @@ mod tests {
         assert_eq!(max_bits(CFG3_96K, 820_000, false), MAX_BITS_8BAND_96K_MAX);
     }
 
-    /// Config 4 has no allocation escapes, so it never allocates over 9 bits, even at the
-    /// highest rate and with one loud band that isn't tonal (§10.F). The 520 table gave 10.
+    /// Config 4 stays at 9 bits without allocation escapes, including a loud non-tonal band (§10.F).
     #[test]
     fn config_4_stays_at_9_bits() {
         let x: Vec<i32> = (0..64 * 16)

@@ -1,5 +1,4 @@
-//! Turns PCM into packets (spec `codec-core.md` §8.1): frame sizing from the padding and
-//! carry histories, per-packet rate check, and the allocator of §8.2–§8.6.
+//! Turns PCM into packets using `codec-core.md` §8.1–§8.8.
 //!
 //! Like the reference, it never drops frames or bounds the carry (§8.8). Packets too small for
 //! the bitrate show up as input left unconsumed; the caller picks the bitrate from the packet
@@ -57,7 +56,7 @@ pub struct Packetiser {
     /// Carried bytes the open packet started with, and blocks coded into it.
     carry_in: usize,
     packet_blocks: usize,
-    /// Every frame packed so far: allocation and codes.
+    /// Allocations and codes packed so far.
     #[cfg(test)]
     sent_frames: Vec<(Vec<u8>, Vec<i32>)>,
 }
@@ -379,8 +378,7 @@ mod tests {
         parses(cfg3_96k, 656, 340_000, 2880, &noise(48_000));
     }
 
-    /// Config 4 (§10.F) round trip: the decoder reads it without config 3's escapes, and every
-    /// frame's allocation and codes match what was packed, through sine, silence and noise.
+    /// Config 4 (§10.F) round trip, including allocations and codes.
     #[test]
     fn config_4_round_trip() {
         for sample_rate in [44_100, 48_000] {
@@ -416,8 +414,7 @@ mod tests {
         }
     }
 
-    /// §8.8: with packets far too small for the bitrate, nothing is dropped and the carry stays
-    /// small; the input the encoder can't code is left with the caller, whose backlog grows.
+    /// §8.8: undersized packets leave input unconsumed without dropping frames.
     #[test]
     fn small_packets_leave_input_unconsumed() {
         for len in [64, 128, 200] {
@@ -468,8 +465,7 @@ mod tests {
         assert!(ab[..3].iter().all(|(a, b)| a == b));
     }
 
-    /// Steady state allocates nothing: every buffer keeps its first capacity, even with packets
-    /// far too small for the bitrate.
+    /// Buffers retain their initial capacity, even with undersized packets.
     #[test]
     fn buffers_never_grow() {
         let cfg3 = Params {

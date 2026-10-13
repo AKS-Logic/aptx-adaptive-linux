@@ -1,4 +1,4 @@
-//! The core encoder (spec `codec-core.md`): filterbank, quantiser, predictor and packer.
+//! Core encoder from `codec-core.md`.
 
 pub mod alloc;
 mod analysis;
@@ -164,8 +164,7 @@ struct Channel {
     seed: i32,
 }
 
-/// Signal path state for both channels: everything before the packer. `Copy`, so a trial
-/// copy is a plain memcpy.
+/// Signal-path state for both channels before packing.
 #[derive(Debug, Clone, Copy)]
 pub struct Engine {
     params: Params,

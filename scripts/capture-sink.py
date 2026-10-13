@@ -42,7 +42,7 @@ def log(msg: str) -> None:
 class Capture:
     def __init__(self, bus: MessageBus):
         self.bus = bus
-        self.transports: dict[str, str] = {}  # transport path -> endpoint path
+        self.transports: dict[str, str] = {}
         self.fd: int | None = None
         self.fd_transport: str | None = None
         self.out = None

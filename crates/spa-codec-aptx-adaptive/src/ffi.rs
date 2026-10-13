@@ -1,7 +1,4 @@
-//! Hand-written mirrors of the SPA and PipeWire 1.6 bluez5 codec structs.
-//!
-//! `spa/plugins/bluez5/media-codecs.h` is private to PipeWire, so the layout is pinned with
-//! the assertions at the bottom (values taken from the 1.6.9 headers on `x86_64`).
+//! SPA and PipeWire 1.6 bluez5 codec struct mirrors, pinned to the 1.6.9 `x86_64` headers.
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -174,8 +171,7 @@ pub struct spa_audio_info_raw {
     pub position: [u32; SPA_AUDIO_MAX_CHANNELS],
 }
 
-/// `struct spa_audio_info`. Only the `raw` member of the C union is used; `_union_tail`
-/// pads to the size of the largest member.
+/// `struct spa_audio_info`, padded to the size of the largest C union member.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct spa_audio_info {
@@ -198,7 +194,7 @@ pub struct media_codec_audio_info {
     pub channels: u32,
 }
 
-/// Opaque to us: `struct spa_log`, `struct bap_codec_qos`, `struct bap_endpoint_qos`.
+/// Opaque PipeWire log and BAP `QoS` structs.
 pub type Opaque = c_void;
 
 #[repr(C)]

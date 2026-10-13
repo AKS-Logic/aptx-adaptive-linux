@@ -1,5 +1,4 @@
-//! Just enough SPA pod serialisation to build a raw-audio `EnumFormat` object and the codec
-//! property objects, and to read one `Int` property back.
+//! SPA pod serialisation for raw-audio formats and codec properties.
 
 use crate::ffi::{
     SPA_CHOICE_ENUM, SPA_FORMAT_AUDIO_CHANNELS, SPA_FORMAT_AUDIO_FORMAT, SPA_FORMAT_AUDIO_POSITION,
@@ -93,8 +92,7 @@ impl Writer {
     }
 }
 
-/// `PropInfo` for one `Int` property with enumerated values and labels, like
-/// `a2dp-codec-ldac.c` builds for "LDAC quality".
+/// `PropInfo` for an `Int` property with enumerated values and labels.
 #[must_use]
 pub fn enum_prop_info(
     id: u32,
@@ -180,8 +178,7 @@ pub fn props_int(pod: &[u8], key: u32) -> Option<i32> {
     None
 }
 
-/// Serialises `Format` object `id` with fixed format, rate, channel count and positions,
-/// the same shape `spa_format_audio_raw_build` produces.
+/// Serialises a fixed raw-audio `Format` object, matching `spa_format_audio_raw_build`.
 #[must_use]
 pub fn raw_audio_format(id: u32, f: &RawFormat) -> Vec<u8> {
     let mut w = Writer(Vec::with_capacity(192));
@@ -212,8 +209,7 @@ mod tests {
         SPA_PARAM_ENUM_FORMAT,
     };
 
-    /// Output of `spa_pod_builder_add` from the 1.6.9 headers for the same format,
-    /// `SPA_PARAM_EnumFormat` (3), dumped once with a throwaway C program.
+    /// `spa_pod_builder_add` output for `SPA_PARAM_EnumFormat` (3), from PipeWire 1.6.9.
     const REFERENCE: [u8; 168] = [
         0xa0, 0, 0, 0, 0x0f, 0, 0, 0, 0x03, 0, 0x04, 0, 0x03, 0, 0, 0, //
         0x01, 0, 0, 0, 0, 0, 0, 0, 0x04, 0, 0, 0, 0x03, 0, 0, 0, //
@@ -228,8 +224,7 @@ mod tests {
         0x03, 0, 0, 0, 0x04, 0, 0, 0,
     ];
 
-    /// `spa_pod_builder` output from the 1.6.9 headers (a throwaway C program in `.scratch/`)
-    /// for the LDAC-style `PropInfo` with current value 1, labels 0 "HQ", 1 "Low latency".
+    /// PipeWire 1.6.9 `spa_pod_builder` output for the `PropInfo` with value 1 and two labels.
     const PROP_INFO_LL: [u8; 216] = [
         0xd0, 0, 0, 0, 0x0f, 0, 0, 0, 0x01, 0, 0x04, 0, 0x01, 0, 0, 0, //
         0x01, 0, 0, 0, 0, 0, 0, 0, 0x04, 0, 0, 0, 0x03, 0, 0, 0, //

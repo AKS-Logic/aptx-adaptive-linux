@@ -1,8 +1,5 @@
-//! The codec property: HQ or low latency (spec §2 "Profile"), as `SPA_PROP_quality`, the way
-//! `a2dp-codec-ldac.c` exposes "LDAC quality". Safe Rust, no FFI.
-//!
-//! `set_props` and `enum_props` run on PipeWire's main thread, `update_props` on the data
-//! thread, so everything shared is an atomic: no locks, no allocation on the data thread.
+//! Exposes HQ or low-latency profile as `SPA_PROP_quality` (spec §2 "Profile").
+//! PipeWire callbacks share state between main and data threads through atomics.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -44,12 +41,9 @@ pub struct Props {
     initial: Profile,
     /// What the user asked for. Main thread writes, data thread reads.
     wanted: AtomicU8,
-    /// What Props reports: the profile running or being switched to. `set` writes the
-    /// request; the stream (data thread) corrects it at init and after each `update_props`
-    /// if it runs something else.
+    /// Profile reported as running or being switched to.
     running: AtomicU8,
-    /// Whether LL is offered: false once a stream finds it can't run it (a replay core, an MTU
-    /// too small). Data thread writes, main thread reads.
+    /// Whether the stream can offer LL. Data thread writes, main thread reads.
     ll_offered: AtomicBool,
 }
 
@@ -64,8 +58,7 @@ impl Props {
         }
     }
 
-    /// From the [`MODE_SETTING`] value, if set. Unknown values are HQ, like LDAC's unknown
-    /// quality falls back to its default; the message says why.
+    /// Parses the device setting, defaulting to HQ for unknown values.
     pub fn from_setting(mode: Option<&str>) -> (Self, Option<String>) {
         let (p, msg) = match mode.map(str::trim) {
             None | Some("hq") => (Profile::Hq, None),
@@ -115,10 +108,7 @@ impl Props {
         Ok((idx == 0).then_some(pod))
     }
 
-    /// Applies a `Props` pod, or resets to the device setting for `None`. Values other than
-    /// [`HQ`] and [`LL`] are ignored, and LL becomes HQ when it isn't offered: refused here,
-    /// on the main thread, so what Props reports is right straight away. Returns whether the
-    /// request changed, so media-sink calls `update_props`.
+    /// Applies a Props pod or resets to the device setting; returns whether the request changed.
     pub fn set(&self, param: Option<&[u8]>) -> bool {
         let want = match param {
             None => Some(self.initial),
@@ -191,7 +181,6 @@ mod tests {
         assert_eq!(p.wanted(), Profile::Hq);
         assert!(!p.set(Some(&quality(HQ))));
         assert!(!p.set(Some(&quality(7))));
-        // Another property only: unchanged.
         assert!(!p.set(Some(&pod::int_props(SPA_PARAM_PROPS, 0x1_000e, LL))));
         assert!(p.set(None));
         assert_eq!(p.wanted(), Profile::Ll);
@@ -203,13 +192,11 @@ mod tests {
         let (p, _) = Props::from_setting(None);
         assert!(p.set(Some(&quality(LL))));
         assert_eq!(p.running(), Profile::Ll);
-        // The stream couldn't: it says it runs HQ and can't offer LL.
         p.report(Profile::Hq, false);
         assert_eq!(
             p.enum_param(SPA_PARAM_PROPS, 0).unwrap().unwrap(),
             quality(HQ)
         );
-        // LL is no longer offered: not listed, and asking for it asks for HQ.
         let info = p.enum_param(SPA_PARAM_PROP_INFO, 0).unwrap().unwrap();
         let only_hq = pod::enum_prop_info(
             SPA_PARAM_PROP_INFO,

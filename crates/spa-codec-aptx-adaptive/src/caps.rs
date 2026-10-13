@@ -1,5 +1,4 @@
-//! A2DP capability negotiation (spec `a2dp-integration.md` §1). Offsets are from the start of
-//! the vendor header, the spec's "body".
+//! A2DP capability negotiation (spec `a2dp-integration.md` §1); offsets start at the vendor header.
 
 use aptx_adaptive::DecoderLevel;
 
@@ -20,8 +19,7 @@ const CHANNEL_MODES: usize = 7;
 const RATE_MASK: u8 = 0xF8;
 const RATE_48K: u8 = 0x10;
 
-/// Byte 6 bits 0..2 are independent flags (§7J). The sink times playback itself. A host encoder always sends this, never the sink's bits
-/// (§7E, §7J).
+/// Source type 2: the host times playback (§7E, §7J).
 pub const SOURCE_TYPE_HOST: u8 = 0x02;
 
 const CHANNEL_STEREO: u8 = 0x02;
@@ -31,20 +29,16 @@ const CHANNEL_MASK: u8 = 0x3F;
 const APTX_DATA: usize = 8;
 const EXT_VERSION: usize = 15;
 const FEATURES: usize = 16;
-/// End of the R2 extension block, including its end marker. For R1 sinks body 8 up to here is
-/// echoed (§7J).
+/// End of the R2 extension block, including its end marker; R1 body 8..26 is echoed (§7J).
 const R2_DATA_END: usize = 26;
 
-/// With source type 2 the sink takes its target latency from these bytes, and a 0 means a 0 ms
-/// target (§7G), so a 0 in the sink's caps is replaced: LL0 80 ms, LL1 100 ms (ms), HQ 200 ms,
-/// TWS 200 ms (2 ms units). Bytes 12..13 aren't read (§7H).
+/// Defaults for zero target latency bytes under source type 2 (§7G); bytes 12..13 aren't read (§7H).
 const TARGET_LATENCY_DEFAULTS: [(usize, u8); 4] = [(8, 0x50), (9, 0x64), (10, 0x64), (11, 0x64)];
 
-/// The public default TTP bytes (§1.4, §7J): LL0 80 ms, LL1 100 ms, HQ 200 ms; TWS isn't read.
+/// Public default TTP bytes (§1.4, §7J); TWS isn't read.
 const TTP_DEFAULTS: [u8; 6] = [0x50, 0x64, 0x64, 0x64, 0xff, 0xff];
 
-/// Our features word, the public R2.0 value (§1.2): no TWM, split TX/ACK or 2.2 codec, and no
-/// RSSI or ELL adjustment. In a configuration its low byte becomes ours & the sink's (§7J).
+/// Public R2.0 features word (§1.2); configuration low byte is ours & the sink's (§7J).
 const FEATURES_R2_0: u32 = 0x0F00_0000;
 const FEATURES_LOW_BYTE: u32 = 0xff;
 
@@ -65,8 +59,7 @@ const fn r2_data(features: u32) -> [u8; R2_DATA_END - APTX_DATA] {
     ]
 }
 
-/// With source type 2 the LL0 target latency (body 8, ms) is raised to at least 80 ms, to
-/// absorb host and link jitter (§7H).
+/// Minimum LL0 target latency in ms, to absorb host and link jitter (§7H).
 const LL0_MIN: u8 = 0x50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,8 +70,7 @@ pub enum CapsError {
     Unsupported,
 }
 
-/// A capability element or configuration, checked for vendor, codec and length. Bytes past
-/// [`CAPS_LEN`] are ignored.
+/// A checked capability element or configuration; bytes past [`CAPS_LEN`] are ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Caps<'a>(&'a [u8; CAPS_LEN]);
 
@@ -104,8 +96,7 @@ impl<'a> Caps<'a> {
         self.0[CHANNEL_MODES] & CHANNEL_MASK
     }
 
-    /// Decoder compatibility level (§1.3). Only the extension version byte decides it; on an
-    /// R1 sink the features word is really the end marker. R2.2 sinks stay on R2 at 48 kHz.
+    /// Decoder compatibility level (§1.3), determined by the extension version byte.
     #[must_use]
     pub fn decoder_level(self) -> DecoderLevel {
         if self.0[EXT_VERSION] == 1 {
@@ -136,10 +127,8 @@ fn element(len: usize, rate: u8, channel_mode: u8, aptx_data: &[u8]) -> Vec<u8> 
     c
 }
 
-/// Our source endpoint: 48 kHz with source type 2 (`0x12`, §7J), stereo or joint stereo, and
-/// the R1 layout. Not R2: whether a source advertises the extension isn't confirmed, and a
-/// sink that builds its configuration from our caps could copy extension byte 1, which
-/// [`validate_config`] would read as R2 and give an R1 decoder the config 3 bitstream.
+/// Advertises the R1 layout: copying extension byte 1 into a configuration would make
+/// [`validate_config`] select R2 and send an R1 decoder the config 3 bitstream (§7J).
 #[must_use]
 pub fn fill_caps() -> Vec<u8> {
     element(
@@ -150,15 +139,13 @@ pub fn fill_caps() -> Vec<u8> {
     )
 }
 
-/// Picks 48 kHz and one 2-channel mode, with source type [`SOURCE_TYPE_HOST`] in byte 6 (§7E,
-/// §7J); the sink's own bits are never sent. Then, per §7J:
+/// Selects 48 kHz and one 2-channel mode, with source type [`SOURCE_TYPE_HOST`] (§7E, §7J):
 /// - an R2 sink gets our own block ([`r2_data`]), with the features low byte set to ours & the
 ///   sink's;
 /// - an R1 sink gets its own body 8..25 back, except that a zero target latency byte gets a
 ///   default (§7G) and LL0 is raised to at least 80 ms (§7H), and 26..39 zeroed.
 ///
-/// The result is as long as `caps`, with any bytes past [`CAPS_LEN`] zeroed, because PipeWire
-/// only offers the codec when the lengths match.
+/// Output matches the `caps` length; bytes past [`CAPS_LEN`] are zeroed for PipeWire's length check.
 ///
 /// # Errors
 /// As for [`Caps::parse`], or `Unsupported` without 48 kHz and stereo or joint stereo.
