@@ -1,7 +1,8 @@
 //! PipeWire bluez5 media codec plugin for aptX Adaptive.
 //!
-//! Loaded in place of LC3plus HR (see `docs/adr/0001-architecture.md`). This file is only the
-//! C ABI glue; codec behaviour lives in `caps` and `session`.
+//! Loaded in place of LC3plus HR, with the codec id from `slot` (see `docs/adr/0001-architecture.md`
+//! and `0002-codec-autoselect.md`). This file is only the C ABI glue; codec behaviour lives in
+//! `caps` and `session`.
 
 mod caps;
 mod dev;
@@ -12,6 +13,7 @@ mod fixtures;
 mod ids;
 mod pod;
 mod session;
+mod slot;
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::io::Write as _;
@@ -20,12 +22,11 @@ use std::slice;
 
 use ffi::{
     A2DP_CODEC_VENDOR, A2DP_MAX_CAPS_SIZE, EINVAL, ENOENT, ENOSPC, ENOTSUP, MEDIA_CODEC_A2DP,
-    NEED_FLUSH_ALL, NEED_FLUSH_NO, SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR, SPA_MEDIA_SUBTYPE_RAW,
-    SPA_MEDIA_TYPE_AUDIO, SPA_VERSION_BLUEZ5_CODEC_MEDIA, SPA_VERSION_HANDLE,
-    SPA_VERSION_HANDLE_FACTORY, a2dp_vendor_codec_t, media_codec, media_codec_audio_info,
-    spa_audio_info, spa_audio_info_raw, spa_bluez5_codec_a2dp, spa_callbacks, spa_dict,
-    spa_dict_item, spa_handle, spa_handle_factory, spa_interface, spa_interface_info, spa_pod,
-    spa_pod_builder, spa_support,
+    NEED_FLUSH_ALL, NEED_FLUSH_NO, SPA_MEDIA_SUBTYPE_RAW, SPA_MEDIA_TYPE_AUDIO,
+    SPA_VERSION_BLUEZ5_CODEC_MEDIA, SPA_VERSION_HANDLE, SPA_VERSION_HANDLE_FACTORY,
+    a2dp_vendor_codec_t, media_codec, media_codec_audio_info, spa_audio_info, spa_audio_info_raw,
+    spa_bluez5_codec_a2dp, spa_callbacks, spa_dict, spa_dict_item, spa_handle, spa_handle_factory,
+    spa_interface, spa_interface_info, spa_pod, spa_pod_builder, spa_support,
 };
 use session::{Session, SessionError};
 
@@ -48,8 +49,9 @@ fn set_errno(e: c_int) {
     unsafe { *__errno_location() = e };
 }
 
-static CODEC: SyncStatic<media_codec> = SyncStatic(media_codec {
-    id: SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR,
+/// The codec; `id` is filled in per slot below (see `slot`).
+const CODEC: media_codec = media_codec {
+    id: 0,
     kind: MEDIA_CODEC_A2DP,
     codec_id: A2DP_CODEC_VENDOR,
     vendor: a2dp_vendor_codec_t {
@@ -91,9 +93,32 @@ static CODEC: SyncStatic<media_codec> = SyncStatic(media_codec {
     increase_bitpool: None,
     set_log: None,
     get_delay: Some(codec_get_delay),
-});
+};
 
-static CODECS: SyncStatic<[*const media_codec; 2]> = SyncStatic([&raw const CODEC.0, ptr::null()]);
+static CODEC_LDAC: SyncStatic<media_codec> = SyncStatic(media_codec {
+    id: slot::Slot::Ldac.id(),
+    ..CODEC
+});
+static CODEC_LC3PLUS_HR: SyncStatic<media_codec> = SyncStatic(media_codec {
+    id: slot::Slot::Lc3plusHr.id(),
+    ..CODEC
+});
+static CODECS_LDAC: SyncStatic<[*const media_codec; 2]> =
+    SyncStatic([&raw const CODEC_LDAC.0, ptr::null()]);
+static CODECS_LC3PLUS_HR: SyncStatic<[*const media_codec; 2]> =
+    SyncStatic([&raw const CODEC_LC3PLUS_HR.0, ptr::null()]);
+
+/// The codec list for the slot in `APTX_ADAPTIVE_SLOT`, read when the loader instantiates us.
+fn codecs() -> *const *const media_codec {
+    let slot = slot::Slot::from_env(|k| std::env::var_os(k)).unwrap_or_else(|e| {
+        let _ = writeln!(std::io::stderr(), "aptx-adaptive: {e}");
+        slot::Slot::DEFAULT
+    });
+    match slot {
+        slot::Slot::Ldac => CODECS_LDAC.0.as_ptr(),
+        slot::Slot::Lc3plusHr => CODECS_LC3PLUS_HR.0.as_ptr(),
+    }
+}
 
 fn caps_err(e: caps::CapsError) -> c_int {
     match e {
@@ -489,7 +514,7 @@ unsafe extern "C" fn factory_init(
                     data: this.cast(),
                 },
             },
-            codecs: CODECS.0.as_ptr(),
+            codecs: codecs(),
         });
     }
     0

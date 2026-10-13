@@ -97,7 +97,8 @@ journalctl --user -u wireplumber -b --no-pager | grep aptx-adaptive | tail -n 5
 # (b) switch the Px7 to aptX Adaptive
 card=\$(pactl list cards short | awk '/bluez_card\./ {print \$2; exit}'); echo "\$card"
 pactl list cards | grep -A40 "Name: \$card" | grep a2dp-sink
-pactl set-card-profile "\$card" a2dp-sink-aptx_adaptive
+# a2dp-sink-aptx_adaptive in the lc3plus_hr slot; in the default ldac slot it is a2dp-sink
+pactl set-card-profile "\$card" a2dp-sink-aptx_adaptive || pactl set-card-profile "\$card" a2dp-sink
 
 # (c) play. With replay the plugin ignores the PCM, so silence keeps the stream running and you
 #     should hear a steady 1 kHz tone. With --no-replay, play real audio instead of /dev/zero.
@@ -106,12 +107,10 @@ sink=\$(pactl list sinks short | awk '/bluez_output\./ {print \$2; exit}'); echo
 pw-play --target "\$sink" --raw --format s32 --rate 48000 --channels 2 - </dev/zero
 journalctl --user -u wireplumber -u pipewire -b --no-pager --since -2min | grep -i 'bluez\|a2dp\|aptx' | tail -n 30
 
-# (d) undo everything
-rm -f "$dropin"
-rm -f "$config_home/systemd/user/wireplumber.service.d/aptx-adaptive.conf" "$config_home/systemd/user/pipewire.service.d/aptx-adaptive.conf"
-rm -f "$HOME/.local/lib/spa-0.2/bluez5/libspa-codec-bluez5-lc3plus.so"
-systemctl --user daemon-reload
+# (d) undo everything (plugin, drop-ins and this dev-replay drop-in)
+"$repo/scripts/install-plugin.sh" --uninstall
 systemctl --user restart wireplumber pipewire pipewire-pulse
+# after the undo the stock order is back, so a2dp-sink is aptX HD again
 pactl set-card-profile "\$(pactl list cards short | awk '/bluez_card\./ {print \$2; exit}')" a2dp-sink
 
 # To try another framing, vector or switch, re-run e.g.

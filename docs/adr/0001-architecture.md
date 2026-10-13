@@ -40,11 +40,12 @@ Per spec §7D and §7F:
 
 ## PipeWire integration without patching PipeWire
 
-PipeWire 1.6 loads codec plugins from a fixed list of filenames and only offers codecs whose `id` is in `enum spa_bluetooth_audio_codec`. Neither has aptX Adaptive, so the plugin takes over the LC3plus HR slot:
+PipeWire 1.6 loads codec plugins from a fixed list of filenames and only offers codecs whose `id` is in `enum spa_bluetooth_audio_codec`. Neither has aptX Adaptive, so the plugin takes over the LC3plus HR plugin file and borrows an existing codec id:
 
-- built as `libspa-codec-bluez5-lc3plus.so`, factory `api.codec.bluez5.media.lc3plus`, `id = SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR`, `name = "aptx_adaptive"`, description "aptX Adaptive". It shadows a real LC3plus plugin if one is installed.
+- built as `libspa-codec-bluez5-lc3plus.so`, factory `api.codec.bluez5.media.lc3plus`, `name = "aptx_adaptive"`, description "aptX Adaptive". It shadows a real LC3plus plugin if one is installed.
+- `id` is `SPA_BLUETOOTH_AUDIO_CODEC_LDAC` by default, or `SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR` with `APTX_ADAPTIVE_SLOT=lc3plus_hr` (set by `scripts/install-plugin.sh` in the drop-ins). See ADR 0002.
 - installed to `~/.local/lib/spa-0.2/bluez5/`. Systemd user drop-ins set `SPA_PLUGIN_DIR=~/.local/lib/spa-0.2:<system plugindir>` for `wireplumber.service` (where the codec loader runs) and `pipewire.service`. The variable replaces the default path, so the system dir must be in it.
-- **ranking limitation:** `codec_order` in `codec-loader.c` ranks `LC3PLUS_HR` below aptX HD, aptX and AAC, so aptX Adaptive never wins automatic selection. The user picks the profile by hand, or sets a `bluez5.codecs` list without the codecs ranked above it. On connect, the higher-ranked codec is set up first, so switching costs a codec-change chime.
+- **ranking:** `codec_order` in `codec-loader.c` decides which codec BlueZ configures on connect. In the default LDAC slot aptX Adaptive ranks above aptX HD, aptX and AAC, so it's configured directly and is the plain `a2dp-sink` profile. In the `lc3plus_hr` slot it ranks below them and never wins automatic selection: the higher-ranked codec is set up first, and switching to aptX Adaptive by hand costs a codec-change chime. Headsets that also have LDAC should use the `lc3plus_hr` slot (ADR 0002).
 - if `monitor.bluez.properties` sets `bluez5.codecs`, it must include `"aptx_adaptive"`.
 
 Later: send PipeWire a patch that adds a proper codec ID and loader entry, then drop the hijack.

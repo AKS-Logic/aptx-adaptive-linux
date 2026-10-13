@@ -301,3 +301,10 @@ Resolved by `codec-core.md` §10 (2026-10-13): config 4 (§10.F; "from codec-cor
 - Limitation: PipeWire's `validate_config` and `init` only get the configuration bytes, not the remote endpoint's caps, so the decoder level can only come from the config's extension byte (body 15). A sink-initiated config that wrongly carries 1 there would get R2. With R1 caps advertised this shouldn't happen. Is there a rule for a sink-chosen config that disagrees with the sink's own caps?
 - Question: §7J says a source always sends its own source type, but a sink-initiated stream (the sink sends SetConfiguration to our endpoint) could carry 0. `validate_config` accepts it and we stream with the host (type 2) RTP rules anyway, since we can't produce link-clock timestamps. Should it be rejected instead, or is accepting right?
 - Question: the features word above byte 0. We send 0x0F in byte 3 like every public word; is that right for a source, and should bytes 1..2 (RSSI / ELL adjust) be zero?
+
+## codec switch chime on connect: aptX Adaptive configured first (2026-10-13, clean side)
+
+- BlueZ, not PipeWire or WirePlumber, picks the first codec: it tries PipeWire's endpoints in registration order, which is `codec_order`. A WirePlumber rule can't change it. Details in `docs/adr/0002-codec-autoselect.md`.
+- The plugin now claims the LDAC codec id by default, ranked above aptX HD, so a device with aptX Adaptive gets it straight away. `APTX_ADAPTIVE_SLOT=lc3plus_hr scripts/install-plugin.sh` restores the old order.
+- In the LDAC slot, aptX Adaptive is the plain `a2dp-sink` profile and aptX HD is `a2dp-sink-aptx_hd`. The "restore `a2dp-sink` after live tests" rule above now means aptX Adaptive; restore `a2dp-sink-aptx_hd` (or reinstall in the `lc3plus_hr` slot) to get aptX HD.
+- To check on the headset: btmon on connect should show exactly one AVDTP Set Configuration, to the aptX Adaptive SEID (9 on the Px7, vendor codec 0x00ad), and no Close of SEID 7 before it. Only the normal connect chime.

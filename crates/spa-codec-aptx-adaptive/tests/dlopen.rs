@@ -20,10 +20,10 @@ use std::sync::OnceLock;
 use ffi::{
     A2DP_CODEC_VENDOR, A2DP_MAX_CAPS_SIZE, EINVAL, ENOTSUP, MEDIA_CODEC_A2DP, SPA_AUDIO_CHANNEL_FL,
     SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_FORMAT_S24_32_LE, SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR,
-    SPA_MEDIA_SUBTYPE_RAW, SPA_MEDIA_TYPE_AUDIO, SPA_PARAM_ENUM_FORMAT, SPA_TYPE_OBJECT,
-    SPA_VERSION_BLUEZ5_CODEC_MEDIA, SPA_VERSION_HANDLE_FACTORY, media_codec,
-    media_codec_audio_info, spa_audio_info, spa_bluez5_codec_a2dp, spa_handle, spa_handle_factory,
-    spa_pod, spa_pod_builder,
+    SPA_BLUETOOTH_AUDIO_CODEC_LDAC, SPA_MEDIA_SUBTYPE_RAW, SPA_MEDIA_TYPE_AUDIO,
+    SPA_PARAM_ENUM_FORMAT, SPA_TYPE_OBJECT, SPA_VERSION_BLUEZ5_CODEC_MEDIA,
+    SPA_VERSION_HANDLE_FACTORY, media_codec, media_codec_audio_info, spa_audio_info,
+    spa_bluez5_codec_a2dp, spa_handle, spa_handle_factory, spa_pod, spa_pod_builder,
 };
 use fixtures::{PX7_S2E, PX7_S2E_CONFIG};
 use ids::{CAPS_LEN, VENDOR_HEADER};
@@ -171,7 +171,12 @@ fn init(codec: &media_codec, config: &mut [u8], info: &spa_audio_info) -> *mut c
 fn codec_metadata() {
     let l = load();
     let c = l.codec;
-    assert_eq!(c.id, SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR);
+    let want = match std::env::var("APTX_ADAPTIVE_SLOT").as_deref() {
+        Ok("lc3plus_hr") => SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR,
+        // Unset, and anything unknown, falls back to the LDAC slot.
+        _ => SPA_BLUETOOTH_AUDIO_CODEC_LDAC,
+    };
+    assert_eq!(c.id, want);
     assert_eq!(c.kind, MEDIA_CODEC_A2DP);
     assert_eq!(c.codec_id, A2DP_CODEC_VENDOR);
     let (vid, cid) = (c.vendor.vendor_id, c.vendor.codec_id);
@@ -185,6 +190,25 @@ fn codec_metadata() {
     // A bigger socket buffer than media-sink's 4 × MTU default, so a start-up stall doesn't drop packets.
     assert_eq!(c.send_buf_size, ids::SEND_BUF_SIZE);
     assert!(c.abr_process.is_some());
+}
+
+/// Re-runs `codec_metadata` in a child with each `APTX_ADAPTIVE_SLOT`, since the slot is read
+/// from the environment at factory init and tests can't safely set it in-process.
+#[test]
+fn slot_follows_env() {
+    for slot in ["ldac", "lc3plus_hr", "bogus"] {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "codec_metadata", "--test-threads=1"])
+            .env("APTX_ADAPTIVE_SLOT", slot)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "slot {slot}: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
