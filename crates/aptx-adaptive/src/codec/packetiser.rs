@@ -57,6 +57,9 @@ pub struct Packetiser {
     /// Carried bytes the open packet started with, and blocks coded into it.
     carry_in: usize,
     packet_blocks: usize,
+    /// Every frame packed so far: allocation and codes.
+    #[cfg(test)]
+    sent_frames: Vec<(Vec<u8>, Vec<i32>)>,
 }
 
 impl Packetiser {
@@ -80,6 +83,8 @@ impl Packetiser {
             rate: Rate::new(bitrate),
             carry_in: 0,
             packet_blocks: 0,
+            #[cfg(test)]
+            sent_frames: Vec::new(),
         }
     }
 
@@ -167,6 +172,8 @@ impl Packetiser {
             self.packer.begin();
         }
         self.packer.push_frame(bits, &self.codes);
+        #[cfg(test)]
+        self.sent_frames.push((bits.to_vec(), self.codes.clone()));
         self.frame.clear();
         self.packet_blocks += blocks;
         if first && let Some(pad) = self.pending_pad.take() {
@@ -343,6 +350,43 @@ mod tests {
             sample_rate: 96_000,
         };
         parses(cfg3_96k, 656, 340_000, 2880, &noise(48_000));
+    }
+
+    /// Config 4 (§10.F) round trip: the decoder reads it without config 3's escapes, and every
+    /// frame's allocation and codes match what was packed, through sine, silence and noise.
+    #[test]
+    fn config_4_round_trip() {
+        for sample_rate in [44_100, 48_000] {
+            let cfg4 = Params {
+                variant: Variant::Cfg4,
+                sample_rate,
+            };
+            let rate = f64::from(sample_rate);
+            let mut pcm = sine(12_000, rate);
+            pcm.extend(vec![0; 12_000]);
+            pcm.extend(noise(12_000));
+            for (len, bitrate) in [(348, 270_000), (560, 320_000)] {
+                parses(cfg4, len, bitrate, 960, &pcm);
+            }
+
+            let mut p = Packetiser::new(cfg4, 348, 270_000);
+            let packets = run(&mut p, 960, &pcm);
+            let frames = decode(cfg4, &packets, 348);
+            let sent = &p.sent_frames;
+            assert!(frames.len() > 10 && frames.len() <= sent.len());
+            // No digital black on config 4, so even silence keeps band 0 of each channel.
+            assert!(sent.iter().all(|(b, _)| b[0] >= 2 && b[8] >= 2));
+            for (f, (bits, codes)) in frames.iter().zip(sent) {
+                assert_eq!(&f.bits, bits);
+                let w = cfg4.width();
+                let want: Vec<i32> = codes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &q)| crate::codec::decode::coded(q, bits[i % w]))
+                    .collect();
+                assert_eq!(f.codes, want[..f.codes.len()]);
+            }
+        }
     }
 
     /// §8.8: with packets far too small for the bitrate, nothing is dropped and the carry stays
