@@ -313,6 +313,64 @@ mod tests {
         assert_eq!(r1_48k.variant, Variant::Cfg0);
     }
 
+    /// Config 4 has no allocation escapes, so it must never allocate over 9 bits, whatever
+    /// bitrate it's created or set to (§10.F). Loud noise with the rate check lifting the
+    /// target by 5/4, then packets that decode.
+    #[test]
+    fn config_4_survives_any_bitrate() {
+        use codec::decode::decode;
+        let config = Config {
+            profile: Profile::Ll,
+            level: DecoderLevel::R2,
+            ..STEREO_48K
+        };
+        // Loud noise, then a loud low tone over quiet noise: one hot band that isn't tonal
+        // enough to set the flag, the case that wanted 10 bits from the 520 table.
+        let mut s = 1u32;
+        let pcm: Vec<i32> = (0..96_000)
+            .map(|i| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let n = (s as i32) >> 8;
+                if i < 48_000 {
+                    n
+                } else {
+                    let t = f64::from(i / 2) / 48_000.0;
+                    let tone = 8_000_000.0 * (2.0 * std::f64::consts::PI * 700.0 * t).sin();
+                    tone as i32 + (n >> 8)
+                }
+            })
+            .collect();
+        for (create, set) in [
+            (600_000, None),
+            (u32::MAX, None),
+            (270_000, Some(600_000)),
+            (270_000, Some(u32::MAX)),
+        ] {
+            let mut enc = Encoder::new(config, create).unwrap();
+            let mut window = [0u8; 560 + WINDOW_SLACK];
+            let mut packets = Vec::new();
+            for chunk in pcm.chunks(960) {
+                let mut pos = 0;
+                loop {
+                    let p = enc.encode_packet(&chunk[pos..], &mut window).unwrap();
+                    pos += p.consumed;
+                    if p.written == 0 {
+                        break;
+                    }
+                    packets.extend_from_slice(&window[..560]);
+                }
+                enc.flush(&mut window).unwrap();
+                packets.extend_from_slice(&window[..560]);
+                if let Some(b) = set {
+                    enc.set_bitrate(b);
+                }
+            }
+            let frames = decode(params(config).unwrap(), &packets, 560);
+            assert!(frames.len() > 50, "{create} {set:?}");
+            assert!(frames.iter().all(|f| f.bits.iter().all(|&b| b <= 9)));
+        }
+    }
+
     /// §10.D / §7J: an R1 sink in LL gets config 0, an R2 sink config 4.
     #[test]
     fn ll_variants() {

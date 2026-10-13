@@ -38,6 +38,7 @@ fn write_absolute(w: &mut BitWriter, params: Params, bits: &[u8], blocks: usize)
                 }
             }
         } else {
+            debug_assert!(a <= 8 && b <= 8, "allocation over 9 bits without escapes");
             w.code(table[((a << 4) | b) as usize]);
         }
     }

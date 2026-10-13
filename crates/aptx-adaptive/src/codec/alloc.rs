@@ -55,7 +55,12 @@ fn max_bits(params: Params, r: u32, tonal: bool) -> &'static [u8] {
             ],
             &MAX_BITS_4BAND_MAX,
         ),
-        (_, false) if tonal && params.variant == Variant::Cfg4 => &MAX_BITS_8BAND_420,
+        // Config 4 has no allocation escapes, so it must stay at 9 bits or less. §10.F's
+        // tonal table is the 420 one, and its chain only reaches 420k past what a source sets
+        // (target ≤ 5/4 × 320k); stop the chain there too, so 336k+ can't pick the 520 table.
+        (_, false) if params.variant == Variant::Cfg4 && (tonal || r > 419_999) => {
+            &MAX_BITS_8BAND_420
+        }
         (_, false) if tonal => &MAX_BITS_8BAND_MAX,
         (_, true) if tonal => &MAX_BITS_8BAND_96K_MAX,
         (_, false) => pick(
@@ -262,7 +267,7 @@ pub fn allocate(params: Params, target: u32, nominal: u32, x: &[i32], out: &mut 
     let mut alloc = [0i32; MAX_WIDTH];
     let alloc = &mut alloc[..w];
     distribute(s, bits as i32, need, maxb, sl, alloc);
-    if params.escapes() {
+    if params.digital_black() {
         digital_black(sf, maxb, s, alternate, alloc);
     }
     for (b, &v) in out.iter_mut().zip(alloc.iter()) {
@@ -367,9 +372,26 @@ mod tests {
         assert_eq!(max_bits(CFG3, 420_000, false), MAX_BITS_8BAND_520);
         assert_eq!(max_bits(CFG3, 250_000, true), MAX_BITS_8BAND_MAX);
         assert_eq!(max_bits(CFG4, 250_000, true), MAX_BITS_8BAND_420);
-        assert_eq!(max_bits(CFG4, 420_000, false), MAX_BITS_8BAND_520);
+        assert_eq!(max_bits(CFG4, 419_999, false), MAX_BITS_8BAND_420);
+        assert_eq!(max_bits(CFG4, 420_000, false), MAX_BITS_8BAND_420);
+        assert_eq!(max_bits(CFG4, 400_000, false), MAX_BITS_8BAND_420);
+        assert_eq!(max_bits(CFG4, 369_999, false), MAX_BITS_8BAND_370);
         assert_eq!(max_bits(CFG3_96K, 420_000, false), MAX_BITS_8BAND_96K_500);
         assert_eq!(max_bits(CFG3_96K, 820_000, false), MAX_BITS_8BAND_96K_MAX);
+    }
+
+    /// Config 4 has no allocation escapes, so it never allocates over 9 bits, even at the
+    /// highest rate and with one loud band that isn't tonal (§10.F). The 520 table gave 10.
+    #[test]
+    fn config_4_stays_at_9_bits() {
+        let x: Vec<i32> = (0..64 * 16)
+            .map(|i| if i % 8 == 0 { 1 << 30 } else { 1 << 20 })
+            .collect();
+        for rate in [336_000, 420_000, 600_000, u32::MAX] {
+            let mut out = [0; 16];
+            allocate(CFG4, rate, rate, &x, &mut out);
+            assert!(out.iter().all(|&b| b <= 9), "{rate}: {out:?}");
+        }
     }
 
     #[test]

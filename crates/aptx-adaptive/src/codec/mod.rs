@@ -5,7 +5,7 @@ mod analysis;
 mod arith;
 mod bits;
 #[cfg(test)]
-mod decode;
+pub mod decode;
 pub mod pack;
 pub mod packetiser;
 mod predict;
@@ -49,8 +49,8 @@ struct Descriptor {
     low_power: bool,
     /// 128-tap filterbank prototype instead of 256 (8 bands only).
     short_proto: bool,
-    /// Config 3's allocation escapes, zero-allocation escape and digital-black step; config 4
-    /// codes allocations like configs 0/1 (§10.F).
+    /// Config 3's allocation escapes and zero-allocation escape; config 4 codes allocations
+    /// like configs 0/1 (§10.F).
     escapes: bool,
     /// Zero taps per band, 0 = predictor off (§6), at 44.1/48 and 88.2/96 kHz.
     taps: [&'static [usize]; 2],
@@ -116,9 +116,14 @@ impl Params {
         self.desc().low_power
     }
 
-    /// Config 3's allocation escapes and digital-black step (§7.2, §7.3, §8.6 step 5).
+    /// Config 3's allocation escapes and zero-allocation escape (§7.2, §7.3).
     pub fn escapes(self) -> bool {
         self.desc().escapes
+    }
+
+    /// The digital-black step (§8.6 step 5), config 3 only; not config 4 (§10.F).
+    pub fn digital_black(self) -> bool {
+        self.variant == Variant::Cfg3
     }
 
     fn high_rate(self) -> usize {
