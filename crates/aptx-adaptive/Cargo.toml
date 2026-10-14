@@ -10,3 +10,6 @@ workspace = true
 
 [features]
 fake = []
+
+[build-dependencies]
+sha2 = "0.11.1"
