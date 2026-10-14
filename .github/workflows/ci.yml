@@ -6,7 +6,23 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      APTX_ADAPTIVE_SO_URL: ${{ secrets.APTX_ADAPTIVE_SO_URL }}
+      # The build reads the codec tables from this file (spec/table-extraction.md).
+      APTX_ADAPTIVE_SO: ${{ github.workspace }}/.scratch/libaptXAdaptiveEnc.so
     steps:
+      - name: skip without the vendor library
+        if: env.APTX_ADAPTIVE_SO_URL == ''
+        run: echo "::notice title=check skipped::The APTX_ADAPTIVE_SO_URL secret isn't set (or isn't available to this run, e.g. a fork PR), so the vendor library can't be fetched and nothing was built or tested."
       - uses: actions/checkout@v5
+        if: env.APTX_ADAPTIVE_SO_URL != ''
+      - name: fetch the vendor library
+        if: env.APTX_ADAPTIVE_SO_URL != ''
+        run: |
+          mkdir -p .scratch
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$APTX_ADAPTIVE_SO" "$APTX_ADAPTIVE_SO_URL"
       - uses: jdx/mise-action@v3
+        if: env.APTX_ADAPTIVE_SO_URL != ''
       - run: mise run check
+        if: env.APTX_ADAPTIVE_SO_URL != ''
