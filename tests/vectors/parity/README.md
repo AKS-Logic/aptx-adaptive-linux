@@ -31,7 +31,7 @@ Create parameters common to every run: secondary profile 0, channel config 4 (st
 - **profile:** the create-parameter profile. The reference source sends **3** (HQ) for an R1 sink even in LL mode, and 6 only for LL with an R2 sink (`spec/codec-core.md` §10.D). Profile 1 is included to show the low-power config 1.
 - **rate, bitrate:** the create sample rate and bitrate. The same bitrate is the "table bitrate" of the packet loop.
 - **cfg / byte 1:** the config the encoder reports, and byte 1 of the first packet (frame type, plus 0x80 if that packet is padded).
-- **P:** the period in interleaved samples, `floor(rate · 2 · period_ms / 1000)` (`spec/codec-core.md` §10.A, `spec/tables/period_interleaved.json`). At 44.1 kHz P can be odd (1587, 1411, 1323, 1675).
+- **P:** the period in interleaved samples, `floor(rate · 2 · period_ms / 1000)` (`spec/codec-core.md` §10.A). At 44.1 kHz P can be odd (1587, 1411, 1323, 1675).
 - **Lp:** the packet size in bytes (the output window).
 - **chunk:** input frames per encode call. The output depends on the chunk size (see "chunk dependence" below), so it is part of the vector.
 - **ll:** 1 = the LL variant of the packet loop (step 5 below).

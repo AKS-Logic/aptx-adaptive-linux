@@ -12,10 +12,13 @@ Works on the Bowers & Wilkins Px7 S2e in HQ and LL at 48 kHz stereo, with stock 
 
 The codec is built from written specs only. The reverse engineering happens in a separate repo, `aptx-re-quarantine`, which is never read by anyone implementing here. What crosses over:
 
-- prose specs and numeric tables, copied into `spec/`
+- prose specs, copied into `spec/`
 - black-box test vectors (PCM in, bitstream out), copied into `tests/vectors/`
+- for the numeric tables, a locator spec rather than the values (`spec/table-extraction.md`): symbol names, layouts, transforms and a SHA-256 of each table
 
-Implementers must not open the quarantine repo, decompiled output or the vendor binaries, or run IDA. Ambiguities go in `spec/QUESTIONS.md`.
+The repo holds no table values. `crates/aptx-adaptive/build.rs` reads them at build time from the user's own copy of the vendor encoder library, `libaptXAdaptiveEnc.so`, named by `APTX_ADAPTIVE_SO`. It follows the spec mechanically (ELF symbols, fixed offsets, the hashes) and fails the build unless every table matches its hash. The build needs that file; without it nothing compiles. mise and `scripts/install-plugin.sh` default it to `.scratch/libaptXAdaptiveEnc.so`, and CI downloads it from the `APTX_ADAPTIVE_SO_URL` secret.
+
+Implementers must not open the quarantine repo, decompiled output or the vendor binaries, or run IDA. The build script is the only thing that reads the vendor library, and it is written from `spec/table-extraction.md` alone. Nobody inspects the file or prints the tables. Ambiguities go in `spec/QUESTIONS.md`.
 
 ## layout
 

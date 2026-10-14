@@ -12,7 +12,16 @@ Needs PipeWire 1.6.x. Design notes are in [docs/adr/](docs/adr/).
 
 ## install
 
-You need `mise` (it provides Rust, Python and uv: run `mise install`) and `pkg-config` with the libspa development headers.
+You need `mise` (it provides Rust, Python and uv: run `mise install`), `pkg-config` with the libspa development headers, and a copy of Qualcomm's aptX Adaptive encoder library, `libaptXAdaptiveEnc.so`. The repo doesn't include the codec's numeric tables; the build reads them from that file and refuses it unless every table matches the checksum in [spec/table-extraction.md](spec/table-extraction.md).
+
+To get it, from a Snapdragon phone with aptX Adaptive over `adb`:
+
+```sh
+mkdir -p .scratch
+adb pull /vendor/dsp/adsp/libaptXAdaptiveEnc.so .scratch/
+```
+
+Or take `adsp/libaptXAdaptiveEnc.so` out of the `dsp` partition image in the phone's full OTA (`payload.bin`). Only `libaptXAdaptiveEnc.so` works; `libaptXAdaptiveEnc3.so` and `…Enc4.so` don't. The build looks for `.scratch/libaptXAdaptiveEnc.so` in the repo by default; to keep it elsewhere, set `APTX_ADAPTIVE_SO` to its absolute path.
 
 ```sh
 mise install
@@ -200,4 +209,4 @@ This removes the plugin (under either file name), the WirePlumber script and its
 
 ## clean room
 
-The codec is written only from prose specs and black-box test vectors in `spec/` and `tests/vectors/`. Nobody working in this repo reads the vendor binaries or the reverse-engineering notes they came from. See [AGENTS.md](AGENTS.md).
+The codec is written only from prose specs and black-box test vectors in `spec/` and `tests/vectors/`. Nobody working in this repo reads the vendor binaries or the reverse-engineering notes they came from. The numeric tables aren't in the repo: the build extracts them from your copy of the vendor library, following [spec/table-extraction.md](spec/table-extraction.md). See [AGENTS.md](AGENTS.md) and [ADR 0001](docs/adr/0001-architecture.md).

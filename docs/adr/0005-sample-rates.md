@@ -34,7 +34,7 @@ Derive the high-rate table flag centrally from Config. R2 HQ at 96 kHz uses inde
 
 PCM block size stays fixed throughout a session. Compute the GCD of reachable packet periods in milliseconds, then convert that duration to whole PCM frames. This preserves existing 48 kHz blocks and gives 44-frame input at 44.1 kHz and 96-frame input at 96 kHz. Include every reachable bitrate level and mode when finding that GCD.
 
-Keep the coded packet period separately in exact interleaved samples from `period_interleaved.json`, including odd values. Never round that period to make a PCM block divide it. Stream already retains unconsumed input. PipeWire schedules from actual consumed block frames and the negotiated rate, so a 44-frame block is not treated as exactly one millisecond.
+Keep the coded packet period separately in exact interleaved samples, `floor(period_ms · rate · 2 / 1000)` (codec-core §10.A), including odd values. Never round that period to make a PCM block divide it. Stream already retains unconsumed input. PipeWire schedules from actual consumed block frames and the negotiated rate, so a 44-frame block is not treated as exactly one millisecond.
 
 The negotiated rate also drives mode resets, RTP sample counts, delay and drift. Retain the supplied nominal RTP rule `floor(Pi / channels)`, zero adjustment and mode SSRC. Fractional-rate timing questions go to the coordinator rather than an invented timestamp scheme. Replay must not return half-frame PCM blocks at an odd period.
 
