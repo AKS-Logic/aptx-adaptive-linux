@@ -22,13 +22,25 @@ The document contains no table values. Each table is described by a locator, a l
 |---|---|---|
 | `1ac881571cd1db4d256113d4448304016de73fedebc059824b1b2ed09599f0c9` | 271424 | OnePlus 15 (CPH2749) full OTA, build B.R4T3, SPL 2026-02, `dsp` partition, `adsp/libaptXAdaptiveEnc.so` |
 
+**Build identity.** The whole-file hash changes when non-loaded sections are stripped (`.symtab`, `.strtab`, `.comment`), but the code and data do not. A file **matches the known-good build identity** when, for each of the four sections below, there is a section header with that name, `sh_addr` and `sh_size`, and the SHA-256 of its `sh_size` bytes at `sh_offset` equals the hash listed. The values were computed on the known-good file, and are unchanged by `llvm-objcopy --strip-all`.
+
+| section | sh_addr | sh_size | SHA-256 of the section bytes |
+|---|---|---|---|
+| `.text` | 0x089A0 | 96548 | `bfa68d93528ec45041b56b4d008d6ea7e5441ddc97c7a436b33a7667da127788` |
+| `.rodata` | 0x20328 | 100980 | `7eff359c762a4c44282848de93047a032ad004a5202c08448ac40f6936dbff9d` |
+| `.data.rel.ro` | 0x390A0 | 572 | `a88ed7e1052559407036e7b66303d72607ec2f53d4e3d9ea5a2d36c16a475727` |
+| `.data` | 0x392E0 | 1920 | `6f75e1707084bc195bcdb98f80618ce5d847afd5cfb54cb5831c165590b9121e` |
+
+A file with the known-good whole-file hash always matches the build identity. A file without section headers can't be checked and does not match.
+
 **Not supported:** `libaptXAdaptiveEnc3.so` (R3) and `libaptXAdaptiveEnc4.so` (R4) have some of the same symbol names, but both lack several of the tables below: the 4-band filterbank, the predictor tap tables, the 44.1/48 kHz max-bits tables and the per-channel-config offset tables. Their allocator tables are also organised differently. Accept only `libaptXAdaptiveEnc.so`.
 
 **Build-script policy (recommended).**
 
 1. Check the ELF header fields above.
-2. If the file hash is in the known-good list, use every locator below as written.
-3. If the hash is unknown, still try. Every table except the two in §3.3 is found by `.dynsym` name, which is likely to survive a rebuild. Then require every table hash in §5 to match. An unknown build that passes all of them yields the same tables, so it is safe to use.
+2. Locate every table by symbol (§2, §3). This works on any build that still has the symbols.
+3. Per-build fallbacks — the `F_MOD` delta in §3.3 and the fixed offsets in §6 — may be used only when the file matches the known-good build identity (above). The whole-file hash is not required, so a stripped copy of the known-good build is accepted. If a fallback is needed and the identity doesn't match, reject the file: a `.symtab`-stripped copy of an unknown build is unsupported.
+4. Always require every table hash in §5 to match, whichever locators were used. An unknown build that passes all of them yields the same tables, so it is safe to use.
 
 ---
 
@@ -89,7 +101,7 @@ These constants are not stored as data. They are 32-bit immediates inside two fu
 Function anchors:
 
 - `F_DCT` = `CmfbPRPD_RunDCT2_N8`, in `.dynsym`, FUNC, st_size 424.
-- `F_MOD` = `CmfbPRPDAnalysisFilter_RunFastCosineModulation_EvenPolyPrototypeLen`, which is LOCAL and in `.symtab` only (st_size 448). If `.symtab` is missing, use `F_MOD = st_value(F_DCT) + 0x98C`. That delta holds for the known-good build only.
+- `F_MOD` = `CmfbPRPDAnalysisFilter_RunFastCosineModulation_EvenPolyPrototypeLen`, which is LOCAL and in `.symtab` only (st_size 448). If this symbol is not found (for example `.symtab` was stripped), and only if the file matches the known-good build identity (§1), use `F_MOD = st_value(F_DCT) + 0x98C`. If the symbol is missing and the identity doesn't match, reject the file.
 
 **`dct.c1` … `dct.c7`** (generated as `DCT`, `[i32; 7]`, ordered K1..K7). Each `c_k` is the decoded constant at `F_DCT + delta_k`, sign-extended from 32 bits (the JSON stores these as signed).
 
@@ -356,9 +368,9 @@ SHA-256 of the canonical form (§4). The dirty side computed every hash twice an
 
 ---
 
-## 6. Per-build locator table (known-good build `1ac88157…`)
+## 6. Per-build locator table (known-good build identity, §1)
 
-This is a fallback for a build script that wants a fixed offset when a symbol is missing, and a cross-check when it isn't. "vaddr = file offset" holds for this build (§2). Use it only when the file hash matches.
+This is a fallback for a build script that wants a fixed offset when a symbol is missing, and a cross-check when it isn't. Use it only when the file matches the known-good build identity (§1: section name, address, size and SHA-256 of `.text`, `.rodata`, `.data.rel.ro` and `.data`); the whole-file hash need not match. The vaddr column is authoritative: map it to a file offset through `PT_LOAD` (§2). In the known-good file, vaddr equals the file offset. The "offset in section" column is relative to that section's `sh_addr`, and holds for any file that matches the identity.
 
 | symbol | in | section | vaddr / file offset | offset in section | st_size |
 |---|---|---|---|---|---|
@@ -441,4 +453,4 @@ This is a fallback for a build script that wants a fixed offset when a symbol is
 
 ## 7. Proof
 
-The dirty side checked this with a throwaway extractor written only from this document: 77 / 77 table ids match on the known-good build, on a copy with `.symtab` stripped, and on a copy taken straight from the OTA `dsp` image.
+The dirty side checked this with a throwaway extractor written only from this document: 77 / 77 table ids match on the known-good build, on a copy with `.symtab` stripped (different whole-file hash, build identity matches, so the §3.3 `F_MOD` fallback was used), and on a copy taken straight from the OTA `dsp` image. A stripped copy with one `.text` byte flipped is rejected before extraction.
