@@ -1,6 +1,6 @@
 # Table extraction from the vendor encoder library
 
-Status: dirty-side handoff, 2026-10-15. This spec lets a build script read every numeric table in `spec/tables/*.json`, and every constant array `scripts/gen-tables.py` writes into `codec/tables.rs`, out of a copy of the vendor library that the user supplies.
+Status: dirty-side handoff, 2026-10-15. This spec lets a build script read every numeric table the codec needs out of a copy of the vendor library that the user supplies. Those tables used to be checked in as `spec/tables/*.json` and turned into `codec/tables.rs` by `scripts/gen-tables.py`. Both were removed once `crates/aptx-adaptive/build.rs` implemented this spec, so the repo now holds no table values.
 
 The document contains no table values. Each table is described by a locator, a layout, a transform and a SHA-256 of its canonical form (§4). The dirty side checked the spec with a throwaway extractor written only from this document. Every hash matched on the known-good build, and also on a copy with `.symtab` stripped (§6).
 
@@ -47,7 +47,7 @@ The document contains no table values. Each table is described by a locator, a l
 
 ## 3. Per-table locators, layouts and transforms
 
-The JSON key paths below are as in `spec/tables/<file>.json`. "Generated" names the constant `gen-tables.py` writes. "n" is the element count in the JSON. Where the binary holds fewer elements than the JSON, the transform says what to append.
+Each table is identified by the file and key path it had in the removed `spec/tables/<file>.json`; §5 hashes and the other specs use these ids, such as `quantiser.log_table`. "JSON" below means that historical layout. "Generated" names the Rust constant `build.rs` writes to `$OUT_DIR/tables.rs`. "n" is the element count in the canonical form. Where the binary holds fewer elements than n, the transform says what to append.
 
 ### 3.1 `filterbank_4band_tree.json`
 
@@ -137,7 +137,7 @@ Notes:
 
 - `logdelta_max_rule` is a prose string and isn't extracted.
 - Don't confuse these symbols with similarly named ones. `nu_dq<Bt>bit16sum`, `nu_dq<Bt>dith16_diff_rshift1`, `nu_dq4bit24`/`nu_dq5bit24`, `nu_q4incr24`/`nu_q5incr24` and `nMaxLDBuf9` are different tables and are not used.
-- Generated: `QUANT[Bt − 2] = { threshold, dither, incr }` with types `i32`/`i32`/`i16`, and `LOG_TABLE`. `logdelta_max` is not emitted; the code uses the formula.
+- Generated: `QUANT[Bt − 2] = { threshold, dither, incr }` with types `i32`/`i32`/`i16`, and `LOG_TABLE`. `logdelta_max` is not emitted; the code uses the formula. The build still extracts and verifies it, as a check on that formula.
 
 ### 3.5 `predictor_taps.json`
 
@@ -238,7 +238,7 @@ Do not use the similarly named `BitAllocOffset_96k_*`, `g_nMaxBitsCfg0_2_*`, `g_
 
 The wrapper computes this value; there is no table. Rule: for each rate in {44100, 48000, 96000} and each `period_ms` key, `periods[rate][period_ms] = floor(period_ms · rate · 2 / 1000)`, in exact integer arithmetic.
 
-The keys are every distinct period that appears in the HQ and LL mode tables (`a2dp-integration.md` §4.1 and §4.2, the same rows as `crates/aptx-adaptive/src/tables.rs`). Write each key as a decimal string and sort them ascending. `gen-tables.py` does not emit this file.
+The keys are every distinct period that appears in the HQ and LL mode tables (`a2dp-integration.md` §4.1 and §4.2, the same rows as `crates/aptx-adaptive/src/tables.rs`). Write each key as a decimal string and sort them ascending. The build neither emits nor verifies this table; the codec computes the period from the rule above (`codec-core.md` §10.A).
 
 ### 3.11 Non-numeric fields
 
@@ -271,7 +271,7 @@ Orders:
 
 ## 5. Hashes
 
-SHA-256 of the canonical form (§4). The dirty side computed every hash twice and got the same result both times: once from the current `aptx-linux/spec/tables/*.json` (main @ `1634c90`), and once from the known-good binary using only the locators above.
+SHA-256 of the canonical form (§4). The dirty side computed every hash twice and got the same result both times: once from the then-current `aptx-linux/spec/tables/*.json` (main @ `1634c90`, since removed), and once from the known-good binary using only the locators above.
 
 | table id | SHA-256 |
 |---|---|

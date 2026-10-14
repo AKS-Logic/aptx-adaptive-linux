@@ -4,7 +4,7 @@ Status: clean-side spec, 2026-10-12. Batch 5 corrections and the config 4 specif
 
 - **Verification:** every stage marked **[VERIFIED]** was modelled independently and compared bit for bit against the reference encoder, using intermediate values captured between stages.
 - **Test vectors:** `tests/vectors/stages/` (see its README).
-- **Tables:** `spec/tables/*.json`. Each file has a `note` field describing its format.
+- **Tables:** not in the repo. The build extracts them from the user's copy of the vendor library and checks each against a SHA-256 (`table-extraction.md`). This document names a table by its id there, such as `quantiser.log_table`; §3 of that spec gives each id's layout and the Rust constant it becomes.
 - **Companion spec:** `a2dp-integration.md` covers the wrapper, the A2DP config, packet timing, the 16-bit byte swap and the 8-byte header. This document starts where that one stops: PCM samples go into the encoder, raw packets come out.
 
 Notation and arithmetic conventions are in §0. Anything not confirmed by execution is marked **UNCERTAIN**.
@@ -38,7 +38,7 @@ The encoder supports four music configurations, numbered 0, 1, 3 and 4 (config 2
 | HQ (profile 0, 3 or 5) | R1 | 44.1/48k | **config 0** | 1 | 4-band tree QMF, 16 taps (§3.1) | 4 | 4 | normal (§6) |
 | LL (profile 1 always; profile 2/6 with R1; but see §10.D: the source never uses these for an R1 sink) | R1 | 44.1/48k | **config 1** | 2 | 4-band tree QMF, 12 taps | 4 | 4 | low-power (§6.3) |
 | HQ | R2 | 44.1/48k | **config 3** | 3 | 8-band cosine-modulated, 256-tap prototype (§3.2) | 8 | 8 | normal |
-| HQ | any | 88.2/96k | **config 3** | 3 | same as above | 8 | 8 | normal, some bands predictor off |
+| HQ | any | 88.2/96k | **config 3** | 3 | same as above | 8 | 8 | normal, some bands' predictor off |
 | LL (profile 2/6) | R2 | 44.1/48k | **config 4** | 4 | cosine-modulated, 128-tap prototype (§10.F) | 8 | 8 | normal |
 
 The companion spec establishes that the **Px7 S2e is an R1 sink**. That means:
@@ -89,7 +89,7 @@ The codes `q` of all blocks in the frame, plus the frame's allocation, are then 
 
 This is the same tree structure as aptX classic. Two-band stages are cascaded: one outer stage, then two inner stages.
 
-- **Coefficients:** `spec/tables/filterbank_4band_tree.json`. Config 0 uses `outer_16` and `inner_16` (n = 16 taps). Config 1 uses `outer_12` and `inner_12` (n = 12).
+- **Coefficients:** `filterbank_4band_tree.*`. Config 0 uses `outer_16` and `inner_16` (n = 16 taps). Config 1 uses `outer_12` and `inner_12` (n = 12).
 - **State:** each 2-band stage keeps two delay lines, A and B, each holding the last n samples. All state starts at zero.
 
 **A 2-band stage** takes two inputs (a, b):
@@ -112,7 +112,7 @@ This is the same tree structure as aptX classic. Two-band stages are cascaded: o
 
 ### 3.2 Eight-band cosine-modulated filterbank (config 3) [VERIFIED]
 
-- **Tables:** prototype `spec/tables/filterbank_8band_prototype_256.json` (256 int32 values `P[0..255]`). Modulation constants `spec/tables/filterbank_8band_modulation.json`.
+- **Tables:** prototype `filterbank_8band_prototype_256.coef` (256 int32 values `P[0..255]`). Modulation constants `filterbank_8band_modulation.frontend` and `.dct`.
 - **State:** the last 256 input samples of the channel, all zero at start.
 
 **Per block** (8 new samples per channel):
@@ -124,7 +124,7 @@ This is the same tree structure as aptX classic. Two-band stages are cascaded: o
 - `acc = −Σ_{k=0}^{15} P[i+16k] · h(i+16k)`. Accumulate in 64 bits with wraparound.
 - `u[i] = R64( lo64(acc · 64) )`.
 
-**3. Cosine-modulation front end.** There are four groups. Each group g has fields `(a, b, c, d, od, Kd, os, Ks)`; in the JSON these are `u_add = [a, b]`, `u_sub = [c, d]`, `diff_out = od`, `diff_const = Kd`, `sum_out = os`, `sum_const = Ks`. For each group:
+**3. Cosine-modulation front end.** There are four groups. Each group g has fields `(a, b, c, d, od, Kd, os, Ks)`; in `filterbank_8band_modulation.frontend[g]` these are `u_add = [a, b]`, `u_sub = [c, d]`, `diff_out = od`, `diff_const = Kd`, `sum_out = os`, `sum_const = Ks`. For each group:
 
 - `A = u[a] ⊕ u[b]`
 - `C = u[c] ⊖ u[d]`
@@ -137,17 +137,7 @@ The constants are **unsigned** 32-bit values: the product is the signed sample t
 
 **4. 8-point DCT.** Apply this to `o[0..7]`, in place.
 
-Define `M(v, K) = R64( lo64(2 · v · K) )`, with signed 32-bit constants (also in the JSON as `dct.c1..c7`):
-
-| constant | value |
-|---|---|
-| K1 | dct.c1 |
-| K2 | dct.c2 |
-| K3 | dct.c3 |
-| K4 | dct.c4 |
-| K5 | dct.c5 |
-| K6 | dct.c6 |
-| K7 | dct.c7 |
+Define `M(v, K) = R64( lo64(2 · v · K) )`. The constants K1..K7 are the signed 32-bit values `filterbank_8band_modulation.dct` c1..c7, in that order.
 
 With inputs x0..x7 = o[0..7]:
 
@@ -191,13 +181,13 @@ The difference is formed as `d = x ⊖ lo32(p · 256)`.
 
 ## 5. Non-uniform adaptive quantiser [VERIFIED]
 
-**Tables:** `spec/tables/quantiser.json`. For each table size Bt = 2..9 there are:
+**Tables:** for each table size Bt = 2..9 there are:
 
-- `T` (`threshold`): thresholds;
-- `Dt` (`dither`): dither;
-- `Inc` (`logdelta_incr`): log-delta increments.
+- `T` (`quantiser.tables.<Bt>.threshold`): thresholds;
+- `Dt` (`quantiser.tables.<Bt>.dither`): dither;
+- `Inc` (`quantiser.tables.<Bt>.logdelta_incr`): log-delta increments.
 
-All three have 2^(Bt−1)+2 entries. The JSON also holds `log_table` (32 entries).
+All three have 2^(Bt−1)+2 entries, the last a zero sentinel. Allocations above 9 bits use the Bt = 9 tables plus raw LSBs. There is also `quantiser.log_table` (32 entries).
 
 **State.**
 
@@ -307,11 +297,11 @@ These dither values apply to the **next** block.
 
 There is one predictor per band, per channel. It is a pole-zero (two poles, N zeros) adaptive predictor with sign-sign updates.
 
-**Zero (FIR) tap counts N** (`spec/tables/predictor_taps.json`):
+**Zero (FIR) tap counts N**, per band, the same for each channel:
 
-- configs 0 and 1: `predictor_taps.4band` per channel.
+- configs 0 and 1: `predictor_taps.4band`.
 - config 3 at 44.1/48k: `predictor_taps.8band_48k`.
-- config 3 at 88.2/96k: `predictor_taps.8band_96k`. The predictor for some bands is disabled: its output is 0 and its state is never touched.
+- config 3 at 88.2/96k: `predictor_taps.8band_96k`. A count of 0 disables that band's predictor: its output is 0 and its state is never touched.
 
 **State per band** (all at reset):
 
@@ -433,12 +423,12 @@ A decoder cannot read the block count of the last frame directly. It is implied 
 
 Observed headers: 0xA for configs 0 and 3 at 48 kHz stereo; 0xB for config 1.
 
-**Band pairs.** The bands are taken in pairs (band 2m, band 2m+1) over the ordered list ch0 bands, then ch1 bands. Tables are in `spec/tables/alloc_absolute_huffman.json` (`table_a`, `table_b`; the per-pair choice is in `pair_table_8band` / `pair_table_4band`).
+**Band pairs.** The bands are taken in pairs (band 2m, band 2m+1) over the ordered list ch0 bands, then ch1 bands. The tables are `alloc_absolute_huffman.table_a` (A) and `.table_b` (B). Which one codes pair m is entry m of `alloc_absolute_huffman.pair_table_8band` (8 subbands) or `.pair_table_4band` (4 subbands).
 
 **Configs 3 / 4.** For each pair m, with α = ρ(B[2m]) and β = ρ(B[2m+1]):
 
 1. Map each value to a nibble: the value itself if ≤ 7, otherwise 8.
-2. Symbol = `(nibble_α << 4) | nibble_β`. Write its Huffman code from table A or table B per `pair_table_8band`.
+2. Symbol = `(nibble_α << 4) | nibble_β`. Write its Huffman code from pair m's table.
 3. Escapes: for each of α, β in that order whose value is > 7, append `value − 8` in 3 bits. All escape bits of the pair come together after the code, α's first.
 
 After all pairs, if every B in the frame is 0, write `(frame_blocks − 1)` in 8 bits.
@@ -446,12 +436,12 @@ After all pairs, if every B in the frame is 0, write `(frame_blocks − 1)` in 8
 **Configs 0 / 1.** For each pair m:
 
 - Symbol = `(α << 4) | β`, with no escapes.
-- Tables alternate A, B, A, B for pairs 0..3 (ch0 bands 0/1, ch0 2/3, ch1 0/1, ch1 2/3).
+- Pairs 0..3 (ch0 bands 0/1, ch0 2/3, ch1 0/1, ch1 2/3) each use pair m's table.
 - There is no zero-allocation escape.
 
 ### 7.3 Differential allocation (later frames in the same packet)
 
-Tables: `spec/tables/alloc_diff_huffman.json`. Per band i, in list order:
+Tables: `alloc_diff_huffman.tables`, `.table_index` and `.range`. Per band i, in list order:
 
 - `v = ρ(B_new[i])`
 - `pv = ρ(B_prev[i])`, from the immediately preceding frame
@@ -472,7 +462,7 @@ After all bands, if every B is 0, write `(frame_blocks − 1)` in 8 bits.
 
 ### 7.4 Codewords
 
-Tables: `spec/tables/codeword_huffman.json`, with one entry per allocation 0..16.
+Tables: `codeword_huffman.entries`, one record per allocation 0..16, each naming one of `codeword_huffman.tables.T1`..`T4` (or none) with its `pair_shift`, `raw_lsbs` and `msb_mask`. Allocation 1 is never allocated; its record is used only by the configs 0 / 1 exception below.
 
 Blocks are taken in pairs (block 2n, block 2n+1) in time order; frames always have an even block count. For each pair, for each band i in list order with B[i] ≠ 0:
 
@@ -483,13 +473,7 @@ Blocks are taken in pairs (block 2n, block 2n+1) in time order; frames always ha
 5. Write the Huffman code for symbol `(h0 << pair_shift) | h1`.
 6. If `raw_lsbs > 0`, write the low raw_lsbs bits of q0, then the low raw_lsbs bits of q1.
 
-The parameters by allocation:
-
-| allocation | pair_shift | msb_mask | symbols | raw_lsbs |
-|---|---|---|---|---|
-| (see `codeword_huffman.entries`) |
-| (see `codeword_huffman.entries`) |
-| (see `codeword_huffman.entries`) |
+The parameters for each allocation are those of its `codeword_huffman.entries` record.
 
 ---
 
@@ -509,7 +493,7 @@ Only the `tests/vectors/` runs are available on the clean side; the other table 
 
 Input was fed in 48-, 672- and 1000-frame chunks. **Correction (§10.B):** the output does depend on chunking in general; a bit-exact test must use each vector's stated chunk size.
 
-**Tables:** `spec/tables/allocator.json`. It replaces the earlier informative `allocator_hints.json`; every value carried over is unchanged.
+**Tables:** the `allocator.int8.offset_*` and `allocator.int32.max_bits_*` tables (`table-extraction.md` §3.9).
 
 ### 8.0 Why packets end "64 + 64 + 40"
 
@@ -645,7 +629,7 @@ Examples: config 0 at 364 kbps / 48 kHz gives 30; config 1 at 265 kbps gives 22;
 
 ### 8.3 Max-bits table
 
-Let `r` be the clamped target R of §8.2 (not the nominal rate), or 2R for mono. The tables are the `max_bits_*` entries of `spec/tables/allocator.json`; each has 2·S entries, channel 0 bands then channel 1 bands. The result is the per-band ceiling `maxb[i]`.
+Let `r` be the clamped target R of §8.2 (not the nominal rate), or 2R for mono. The tables are `allocator.int32.max_bits_*`; each has 2·S entries, channel 0 bands then channel 1 bands. The result is the per-band ceiling `maxb[i]`.
 
 **S = 4 (configs 0 and 1):**
 
@@ -700,7 +684,7 @@ Everything here is per frame, over all of the frame's blocks. Band index i runs 
 
 **Offset table.** Let `rate_idx` be 0, 1, 2, 3 or 4 for fs ≤ 16000, ≤ 32000, ≤ 44100, ≤ 48000, or higher. The table depends on the create-parameter channel config (`a2dp-integration.md` §3.1). Normal stereo is channel config 4, and it uses the **dual-mono** tables.
 
-| S | channel config | table (`spec/tables/allocator.json`) | row start |
+| S | channel config | table (`allocator.int8.*`) | row start |
 |---|---|---|---|
 | 4 | 2 | `offset_4band_stereo` | 8·rate_idx |
 | 4 | anything else | `offset_4band_dual_mono` | 8·rate_idx |
@@ -708,7 +692,7 @@ Everything here is per frame, over all of the frame's blocks. Band index i runs 
 | 8 | anything else, tonal flag set | `offset_8band_dual_mono_tone` | 16·rate_idx |
 | 8 | anything else, tonal flag clear | `offset_8band_dual_mono` | 16·rate_idx |
 
-Let `off[i]` be the table entry at row start + i.
+Let `off[i]` be the table entry at row start + i. Each table holds a row only for the `rate_idx` values its size covers (`table-extraction.md` §3.9).
 
 **Bit need:**
 
@@ -837,7 +821,7 @@ Status: clean-side summary of a spec-side verification round, 2026-10-13. Where 
 
 **Rule.** Keep every counter of the packet loop in **interleaved** samples (both channels counted).
 
-- The period is `Pi = floor(period_ms · fs · 2 / 1000)`. The reference computes this in single-precision floating point; for every table row at 44.1, 48 and 96 kHz that gives the same value as exact integer arithmetic. The values are in `spec/tables/period_interleaved.json`.
+- The period is `Pi = floor(period_ms · fs · 2 / 1000)`. The reference computes this in single-precision floating point; for every table row at 44.1, 48 and 96 kHz that gives the same value as exact integer arithmetic.
 - At 44.1 kHz `Pi` can be **odd**: 18 ms → 1587, 16 ms → 1411, 15 ms → 1323, 19 ms → 1675. Others: 14 ms → 1234, 12 ms → 1058, 10 ms → 882.
 - A packet is due when `consumed ≥ Pi + deficit`. After the packet, `deficit = deficit + Pi − consumed`. `consumed` counts interleaved samples, so it is always even.
 - The set-bitrate rule's "deficit above 96" is in the same units.
@@ -915,7 +899,7 @@ Dropping either change breaks the 104k and 128k streams within a few packets. Th
 
 Everything not listed here is as for config 3 at 44.1/48 kHz.
 
-**1. Filterbank: 8-band, 128-tap prototype.** Use `spec/tables/filterbank_8band_prototype_128.json` (128 values `P128[0..127]`), now verified identical to the reference's table. The channel state holds the last 128 input samples. §3.2 step 2 becomes, for i = 0..15:
+**1. Filterbank: 8-band, 128-tap prototype.** Use `filterbank_8band_prototype_128.coef` (128 values `P128[0..127]`), now verified identical to the reference's table. The channel state holds the last 128 input samples. §3.2 step 2 becomes, for i = 0..15:
 
 - `acc = −Σ_{k=0}^{7} P128[i+16k] · h(i+16k)`, accumulated in 64 bits with wraparound;
 - `u[i] = R64( lo64(acc · 64) )`, as before.
@@ -924,7 +908,7 @@ Steps 3–6 (cosine-modulation front end, 8-point DCT, post-processing, output) 
 
 **2. Quantiser (§5).** Normal mode with dither, exactly as config 3. The dither shifts are `s_k = 2k`.
 
-**3. Predictor (§6).** Normal mode: both channels, all 8 bands run every block. Zero-tap counts `predictor_taps.8band_48k`, the same as config 3 at 44.1/48 kHz (`8band_48k` in `predictor_taps.json`).
+**3. Predictor (§6).** Normal mode: both channels, all 8 bands run every block. Zero-tap counts `predictor_taps.8band_48k`, the same as config 3 at 44.1/48 kHz.
 
 **4. Allocation (§8.2–§8.6).**
 
