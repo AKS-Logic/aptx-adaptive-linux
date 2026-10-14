@@ -75,7 +75,11 @@ pub fn table_row(config: Config, budget: usize) -> Result<Row> {
 /// As for [`table_row`], `UnsupportedConfig` for a level outside 1..=7, and
 /// `PacketTooSmall` for an LL row bigger than `budget`.
 pub fn table_row_at_level(config: Config, budget: usize, level: u8) -> Result<Row> {
-    let index = tables::index(config.profile, config.level, Link::default());
+    let link = Link {
+        rate_96k: config.sample_rate == 96_000,
+        ..Link::default()
+    };
+    let index = tables::index(config.profile, config.level, link);
     let row = tables::row(config.profile, index, level)
         .ok_or(Error::UnsupportedConfig)?
         .fit(config.profile, budget);

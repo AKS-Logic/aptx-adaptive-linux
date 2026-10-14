@@ -4,9 +4,9 @@ aptX Adaptive for Linux: a clean-room Rust encoder plus a PipeWire Bluetooth cod
 
 ## status
 
-- **Works:** Bowers & Wilkins Px7 S2e, high-quality mode, 48 kHz stereo (364 kbps).
-- **Untested:** low-latency mode on real hardware, including picking the low-latency profile in KDE/pavucontrol; every other headset.
-- **Not yet:** 44.1 or 96 kHz.
+- **Works:** Bowers & Wilkins Px7 S2e, 48 kHz stereo, HQ and low latency. HQ starts at 364 kbps and reached 427 kbps through adaptive bitrate in a live test. LL runs at 265 kbps. Runtime HQ → LL → HQ switching, LL on connect, and card-profile switches have been tested ([test status](spec/QUESTIONS.md#current-status-2026-10-14)).
+- **Untested:** congestion-driven bitrate reduction on hardware, and every other headset, including R2 sinks.
+- **Offline-tested:** R2 stereo at 44.1 kHz in HQ or LL, and 96 kHz in HQ. Reference packets and compiled plugin callbacks pass; playback on an R2 headset remains unverified. R1 headsets, including the Px7, stay at 48 kHz.
 
 Needs PipeWire 1.6.x. Design notes are in [docs/adr/](docs/adr/).
 
@@ -38,7 +38,7 @@ The install slot (`APTX_ADAPTIVE_SLOT`) decides which PipeWire codec ids aptX Ad
 | slot | plugin file | aptX Adaptive on connect | notes |
 |---|---|---|---|
 | `aptx` (default) | aptX | yes, unless the headset has LDAC | replaces aptX HD and aptX on aptX Adaptive headsets only ([ADR 0004](docs/adr/0004-aptx-slot.md)) |
-| `ldac` | LC3plus HR | yes, above LDAC | clashes with LDAC on headsets that have both ([ADR 0002](docs/adr/0002-codec-autoselect.md)) |
+| `ldac` | LC3plus HR | yes, unless the headset also has LDAC | shares LDAC's id; on headsets with both codecs, the selected codec can change between restarts ([ADR 0002](docs/adr/0002-codec-autoselect.md)) |
 | `lc3plus_hr` | LC3plus HR | no, pick it by hand | below aptX HD, aptX and AAC |
 
 **`aptx` slot (default).** aptX Adaptive takes PipeWire's aptX HD and aptX codec ids. PipeWire makes one profile per id, using the codecs the headset supports, so:
@@ -72,9 +72,31 @@ pactl set-card-profile <card> a2dp-sink-aptx_adaptive
 
 If your WirePlumber config sets `bluez5.codecs`, add `"aptx_adaptive"` and `"aptx_adaptive_ll"` to it, or the codec and its low-latency profile won't show up.
 
+## sample rates
+
+The default is 48 kHz. To prefer 44.1 or 96 kHz on a compatible R2 headset, add a WirePlumber fragment such as `~/.config/wireplumber/wireplumber.conf.d/aptx-adaptive-rate.conf`:
+
+```conf
+monitor.bluez.properties = {
+	bluez5.default.rate = 96000
+}
+```
+
+Use `44100` for 44.1 kHz or `48000` to restore the default. Restart WirePlumber and reconnect the headset:
+
+```sh
+systemctl --user restart wireplumber
+```
+
+This is a preference for all Bluetooth codecs, not a PipeWire graph-rate setting. An unavailable preference falls back to a supported rate, preferring 48 kHz. It does not increase the resolution of source audio.
+
+R1 headsets remain at 48 kHz. At 96 kHz, LL is unavailable and an initial LL request falls back to HQ. The node's `quality` property reports HQ, although the selected card profile can still have the LL label. Choose 44.1 or 48 kHz for LL. Sinks advertising the R3 decoder feature cannot negotiate 44.1 kHz until that bitstream is specified.
+
+The source's advertised capabilities remain the compatible 48 kHz R1 layout. Other rates use host selection against the remote R2 capabilities. R2.2 compatibility and fractional-rate playback timing remain open questions in [the sample-rate design](docs/adr/0005-sample-rates.md).
+
 ## HQ or low latency
 
-HQ and low latency are two card profiles, so you can pick either anywhere profiles are listed:
+HQ and low latency are two card profiles. Profile selection has been tested on the Px7 S2e. These tools expose the profiles:
 
 - **KDE:** System Settings → Sound, the "Profile:" box under the headset; or the tray's volume applet, right-click the headset → Profiles.
 - **pavucontrol:** Configuration tab, the headset's Profile list. The Codec list next to it shows both too.
@@ -128,7 +150,7 @@ monitor.bluez.rules = [
 ]
 ```
 
-Low latency works on both headset generations: the Px7 S2e (aptX Adaptive R1) gets 265 kbps, and newer (R2) headsets get the R2 low-latency codec at 270 kbps. GUIs don't show per-codec properties for any codec; the `quality` switch is `pw-cli` only.
+Low latency has been hardware-tested on the Px7 S2e (aptX Adaptive R1) at 265 kbps. The R2 path starts at 270 kbps and is covered by vectors, not by a real headset test. GUIs don't show per-codec properties for any codec. The `quality` switch is `pw-cli` only.
 
 ## check it's working
 
@@ -144,6 +166,8 @@ To silence it, set `APTX_ADAPTIVE_DRIFT_LOG=0` in WirePlumber's service environm
 
 In HQ mode the plugin changes the quality level as the link allows. When PipeWire can't send a packet because the socket is full, it asks the codec to back off (at most every ½ s), and the plugin drops one level. After a second with nothing queued, PipeWire asks it to go up again, and the plugin goes up one level. On a Px7 S2e (R1) the levels are 2 (318 kbps, 16 ms), 3 (364 kbps, 14 ms, the default) and 4 (427 kbps, 12 ms). The change applies from the next packet with no gap or fade. Switching between HQ and low latency puts the level back to 3. Low latency on an R1 headset has one bitrate at every level, so it never changes.
 
+In the [October 13 live ABR test](spec/QUESTIONS.md#adaptive-bitrate-live-2026-10-13-1314-after-25), PipeWire raised HQ from level 3 to 4 after one second. It stayed at 427 kbps for minutes without backlog growth. Walking around did not trigger a reduction, so reductions remain covered by tests and vectors only.
+
 Each change is logged once:
 
 ```sh
@@ -151,7 +175,7 @@ journalctl --user -u wireplumber -f | grep 'aptx-adaptive: level'
 # aptx-adaptive: level 3 -> 2 (364k -> 318k)
 ```
 
-To confirm the headset's latency target is right, run `sudo btmon` and start playback. The headset's AVDTP Delay Report after Start should read 200.0 ms. If it reads 0 ms, expect stutter after a minute or two.
+If the headset offers Delay Reporting, run `sudo btmon` and start playback. The Px7's target is 200.0 ms in HQ and 80.0 ms in LL. Both were confirmed with a test bluetoothd advertising A2DP 1.3. With stock BlueZ 5.87 advertising A2DP 1.4, the Px7 omits Delay Reporting, but audio works in both modes. A 0 ms HQ target can cause stutter after a minute or two.
 
 ## headset keeps switching to the call profile
 

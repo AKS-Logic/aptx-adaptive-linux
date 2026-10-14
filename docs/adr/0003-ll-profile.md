@@ -1,5 +1,9 @@
 # 0003 - HQ and low latency as card profiles
 
+## status
+
+Implemented. The October 13 live test confirmed LL on connect in the `ldac` slot, one SetConfiguration, and both profiles listed in KDE. The October 14 test confirmed LL on connect and LL → HQ → LL card-profile switches in the default `aptx` slot. Runtime switching through the node's `quality` property was tested separately on October 13. The user confirmed profile selection is tested on October 15 ([test status](../../spec/QUESTIONS.md#current-status-2026-10-14)).
+
 ## problem
 
 HQ or low latency is a codec node prop (`quality`, like LDAC's). No GUI shows codec node props. KDE (settings and tray), pavucontrol and pwvucontrol show **card profiles**, and pavucontrol also has a Codec combobox built from the device's `bluetoothAudioCodec` PropInfo. Both lists have one entry per codec **id**. So LL could only be reached with `pw-cli` or a WirePlumber setting, and the setting left the profile labelled plain "aptX Adaptive" while LL ran.
@@ -19,7 +23,9 @@ The plugin exports two `media_codec` entries for the one `aptx_adaptive` endpoin
 
 One of them is the **owner**: it has the slot's id (LDAC or LC3plus HR, ADR 0002; aptX HD in the `aptx` slot, ADR 0004) and `fill_caps`, and comes first. The other is the **alias**: id `SPA_BLUETOOTH_AUDIO_CODEC_MPEG` (3), or `SPA_BLUETOOTH_AUDIO_CODEC_APTX` (6) in the `aptx` slot, and `fill_caps = NULL`. Which one owns the endpoint is chosen when the plugin loads, from `APTX_ADAPTIVE_DEFAULT_MODE=hq|ll` (default `hq`; unknown values log an error and use `hq`). `scripts/install-plugin.sh` writes it into the same systemd drop-ins as `APTX_ADAPTIVE_SLOT`. All callbacks are shared. The `quality` prop works on both entries, and a reset (`set_props` with no param) goes back to the entry's own starting mode.
 
-Only the HQ owner reads `bluez5.a2dp.aptx-adaptive.mode`. Every other entry starts in the mode its label says, so the label is never wrong after a profile pick or a connect.
+Only the HQ owner reads `bluez5.a2dp.aptx-adaptive.mode`. Every other entry starts in the mode its label says. The legacy setting can therefore make an HQ owner run LL under the plain "aptX Adaptive" label. `APTX_ADAPTIVE_DEFAULT_MODE=ll` selects LL on connect with the correct label.
+
+At a negotiated 96 kHz, LL is unavailable regardless of the entry. Init falls back to HQ, and the node's `quality` property reports HQ without offering LL. The card-profile label remains the selected entry's label because the plugin cannot change PipeWire's profile metadata per transport. Use a 44.1 or 48 kHz preference when LL is wanted (ADR 0005).
 
 ### why connect can only bind the owner (PipeWire 1.6.9)
 
@@ -34,7 +40,7 @@ So the binding on connect is decided by which entry has `fill_caps`, and nothing
 - **Device settings in the plugin**: `select_config` and `fill_caps` see only the monitor's global `bluez5.*` settings, never the device's (`endpoint_select_configuration`'s FIXME at L799). And they can't change which entry gets bound anyway, only the config bytes, which are the same for both modes (below).
 - **A config file setting the env var**: neither PipeWire 1.6.9 (`context.properties`, `context.spa-libs`, `context.modules`, `context.objects`, `context.exec`; `conf.c` L1413-1423) nor WirePlumber 0.5 has a section that sets the process environment before the bluez5 monitor loads the codecs. The env var has to come from the service environment, i.e. the systemd drop-in we already write.
 
-Hence the swap happens in the plugin, at load time. Doing it there is clean: `codec-loader.c` keeps both entries as long as only one has `fill_caps` (L139-148), and `codec_order` sorts the owner's id (LDAC or LC3plus HR) ahead of MPEG (L31-66, `qsort` at L228). The only thing that changes between modes is which of two static entries gets `fill_caps` and the slot id.
+Hence the swap happens in the plugin, at load time. `codec-loader.c` keeps both entries as long as only one has `fill_caps` (L139-148). `codec_order` sorts the owner's id ahead of the alias (L31-66, `qsort` at L228). The ids are LDAC or LC3plus HR ahead of MPEG in the original slots, and aptX HD ahead of aptX in the `aptx` slot (ADR 0004). The only thing that changes between modes is which of two static entries gets `fill_caps` and the slot id.
 
 ### the rest of the PipeWire / BlueZ side
 
@@ -42,7 +48,7 @@ Hence the swap happens in the plugin, at load time. Doing it there is clean: `co
 - **Profiles** (`bluez5-device.c`): `EnumProfile` walks the ids in `spa_type_bluetooth_audio_codec` (L1868), and `build_profile` takes the first supported codec with that id. Each entry gets its own profile. The bare `a2dp-sink` name goes to the entry with the highest priority (`prio == 0`, L2100), the owner in the `ldac` slot. The alias is named `a2dp-sink-<name>`. In the `lc3plus_hr` slot aptX HD, aptX and AAC outrank both, so both get suffixed names. The owner has the higher priority, so WirePlumber's `find-best-profile` keeps it when nothing is saved. The device's `bluetoothAudioCodec` PropInfo skips aliases only by id (L2668), so pavucontrol's Codec combobox lists both.
 - **Support check**: `media_codec_check_caps` calls the entry's `select_config`, which is the same function for both, so both are offered on exactly the same devices.
 - **Switching**: `set_profile` → `spa_bt_device_ensure_media_codec` → `codec_switch_configure_a2dp` sets `preferred_codec` to the picked entry (L4820) and calls `SetConfiguration` on the remote SEP with the shared local endpoint. BlueZ 5.87's `a2dp_reconfig` (`profiles/audio/a2dp.c` L2038) closes any open stream and reconfigures without comparing caps. The configuration bytes are the same for HQ and LL, and the switch still happens. When the transport comes back, `media_endpoint_to_codec` picks the preferred entry, and `media-sink` calls `init_props` / `init` with that entry's pointer. The pointer is how the plugin knows the mode.
-- **Both slots**: owner id 8 or 13, alias id 3. No collision, and the owner always sorts first.
+- **Original slots** have owner id 8 or 13 and alias id 3. The alias has no shipped MPEG codec to collide with, but the `ldac` owner can still collide with LDAC (ADR 0002). The `aptx` slot uses owner id 7 and alias id 6, with ordered aptX passthrough entries (ADR 0004).
 
 ### why MPEG for the alias
 
@@ -54,9 +60,9 @@ Hence the swap happens in the plugin, at load time. Doing it there is clean: `co
 
 ## trade-offs
 
-- **Profile names depend on the default mode.** In the `ldac` slot the owner is plain `a2dp-sink`, so default mode `hq` gives `a2dp-sink` (HQ) + `a2dp-sink-aptx_adaptive_ll`, and `ll` gives `a2dp-sink` (LL) + `a2dp-sink-aptx_adaptive`. Changing the default mode changes what a saved `a2dp-sink` means (WirePlumber stores profile names), so the next connect after the change gets the new default, which is the point. A saved suffixed name stops existing (it's `a2dp-sink-aptx_adaptive_ll` with `hq`, `a2dp-sink-aptx_adaptive` with `ll`), so WirePlumber falls back to the new default `a2dp-sink` too. Only in the `lc3plus_hr` slot does a saved name keep meaning the same mode. The `lc3plus_hr` slot always uses the suffixed names, and its connect codec is aptX HD regardless.
+- **Profile names depend on the default mode.** In the `ldac` slot, and the `aptx` slot on a headset without LDAC, the owner is plain `a2dp-sink`. Default mode `hq` gives `a2dp-sink` (HQ) and `a2dp-sink-aptx_adaptive_ll`. Mode `ll` gives `a2dp-sink` (LL) and `a2dp-sink-aptx_adaptive`. Changing the default mode changes what a saved `a2dp-sink` means. A saved suffixed name stops existing, so WirePlumber falls back to the new default. In the `lc3plus_hr` slot, or the `aptx` slot on a headset with LDAC, both Adaptive profiles keep their suffixed names. A supported higher-ranked codec connects first. See the profile table in `README.md` and ADR 0004.
 - **The default mode is not a WirePlumber setting.** It's an install-time env var, because nothing in the WirePlumber or PipeWire config reaches the codec loader (above). Changing it means re-running the installer, or editing the drop-in, and restarting wireplumber. A per-device default isn't possible: the owner is per process.
-- **Cosmetic id.** Tools that print the codec id by type name (`pw-dump` device Props, `bluetoothAudioCodec`) say `mpeg` for the alias's profile, just as they say `ldac` for the owner (ADR 0002). `api.bluez5.codec`, the profile name and the descriptions use the entry's own name. If PipeWire ever ships an MPEG plugin, both would have id 3 and only one gets a profile, like the LDAC collision in ADR 0002.
+- **Cosmetic id.** In the original slots, tools that print the codec id by type name (`pw-dump` device Props, `bluetoothAudioCodec`) say `mpeg` for the alias and `ldac` or `lc3plus_hr` for the owner. The `aptx` slot uses `aptx` for the alias and `aptx_hd` for the owner (ADR 0004). `api.bluez5.codec`, the profile name, and the descriptions use the entry's own name. If PipeWire ever ships an MPEG plugin, it would collide with the original slots' alias id 3, like the LDAC collision in ADR 0002.
 - **Picking the non-default profile reconfigures.** `set_profile` removes the nodes and releases the transport, and BlueZ closes and reconfigures the A2DP stream. The result is an audible gap, a new sink node (WirePlumber moves the streams back) and, on the Px7 S2e, probably the disconnect chime. A saved non-default profile costs that once per connect. The live `quality` switch (a fade, under a second of silence, no reconfigure) still works with `pw-cli`.
 - **`bluez5.a2dp.aptx-adaptive.mode` is now only for the HQ owner.** It still works there, for compatibility, but the profile is then labelled plain "aptX Adaptive" while it runs LL. `APTX_ADAPTIVE_DEFAULT_MODE=ll` is the way to get LL on connect with the right label.
 - **`bluez5.codecs`.** `is_media_codec_enabled` checks each entry's `name`. A custom list must name both `aptx_adaptive` and `aptx_adaptive_ll`. Leaving out the owner's name removes the endpoint, and the alias with it.

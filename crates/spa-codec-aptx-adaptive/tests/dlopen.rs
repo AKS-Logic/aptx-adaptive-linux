@@ -155,10 +155,11 @@ fn load_from(path: &Path, factory_name: &CStr) -> Loaded {
 }
 
 fn select(codec: &media_codec, caps: &[u8]) -> (c_int, Vec<u8>) {
-    let info = media_codec_audio_info {
-        rate: 48_000,
-        channels: 2,
-    };
+    select_preferred(codec, caps, Some(48_000))
+}
+
+fn select_preferred(codec: &media_codec, caps: &[u8], rate: Option<u32>) -> (c_int, Vec<u8>) {
+    let info = rate.map(|rate| media_codec_audio_info { rate, channels: 2 });
     let mut config = vec![0u8; A2DP_MAX_CAPS_SIZE];
     // SAFETY: arguments match the C contract.
     let n = unsafe {
@@ -167,7 +168,7 @@ fn select(codec: &media_codec, caps: &[u8]) -> (c_int, Vec<u8>) {
             0,
             caps.as_ptr().cast(),
             caps.len(),
-            &raw const info,
+            info.as_ref().map_or(ptr::null(), ptr::from_ref),
             ptr::null(),
             config.as_mut_ptr(),
             ptr::null_mut(),
@@ -175,6 +176,468 @@ fn select(codec: &media_codec, caps: &[u8]) -> (c_int, Vec<u8>) {
     };
     config.truncate(n.max(0) as usize);
     (n, config)
+}
+
+fn r2_caps(rates: u8, features: u8) -> [u8; CAPS_LEN] {
+    #[rustfmt::skip]
+    let mut caps = [
+        0xd7, 0, 0, 0, 0xad, 0, 0, 0x0a,
+        0x50, 0x64, 0x64, 0x64, 0xff, 0xff, 0, 1,
+        0, 0, 0, 0x0f, 2, 3, 3, 3, 0, 0xaa,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    caps[6] = rates | 1;
+    caps[16] = features;
+    caps
+}
+
+#[test]
+fn rate_preference_and_safe_fallbacks() {
+    let l = load();
+    for (rates, features, preferred, expected) in [
+        (0x38, 0x03, None, 0x12),
+        (0x38, 0x03, Some(0), 0x12),
+        (0x38, 0x03, Some(48_000), 0x12),
+        (0x38, 0x03, Some(44_100), 0x0a),
+        (0x38, 0x03, Some(96_000), 0x22),
+        (0x38, 0x03, Some(192_000), 0x12),
+        (0x28, 0x03, Some(48_000), 0x0a),
+        (0x20, 0x03, None, 0x22),
+        (0x38, 0x83, Some(44_100), 0x12),
+        (0x28, 0x80, Some(44_100), 0x22),
+        (0x38, 0xff, Some(96_000), 0x22),
+    ] {
+        for c in [l.codec, l.ll] {
+            let (n, config) = select_preferred(c, &r2_caps(rates, features), preferred);
+            assert_eq!(n, 40);
+            assert_eq!(
+                config[6], expected,
+                "{rates:#x} {features:#x} {preferred:?}"
+            );
+            assert_eq!(
+                config[7..26],
+                [
+                    2, 0x50, 0x64, 0x64, 0x64, 0xff, 0xff, 0, 1, 0, 0, 0, 0x0f, 2, 3, 3, 3, 0,
+                    0xaa,
+                ]
+            );
+        }
+    }
+    for preferred in [None, Some(44_100), Some(96_000)] {
+        assert_eq!(
+            select_preferred(l.codec, &PX7_S2E, preferred).1,
+            PX7_S2E_CONFIG
+        );
+    }
+    for caps in [r2_caps(0x08, 0x80), r2_caps(0x08, 0x83), r2_caps(0x40, 0)] {
+        assert_eq!(select_preferred(l.codec, &caps, Some(44_100)).0, -ENOTSUP);
+    }
+}
+
+#[test]
+fn negotiated_rates_drive_format_and_init() {
+    let l = load();
+    for (rate, byte6, block, interval, timestamp, calls) in [
+        (44_100, 0x0a, 352, 19_000_000, 837u16, 20),
+        (96_000, 0x22, 768, 15_000_000, 1440u16, 15),
+    ] {
+        let (n, mut config) = select_preferred(l.codec, &r2_caps(0x38, 3), Some(rate));
+        assert_eq!(n, 40);
+        assert_eq!(config[6], byte6);
+        let info = validated_info(l.codec, &config);
+        assert_eq!((info.raw.rate, info.raw.channels), (rate, 2));
+        assert_eq!(info.raw.format, SPA_AUDIO_FORMAT_S24_32_LE);
+        let mut buf = [0u64; 64];
+        let mut b = builder(&mut buf, 512);
+        let mut param = ptr::null_mut();
+        // SAFETY: buffers and configuration satisfy the callback contract.
+        unsafe {
+            assert_eq!(
+                l.codec.enum_config.unwrap()(
+                    l.codec,
+                    0,
+                    config.as_ptr().cast(),
+                    config.len(),
+                    SPA_PARAM_ENUM_FORMAT,
+                    0,
+                    &raw mut b,
+                    &raw mut param,
+                ),
+                1
+            );
+            let words =
+                std::slice::from_raw_parts(param.cast::<u32>(), ((*param).size as usize + 8) / 4);
+            assert!(
+                words
+                    .windows(5)
+                    .any(|w| w == [ffi::SPA_FORMAT_AUDIO_RATE, 0, 4, SPA_TYPE_INT, rate])
+            );
+        }
+        let data = init(l.codec, &mut config, &info);
+        assert!(!data.is_null());
+        // SAFETY: data from init and valid buffers.
+        unsafe {
+            assert_eq!(l.codec.get_block_size.unwrap()(data), block);
+            assert_eq!(l.codec.get_interval.unwrap()(data), interval);
+            let mut out = [0; 1024];
+            assert_eq!(
+                l.codec.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), 7, 99),
+                12
+            );
+            let [hi, lo] = timestamp.to_be_bytes();
+            assert_eq!(out[..12], [0x80, 0x60, 0, 7, 0, 0, hi, lo, 0, 0, 0, 0xa3]);
+            assert_eq!(
+                encode_until_flush(l.codec, data, &mut out[12..], calls),
+                (656, calls)
+            );
+            assert_eq!(out[12] & 0x7f, 3);
+            assert_eq!(
+                l.codec.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), 8, 0),
+                12
+            );
+            assert_eq!(
+                encode_until_flush(l.codec, data, &mut out[12..], calls).0,
+                656
+            );
+            let (name, index) = if rate == 44_100 {
+                ("c3_44k_i1_L3", 38)
+            } else {
+                ("c3_96k_i5_L3", 47)
+            };
+            let reference = std::fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/vectors/parity")
+                    .join(format!("{name}.bin")),
+            )
+            .unwrap();
+            let swapped: Vec<u8> = reference[index * 656..][..656]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|p| [p[1], p[0]])
+                .collect();
+            assert_eq!(out[12..668], swapped, "{rate} digital-black payload");
+            let (mut encoder, mut decoder) = (99, 99);
+            l.codec.get_delay.unwrap()(data, &raw mut encoder, &raw mut decoder);
+            assert_eq!((encoder, decoder), (255, 0));
+            l.codec.deinit.unwrap()(data);
+        }
+    }
+}
+
+#[test]
+fn new_rate_init_rejects_pcm_mismatches() {
+    let l = load();
+    for rate in [44_100, 96_000] {
+        let (_, mut config) = select_preferred(l.codec, &r2_caps(0x38, 3), Some(rate));
+        let info = validated_info(l.codec, &config);
+        let data = init(l.codec, &mut config, &info);
+        assert!(!data.is_null());
+        // SAFETY: initialized session returned by init.
+        unsafe { l.codec.deinit.unwrap()(data) };
+        for mismatch in [48_000, if rate == 44_100 { 96_000 } else { 44_100 }] {
+            let mut bad = info;
+            bad.raw.rate = mismatch;
+            assert!(init(l.codec, &mut config, &bad).is_null());
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(EINVAL));
+        }
+        for bad in [
+            spa_audio_info {
+                media_type: 0,
+                ..info
+            },
+            spa_audio_info {
+                media_subtype: 0,
+                ..info
+            },
+            spa_audio_info {
+                raw: ffi::spa_audio_info_raw {
+                    format: 0,
+                    ..info.raw
+                },
+                ..info
+            },
+            spa_audio_info {
+                raw: ffi::spa_audio_info_raw {
+                    channels: 1,
+                    ..info.raw
+                },
+                ..info
+            },
+        ] {
+            assert!(init(l.codec, &mut config, &bad).is_null());
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(EINVAL));
+        }
+    }
+}
+
+#[test]
+fn invalid_rate_masks_and_r1_non48_are_rejected() {
+    let l = load();
+    for (r2, byte6, features) in [
+        (true, 0x02, 0),
+        (true, 0x1a, 0),
+        (true, 0x2a, 0),
+        (true, 0x32, 0),
+        (true, 0x42, 0),
+        (true, 0x82, 0),
+        (true, 0xa2, 0),
+        (false, 0x0a, 0),
+        (false, 0x22, 0),
+        (true, 0x0a, 0x80),
+        (true, 0x0a, 0x83),
+    ] {
+        let mut config = if r2 {
+            r2_caps(0x10, features)
+        } else {
+            PX7_S2E_CONFIG
+        };
+        config[6] = byte6;
+        config[7] = 2;
+        let mut info = validated_info(l.codec, &PX7_S2E_CONFIG);
+        // SAFETY: valid buffers, malformed contents are intentional.
+        unsafe {
+            assert_eq!(
+                l.codec.validate_config.unwrap()(
+                    l.codec,
+                    0,
+                    config.as_ptr().cast(),
+                    config.len(),
+                    &raw mut info
+                ),
+                -EINVAL
+            );
+        }
+        assert!(init(l.codec, &mut config, &info).is_null());
+    }
+    for (rate, features) in [
+        (0x12, 0xff),
+        (0x22, 0xff),
+        (0x0a, 0x17),
+        (0x08, 0),
+        (0x20, 0),
+    ] {
+        let mut config = r2_caps(0x10, features);
+        config[6] = rate;
+        config[7] = 2;
+        assert_eq!(validated_info(l.codec, &config).raw.channels, 2);
+    }
+    for mode in [0, 1, 4, 0x0a, 0x20] {
+        let mut config = r2_caps(0x08, 0);
+        config[7] = mode;
+        let info = validated_info(l.codec, &PX7_S2E_CONFIG);
+        assert!(init(l.codec, &mut config, &info).is_null());
+    }
+}
+
+#[test]
+fn new_rate_encode_consumes_only_fixed_whole_frame_blocks() {
+    let l = load();
+    for (rate, block) in [(44_100, 352), (96_000, 768)] {
+        let (_, mut config) = select_preferred(l.codec, &r2_caps(0x38, 0), Some(rate));
+        let info = validated_info(l.codec, &config);
+        let data = init(l.codec, &mut config, &info);
+        assert!(!data.is_null());
+        let src = vec![0; block * 2 + 4];
+        let mut out = [0; 1024];
+        let (mut written, mut flush) = (99, 99);
+        // SAFETY: initialized session and buffers of the supplied lengths.
+        unsafe {
+            assert_eq!(
+                l.codec.encode.unwrap()(
+                    data,
+                    src.as_ptr().cast(),
+                    block - 4,
+                    out.as_mut_ptr().cast(),
+                    out.len(),
+                    &raw mut written,
+                    &raw mut flush
+                ),
+                0
+            );
+            assert_eq!((written, flush), (0, 0));
+            let mut packets = 0;
+            let mut gap = 0;
+            for i in 0..2000 {
+                if i % 200 == 0 {
+                    let step = if i % 400 == 0 {
+                        l.codec.reduce_bitpool.unwrap()
+                    } else {
+                        l.codec.increase_bitpool.unwrap()
+                    };
+                    assert_eq!(step(data), if i % 400 == 0 { 2 } else { 3 });
+                }
+                assert_eq!(
+                    l.codec.encode.unwrap()(
+                        data,
+                        src.as_ptr().cast(),
+                        src.len(),
+                        out.as_mut_ptr().cast(),
+                        out.len(),
+                        &raw mut written,
+                        &raw mut flush
+                    ),
+                    block as c_int
+                );
+                assert_eq!(l.codec.get_block_size.unwrap()(data), block as c_int);
+                gap += 1;
+                if flush != 0 {
+                    assert_eq!(written, 656);
+                    assert!(gap <= 30, "{rate} stalled for {gap} blocks");
+                    gap = 0;
+                    packets += 1;
+                } else {
+                    assert_eq!(written, 0);
+                }
+            }
+            assert!((70..=140).contains(&packets), "{rate} {packets} packets");
+            l.codec.deinit.unwrap()(data);
+        }
+    }
+}
+
+#[test]
+fn new_rate_abr_callbacks_preserve_fixed_blocks() {
+    let l = load();
+    for (rate, block, periods) in [
+        (44_100, 352, [837u16, 1102, 837, 661, 529, 661, 837]),
+        (96_000, 768, [1440u16, 1920, 1440, 1152, 768, 1152, 1440]),
+    ] {
+        let (_, mut config) = select_preferred(l.codec, &r2_caps(0x38, 3), Some(rate));
+        let info = validated_info(l.codec, &config);
+        let data = init(l.codec, &mut config, &info);
+        assert!(!data.is_null());
+        // SAFETY: initialized session and correctly sized buffers.
+        unsafe {
+            for (i, frames) in periods.into_iter().enumerate() {
+                if i != 0 {
+                    let (callback, level) = match i {
+                        1 => (l.codec.reduce_bitpool.unwrap(), 2),
+                        2 => (l.codec.increase_bitpool.unwrap(), 3),
+                        3 => (l.codec.increase_bitpool.unwrap(), 4),
+                        4 => (l.codec.increase_bitpool.unwrap(), 5),
+                        5 => (l.codec.reduce_bitpool.unwrap(), 4),
+                        _ => (l.codec.reduce_bitpool.unwrap(), 3),
+                    };
+                    assert_eq!(callback(data), level);
+                }
+                let mut out = [0; 1024];
+                assert_eq!(
+                    l.codec.start_encode.unwrap()(
+                        data,
+                        out.as_mut_ptr().cast(),
+                        out.len(),
+                        i as u16,
+                        99
+                    ),
+                    12
+                );
+                let [hi, lo] = frames.to_be_bytes();
+                assert_eq!(
+                    out[..12],
+                    [0x80, 0x60, 0, i as u8, 0, 0, hi, lo, 0, 0, 0, 0xa3]
+                );
+                assert_eq!(encode_until_flush(l.codec, data, &mut out[12..], 30).0, 656);
+                assert_eq!(out[12] & 0x7f, 3);
+                assert_eq!(l.codec.get_block_size.unwrap()(data), block);
+                assert_eq!(l.codec.abr_process.unwrap()(data, 0), 0);
+            }
+            l.codec.deinit.unwrap()(data);
+        }
+    }
+}
+
+#[test]
+fn rate_44k_switches_hq_ll_hq_without_changing_input_blocks() {
+    let l = load();
+    let c = l.codec;
+    let props = init_props(c, None);
+    let (_, mut config) = select_preferred(c, &r2_caps(0x38, 3), Some(44_100));
+    let info = validated_info(c, &config);
+    let data = init_with_props(c, &mut config, &info, props);
+    assert!(!data.is_null());
+    let mut runs = String::new();
+    // SAFETY: initialized session, properties and valid buffers throughout.
+    unsafe {
+        for seq in 0..330u16 {
+            if seq == 15 || seq == 150 {
+                let quality = quality_props(i32::from(seq == 15));
+                assert_eq!(c.set_props.unwrap()(props, quality.as_ptr().cast()), 1);
+                assert_eq!(c.update_props.unwrap()(data, props), 0);
+            }
+            let mut out = [0; 1024];
+            assert_eq!(
+                c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), seq, 99),
+                12
+            );
+            let kind = match out[4..12] {
+                [0, 0, 0x03, 0x45, 0, 0, 0, 0xa3] => 'H',
+                [0, 0, 0x01, 0xb9, 0, 0, 0, 0xa1] => 'L',
+                _ => panic!("44k fields {:02x?}", &out[4..12]),
+            };
+            if !runs.ends_with(kind) {
+                runs.push(kind);
+            }
+            let (size, _) = encode_until_flush(c, data, &mut out[12..], 22);
+            assert_eq!(size, if kind == 'H' { 656 } else { 348 });
+            assert_eq!(out[12] & 0x7f, if kind == 'H' { 3 } else { 4 });
+            assert_eq!(c.get_block_size.unwrap()(data), 352);
+            assert_eq!(out[2..4], seq.to_be_bytes());
+        }
+        assert_eq!(runs, "HLH");
+        assert_eq!(c.get_interval.unwrap()(data), 19_000_000);
+        assert_eq!(enum_props(c, props, SPA_PARAM_PROPS, 0).1, quality_props(0));
+        c.deinit.unwrap()(data);
+        c.clear_props.unwrap()(props);
+    }
+    let mut config = r2_caps(0x08, 0);
+    config[6] = 0x0a;
+    config[7] = 2;
+    let data = init(l.ll, &mut config, &info);
+    assert!(!data.is_null());
+    // SAFETY: session returned by init.
+    unsafe {
+        assert_eq!(l.ll.get_interval.unwrap()(data), 10_000_000);
+        assert_eq!(l.ll.get_block_size.unwrap()(data), 352);
+        l.ll.deinit.unwrap()(data);
+    }
+}
+
+#[test]
+fn rate_96k_ll_is_unavailable_and_refused_without_changing_hq() {
+    let l = load();
+    let c = l.codec;
+    let props = init_props(c, Some(c"ll"));
+    let (_, mut config) = select_preferred(c, &r2_caps(0x38, 3), Some(96_000));
+    let info = validated_info(c, &config);
+    let data = init_with_props(c, &mut config, &info, props);
+    assert!(!data.is_null());
+    // SAFETY: session and properties returned by init callbacks.
+    unsafe {
+        assert_eq!(enum_props(c, props, SPA_PARAM_PROPS, 0).1, quality_props(0));
+        let (_, labels) = enum_props(c, props, SPA_PARAM_PROP_INFO, 0);
+        let labels: Vec<u8> = labels.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        assert!(!labels.windows(11).any(|w| w == b"Low latency"));
+        assert_eq!(c.update_props.unwrap()(data, props), -ENOTSUP);
+        assert_eq!(enum_props(c, props, SPA_PARAM_PROPS, 0).1, quality_props(0));
+        let ll = quality_props(1);
+        assert_eq!(c.set_props.unwrap()(props, ll.as_ptr().cast()), 1);
+        assert_eq!(c.update_props.unwrap()(data, props), 0);
+        assert_eq!(enum_props(c, props, SPA_PARAM_PROPS, 0).1, quality_props(0));
+        for seq in 0..100u16 {
+            let mut out = [0; 1024];
+            assert_eq!(
+                c.start_encode.unwrap()(data, out.as_mut_ptr().cast(), out.len(), seq, 99),
+                12
+            );
+            assert_eq!(out[4..12], [0, 0, 0x05, 0xa0, 0, 0, 0, 0xa3]);
+            assert_eq!(encode_until_flush(c, data, &mut out[12..], 15), (656, 15));
+            assert_eq!(out[12] & 0x7f, 3);
+            assert_eq!(c.get_block_size.unwrap()(data), 768);
+        }
+        c.deinit.unwrap()(data);
+        c.clear_props.unwrap()(props);
+    }
 }
 
 fn validated_info(codec: &media_codec, config: &[u8]) -> spa_audio_info {

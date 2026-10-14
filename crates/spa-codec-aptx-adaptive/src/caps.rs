@@ -1,22 +1,28 @@
 //! A2DP capability negotiation (spec `a2dp-integration.md` §1); offsets start at the vendor header.
 
-use aptx_adaptive::DecoderLevel;
+use aptx_adaptive::{Config, DecoderLevel, Profile};
 
 use crate::ffi::{SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_FORMAT_S24_32_LE};
 use crate::ids::{CAPS_LEN, VENDOR_HEADER};
 use crate::pod::RawFormat;
 
-pub const STREAM: RawFormat = RawFormat {
-    format: SPA_AUDIO_FORMAT_S24_32_LE,
-    rate: 48_000,
-    positions: &[SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR],
-};
+pub fn raw_format(config: Config) -> RawFormat {
+    RawFormat {
+        format: SPA_AUDIO_FORMAT_S24_32_LE,
+        rate: config.sample_rate,
+        positions: &[SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR][..usize::from(config.channels)],
+    }
+}
 
 const RATES: usize = 6;
 const CHANNEL_MODES: usize = 7;
 
 const RATE_MASK: u8 = 0xF8;
+const RATE_44K: u8 = 0x08;
 const RATE_48K: u8 = 0x10;
+const RATE_96K: u8 = 0x20;
+const SUPPORTED_RATES: [(u32, u8); 3] =
+    [(48_000, RATE_48K), (44_100, RATE_44K), (96_000, RATE_96K)];
 
 pub const SOURCE_TYPE_HOST: u8 = 0x02;
 
@@ -35,6 +41,7 @@ const TTP_DEFAULTS: [u8; 6] = [0x50, 0x64, 0x64, 0x64, 0xff, 0xff];
 
 const FEATURES_R2_0: u32 = 0x0F00_0000;
 const FEATURES_LOW_BYTE: u32 = 0xff;
+const SINK_22_DECODER: u32 = 1 << 7;
 
 const R1_DATA: [u8; 9] = {
     let t = TTP_DEFAULTS;
@@ -105,6 +112,14 @@ impl<'a> Caps<'a> {
             b[FEATURES + 3],
         ])
     }
+
+    fn supported_rates(self) -> u8 {
+        match self.decoder_level() {
+            DecoderLevel::R1 => RATE_48K,
+            DecoderLevel::R2 if self.features() & SINK_22_DECODER != 0 => RATE_48K | RATE_96K,
+            DecoderLevel::R2 => RATE_44K | RATE_48K | RATE_96K,
+        }
+    }
 }
 
 fn element(len: usize, rate: u8, channel_mode: u8, aptx_data: &[u8]) -> Vec<u8> {
@@ -127,17 +142,21 @@ pub fn fill_caps() -> Vec<u8> {
 }
 
 /// # Errors
-/// As for [`Caps::parse`], or `Unsupported` without 48 kHz and stereo or joint stereo.
-pub fn select_config(bytes: &[u8]) -> Result<Vec<u8>, CapsError> {
+/// As for [`Caps::parse`], or `Unsupported` without a supported rate and stereo or joint stereo.
+pub fn select_config(bytes: &[u8], preferred_rate: Option<u32>) -> Result<Vec<u8>, CapsError> {
     let caps = Caps::parse(bytes)?;
-    if caps.rates() & RATE_48K == 0 {
-        return Err(CapsError::Unsupported);
-    }
+    let rates = caps.rates() & caps.supported_rates();
+    let preferred = SUPPORTED_RATES
+        .iter()
+        .find(|&&(hz, bit)| Some(hz) == preferred_rate && rates & bit != 0);
+    let &(_, rate) = preferred
+        .or_else(|| SUPPORTED_RATES.iter().find(|&&(_, bit)| rates & bit != 0))
+        .ok_or(CapsError::Unsupported)?;
     let mode = [CHANNEL_STEREO, CHANNEL_JOINT_STEREO]
         .into_iter()
         .find(|m| caps.channel_modes() & m != 0)
         .ok_or(CapsError::Unsupported)?;
-    let rate = RATE_48K | SOURCE_TYPE_HOST;
+    let rate = rate | SOURCE_TYPE_HOST;
     let config = match caps.decoder_level() {
         DecoderLevel::R2 => {
             // Our low byte is 0, so the AND is always 0; that's what §7J asks for.
@@ -161,19 +180,26 @@ pub fn select_config(bytes: &[u8]) -> Result<Vec<u8>, CapsError> {
 
 ///
 /// # Errors
-/// As for [`Caps::parse`], or `Invalid` unless it picks exactly 48 kHz and exactly one of
+/// As for [`Caps::parse`], or `Invalid` unless it picks exactly one supported rate and one of
 /// stereo or joint stereo. The source type bits aren't checked. A sink-initiated stream may
 /// carry source type 0, whose link-clock timing a host encoder can't meet (§7E); it's still
 /// accepted and streamed with the host (type 2) rules. The level comes from the config's
 /// extension byte: PipeWire doesn't pass the sink's caps here or to `init`. See
 /// `spec/QUESTIONS.md`.
-pub fn validate_config(config: &[u8]) -> Result<DecoderLevel, CapsError> {
+pub fn validate_config(config: &[u8]) -> Result<Config, CapsError> {
     let c = Caps::parse(config)?;
     let mode_ok = matches!(c.channel_modes(), CHANNEL_STEREO | CHANNEL_JOINT_STEREO);
-    if c.rates() != RATE_48K || !mode_ok {
+    let rate = SUPPORTED_RATES.iter().find(|&&(_, bit)| c.rates() == bit);
+    if c.rates() & c.supported_rates() == 0 || !mode_ok {
         return Err(CapsError::Invalid);
     }
-    Ok(c.decoder_level())
+    let &(sample_rate, _) = rate.ok_or(CapsError::Invalid)?;
+    Ok(Config {
+        profile: Profile::Hq,
+        sample_rate,
+        channels: 2,
+        level: c.decoder_level(),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,14 +213,14 @@ pub struct PcmStream {
 ///
 /// # Errors
 /// As for [`validate_config`], or `Invalid` on a mismatch.
-pub fn check_stream(config: &[u8], stream: &PcmStream) -> Result<DecoderLevel, CapsError> {
-    let level = validate_config(config)?;
+pub fn check_stream(config: &[u8], stream: &PcmStream) -> Result<Config, CapsError> {
+    let config = validate_config(config)?;
     let matches = stream.raw_audio
-        && stream.format == STREAM.format
-        && stream.rate == STREAM.rate
-        && stream.channels as usize == STREAM.positions.len();
+        && stream.format == SPA_AUDIO_FORMAT_S24_32_LE
+        && stream.rate == config.sample_rate
+        && stream.channels == u32::from(config.channels);
     if matches {
-        Ok(level)
+        Ok(config)
     } else {
         Err(CapsError::Invalid)
     }
@@ -207,6 +233,19 @@ mod tests {
 
     const SETUP_PREFS: usize = 20;
     const END_MARKER: usize = 24;
+
+    fn select_config(bytes: &[u8]) -> Result<Vec<u8>, CapsError> {
+        super::select_config(bytes, None)
+    }
+
+    const fn config(level: DecoderLevel) -> Config {
+        Config {
+            profile: Profile::Hq,
+            sample_rate: 48_000,
+            channels: 2,
+            level,
+        }
+    }
 
     fn r2_caps(features: u32) -> [u8; CAPS_LEN] {
         let mut c = [0; CAPS_LEN];
@@ -233,7 +272,7 @@ mod tests {
     fn px7_s2e_select_config_matches_spec() {
         let config = select_config(&PX7_S2E).unwrap();
         assert_eq!(config, PX7_S2E_CONFIG);
-        assert_eq!(validate_config(&config), Ok(DecoderLevel::R1));
+        assert_eq!(validate_config(&config), Ok(self::config(DecoderLevel::R1)));
     }
 
     #[test]
@@ -260,7 +299,10 @@ mod tests {
         assert_eq!(config[..CAPS_LEN], PX7_S2E_CONFIG);
         assert_eq!(config[CAPS_LEN..], [0; 4]);
         let long_config = [&PX7_S2E_CONFIG[..], &[0x55; 4]].concat();
-        assert_eq!(validate_config(&long_config), Ok(DecoderLevel::R1));
+        assert_eq!(
+            validate_config(&long_config),
+            Ok(self::config(DecoderLevel::R1))
+        );
         assert_eq!(select_config(&PX7_S2E[..39]), Err(CapsError::Invalid));
     }
 
@@ -278,7 +320,7 @@ mod tests {
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         assert_eq!(config, want);
-        assert_eq!(validate_config(&config), Ok(DecoderLevel::R2));
+        assert_eq!(validate_config(&config), Ok(self::config(DecoderLevel::R2)));
     }
 
     #[test]
@@ -306,7 +348,7 @@ mod tests {
         assert_eq!(config[RATES..=CHANNEL_MODES], [0x12, CHANNEL_STEREO]);
         assert_eq!(config[FEATURES], 0);
         assert_eq!(config[EXT_VERSION], 1);
-        assert_eq!(validate_config(&config), Ok(DecoderLevel::R2));
+        assert_eq!(validate_config(&config), Ok(self::config(DecoderLevel::R2)));
     }
 
     #[test]
@@ -320,7 +362,7 @@ mod tests {
         want[20] = 0x55;
         want[25] = 0x66;
         assert_eq!(select_config(&caps).unwrap(), want);
-        assert_eq!(validate_config(&want), Ok(DecoderLevel::R1));
+        assert_eq!(validate_config(&want), Ok(config(DecoderLevel::R1)));
     }
 
     #[test]
@@ -362,7 +404,7 @@ mod tests {
         c[RATES] = 0x18;
         assert_eq!(validate_config(&c), Err(CapsError::Invalid));
         c[RATES] = 0x12;
-        assert_eq!(validate_config(&c), Ok(DecoderLevel::R1));
+        assert_eq!(validate_config(&c), Ok(config(DecoderLevel::R1)));
     }
 
     #[test]
@@ -426,7 +468,7 @@ mod tests {
         );
         let mut copied = caps.clone();
         copied[CHANNEL_MODES] = CHANNEL_STEREO;
-        assert_eq!(validate_config(&copied), Ok(DecoderLevel::R1));
+        assert_eq!(validate_config(&copied), Ok(config(DecoderLevel::R1)));
         let config = select_config(&caps).unwrap();
         assert_eq!(config, copied);
     }
@@ -435,10 +477,10 @@ mod tests {
     fn validate_accepts_sink_initiated_source_type_0() {
         let mut config = select_config(&fill_caps()).unwrap();
         config[RATES] = RATE_48K;
-        assert_eq!(validate_config(&config), Ok(DecoderLevel::R1));
+        assert_eq!(validate_config(&config), Ok(self::config(DecoderLevel::R1)));
         let mut r2 = select_config(&r2_caps(0x0F00_0003)).unwrap();
         r2[RATES] = RATE_48K;
-        assert_eq!(validate_config(&r2), Ok(DecoderLevel::R2));
+        assert_eq!(validate_config(&r2), Ok(self::config(DecoderLevel::R2)));
     }
 
     #[test]
@@ -461,7 +503,10 @@ mod tests {
             rate: 48_000,
             channels: 2,
         };
-        assert_eq!(check_stream(&PX7_S2E_CONFIG, &ok), Ok(DecoderLevel::R1));
+        assert_eq!(
+            check_stream(&PX7_S2E_CONFIG, &ok),
+            Ok(config(DecoderLevel::R1))
+        );
         for bad in [
             PcmStream {
                 raw_audio: false,

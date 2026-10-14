@@ -4,9 +4,9 @@
 //! sequence number, timestamp = samples per channel in the packet (TTP adjust 0 in the high
 //! 16 bits), SSRC = the latency mode; then the 16-bit byte-swapped codec packet.
 
-use aptx_adaptive::{
-    Config, Core, DecoderLevel, Encoder, Error, Profile, Row, Stream, packet_budget, table_row,
-};
+#[cfg(test)]
+use aptx_adaptive::DecoderLevel;
+use aptx_adaptive::{Config, Core, Encoder, Error, Profile, Row, Stream, packet_budget, table_row};
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -64,6 +64,7 @@ enum Fade {
 }
 
 /// A level-3 stream at 48 kHz stereo (spec §8.4, §7J: an R1 sink always runs at 48 kHz).
+#[cfg(test)]
 fn config(level: DecoderLevel, profile: Profile) -> Config {
     Config {
         profile,
@@ -100,9 +101,7 @@ pub struct Session<C> {
     stream: Stream<C>,
     scmst: Option<u8>,
     mtu: usize,
-    /// One block of PCM, converted. The block stays the same size for the whole session
-    /// (PipeWire reads it once per transport start), so it divides the packet of every
-    /// profile we can switch to.
+    /// One whole-frame PCM block, fixed for the session because PipeWire reads it once.
     pcm: Vec<i32>,
     drift: Drift,
     drift_log: bool,
@@ -128,22 +127,14 @@ fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
 }
 
-/// `profile`'s row on this link, if the encoder can run it and its packets fit the MTU.
-fn link_row(level: DecoderLevel, profile: Profile, mtu: usize) -> Option<Row> {
-    let row = table_row(config(level, profile), budget(mtu)).ok()?;
+fn link_row(config: Config, mtu: usize) -> Option<Row> {
+    let row = table_row(config, budget(mtu)).ok()?;
     (RTP_HEADER_LEN + row.packet_bytes <= mtu).then_some(row)
 }
 
-/// Every row a level change can reach from `row` (§7L): levels 2..=7 of `profile`'s table
-/// index with the same packet size.
-fn level_rows(
-    level: DecoderLevel,
-    profile: Profile,
-    row: Row,
-    budget: usize,
-) -> impl Iterator<Item = Row> {
+fn level_rows(config: Config, row: Row, budget: usize) -> impl Iterator<Item = Row> {
     (MIN_LEVEL..=MAX_LEVEL).filter_map(move |l| {
-        aptx_adaptive::table_row_at_level(config(level, profile), budget, l)
+        aptx_adaptive::table_row_at_level(config, budget, l)
             .ok()
             .filter(|r| r.packet_bytes == row.packet_bytes)
     })
@@ -174,30 +165,29 @@ impl Session<Encoder> {
 }
 
 impl Session<AnyCore> {
-    /// A level-3 session on the real encoder, or on a replay core if `opts` asks for one. Starts in `profile` if this link can run it, otherwise in HQ: check
+    /// A level-3 session on the real encoder, or on a replay core if `opts` asks for one. Starts in `config.profile` if this link can run it, otherwise in HQ: check
     /// [`Session::profile`].
     ///
     /// # Errors
     /// Whatever the encoder rejects, `NoSpace` if the MTU can't fit a packet, or `BadDevSetting` if the replay file can't be used (the reason
     /// goes to stderr).
-    pub fn open(
-        level: DecoderLevel,
-        profile: Profile,
-        mtu: usize,
-        opts: &Options,
-    ) -> Result<Self, SessionError> {
+    pub fn open(mut config: Config, mtu: usize, opts: &Options) -> Result<Self, SessionError> {
         let mtu = mtu.saturating_sub(usize::from(opts.scmst.is_some()));
-        let profile = if opts.replay.is_none() && link_row(level, profile, mtu).is_some() {
-            profile
-        } else {
-            Profile::Hq
-        };
-        let config = config(level, profile);
+        if opts.replay.is_some() || link_row(config, mtu).is_none() {
+            config.profile = Profile::Hq;
+        }
         let row = table_row(config, budget(mtu))?;
         let core = match &opts.replay {
             None => AnyCore::Encoder(Encoder::new(config, row.bitrate)?),
             Some(path) => {
                 let samples = row.interleaved_samples(config.sample_rate, config.channels.into());
+                if !samples.is_multiple_of(usize::from(config.channels)) {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "aptx-adaptive: replay requires whole-frame packet periods"
+                    );
+                    return Err(SessionError::BadDevSetting);
+                }
                 let replay = Replay::from_file(path, row.packet_bytes, samples).map_err(|e| {
                     let _ = writeln!(std::io::stderr(), "aptx-adaptive: {e}");
                     SessionError::BadDevSetting
@@ -235,15 +225,19 @@ impl<C: Core> Session<C> {
             return Err(SessionError::NoSpace);
         }
         let c = stream.config();
-        let mut rows = Profile::ALL.map(|p| link_row(c.level, p, mtu));
+        let mut rows = Profile::ALL.map(|profile| link_row(Config { profile, ..c }, mtu));
         rows[c.profile.index()] = Some(stream.row());
-        let block = Profile::ALL
+        let period_ms = Profile::ALL
             .iter()
             .zip(rows)
             .filter_map(|(&p, r)| r.map(|r| (p, r)))
-            .flat_map(|(p, r)| std::iter::once(r).chain(level_rows(c.level, p, r, stream.budget())))
-            .map(|r| r.interleaved_samples(c.sample_rate, c.channels.into()))
+            .flat_map(|(profile, r)| {
+                std::iter::once(r).chain(level_rows(Config { profile, ..c }, r, stream.budget()))
+            })
+            .map(|r| r.period_ms as usize)
             .fold(0, gcd);
+        let frames = u64::from(c.sample_rate) * period_ms as u64 / 1000;
+        let block = frames as usize * usize::from(c.channels);
         let (stream_level, stream_bitrate) = (stream.level(), stream.row().bitrate);
         Ok(Self {
             pcm: vec![0; block],
@@ -405,9 +399,12 @@ impl<C: Core> Session<C> {
         if n < reset_frames(rate) || self.target == self.profile() {
             return;
         }
-        let level = self.stream.config().level;
+        let config = Config {
+            profile: self.target,
+            ..self.stream.config()
+        };
         let row = self.rows[self.target.index()];
-        let ok = row.is_some_and(|row| self.stream.reset(config(level, self.target), row).is_ok());
+        let ok = row.is_some_and(|row| self.stream.reset(config, row).is_ok());
         if !ok {
             self.refused = self.refused.saturating_add(1);
             self.target = self.profile();
@@ -642,7 +639,7 @@ mod tests {
             replay: Some(vector("sine1k.r1.bin")),
             ..Options::default()
         };
-        let mut s = Session::open(DecoderLevel::R1, Profile::Hq, MTU, &opts).unwrap();
+        let mut s = Session::open(config(DecoderLevel::R1, Profile::Hq), MTU, &opts).unwrap();
         let src = vec![0u8; packet_size(&s)];
         let mut buf = vec![0u8; 2048];
         let len = s.start_encode(&mut buf, 1, 0).unwrap();
@@ -668,7 +665,7 @@ mod tests {
             scmst: Some(0x02),
             ..Options::default()
         };
-        let mut s = Session::open(DecoderLevel::R1, Profile::Hq, MTU, &opts).unwrap();
+        let mut s = Session::open(config(DecoderLevel::R1, Profile::Hq), MTU, &opts).unwrap();
         let src = vec![0u8; packet_size(&s)];
         let mut buf = vec![0xffu8; 2048];
         let len = s.start_encode(&mut buf, 1, 0).unwrap();
@@ -687,7 +684,7 @@ mod tests {
             ..Options::default()
         };
         let row = |o: &Options| {
-            Session::open(DecoderLevel::R1, Profile::Hq, 600, o)
+            Session::open(config(DecoderLevel::R1, Profile::Hq), 600, o)
                 .unwrap()
                 .stream
                 .row()
@@ -696,7 +693,8 @@ mod tests {
         assert_eq!(row(&opts(None)), 588);
         let smaller = row(&opts(Some(0)));
         assert!(smaller < 588);
-        let mut s = Session::open(DecoderLevel::R1, Profile::Hq, 600, &opts(Some(0))).unwrap();
+        let mut s =
+            Session::open(config(DecoderLevel::R1, Profile::Hq), 600, &opts(Some(0))).unwrap();
         let src = vec![0u8; packet_size(&s)];
         let mut buf = vec![0u8; 2048];
         let len = s.start_encode(&mut buf, 0, 0).unwrap();
@@ -1178,7 +1176,7 @@ mod tests {
             replay: Some(vector("sine1k.r1.bin")),
             ..Options::default()
         };
-        let mut s = Session::open(DecoderLevel::R1, Profile::Hq, MTU, &opts).unwrap();
+        let mut s = Session::open(config(DecoderLevel::R1, Profile::Hq), MTU, &opts).unwrap();
         assert_eq!(s.step_level(true), Err(SessionError::Unsupported));
         assert_eq!(s.stream.pending_level(), None);
     }
@@ -1300,7 +1298,7 @@ mod tests {
             replay: Some(vector("sine1k.r1.bin")),
             ..Options::default()
         };
-        let mut s = Session::open(DecoderLevel::R1, Profile::Ll, MTU, &opts).unwrap();
+        let mut s = Session::open(config(DecoderLevel::R1, Profile::Ll), MTU, &opts).unwrap();
         assert_eq!(s.profile(), Profile::Hq);
         assert_eq!(s.request(Profile::Ll), Err(SessionError::Unsupported));
         assert_eq!(
@@ -1333,7 +1331,7 @@ mod tests {
             replay: Some(path),
             ..Options::default()
         };
-        let mut s = Session::open(DecoderLevel::R1, Profile::Hq, MTU, &opts).unwrap();
+        let mut s = Session::open(config(DecoderLevel::R1, Profile::Hq), MTU, &opts).unwrap();
         let header = RTP_HEADER_LEN;
         let src = vec![0x55u8; packet_size(&s)];
         let mut buffer = vec![0u8; 8192];
@@ -1374,18 +1372,144 @@ mod tests {
             ..Options::default()
         };
         assert!(matches!(
-            Session::open(DecoderLevel::R1, Profile::Hq, MTU, &opts("missing.bin")),
+            Session::open(
+                config(DecoderLevel::R1, Profile::Hq),
+                MTU,
+                &opts("missing.bin")
+            ),
             Err(SessionError::BadDevSetting)
         ));
         assert!(matches!(
-            Session::open(DecoderLevel::R1, Profile::Hq, MTU, &opts("sine1k.s32le")),
+            Session::open(
+                config(DecoderLevel::R1, Profile::Hq),
+                MTU,
+                &opts("sine1k.s32le")
+            ),
             Err(SessionError::BadDevSetting)
         ));
     }
 
     #[test]
+    fn replay_refuses_fractional_stereo_period() {
+        let opts = Options {
+            replay: Some(vector("sine1k.r2.bin")),
+            ..Options::default()
+        };
+        let c = Config {
+            sample_rate: 44_100,
+            level: DecoderLevel::R2,
+            ..config(DecoderLevel::R1, Profile::Hq)
+        };
+        assert!(matches!(
+            Session::open(c, MTU, &opts),
+            Err(SessionError::BadDevSetting)
+        ));
+        let mut s = Session::open(
+            Config {
+                sample_rate: 96_000,
+                ..c
+            },
+            MTU,
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(s.block_size(), 1440 * 2 * 4);
+        let src = vec![0; 1440 * 2 * 4];
+        assert_eq!(s.encode(&src, &mut [0; 1024]).unwrap().consumed, 11520);
+    }
+
+    #[test]
+    fn new_rate_session_data_thread_does_not_allocate() {
+        for (rate, block) in [(44_100, 352), (96_000, 768)] {
+            let c = Config {
+                sample_rate: rate,
+                level: DecoderLevel::R2,
+                ..config(DecoderLevel::R1, Profile::Hq)
+            };
+            let opts = Options {
+                drift_log: false,
+                ..Options::default()
+            };
+            let mut s = Session::open(c, MTU, &opts).unwrap();
+            let src = vec![0; block];
+            let mut out = [0; 1024];
+            let mut packets = 0;
+            let allocations = crate::alloc_count::count(|| {
+                let mut used = s.start_encode(&mut out, 0, 99).unwrap();
+                for i in 0..4000 {
+                    if i == 500 || i == 2200 {
+                        if rate == 44_100 {
+                            s.request(if i == 500 { Profile::Ll } else { Profile::Hq })
+                                .unwrap();
+                        } else {
+                            assert_eq!(s.request(Profile::Ll), Err(SessionError::Unsupported));
+                        }
+                    }
+                    if i % 400 == 0 {
+                        s.step_level(i % 800 == 0).unwrap();
+                    }
+                    let r = s.encode(&src, &mut out[used..]).unwrap();
+                    assert_eq!(r.consumed, block);
+                    assert_eq!(s.block_size(), block);
+                    used += r.written;
+                    if r.flush {
+                        packets += 1;
+                        s.abr_process(0);
+                        used = s.start_encode(&mut out, packets, 99).unwrap();
+                    }
+                }
+            });
+            assert_eq!(allocations, 0, "{rate} data-thread allocations");
+            assert!((100..=500).contains(&packets), "{rate} {packets} packets");
+            assert_eq!(s.stream.config(), c);
+            assert_eq!(s.profile(), Profile::Hq);
+        }
+    }
+
+    #[test]
+    fn refused_96k_ll_request_preserves_all_playback_state() {
+        let c = Config {
+            sample_rate: 96_000,
+            level: DecoderLevel::R2,
+            ..config(DecoderLevel::R1, Profile::Hq)
+        };
+        let opts = Options::default();
+        let mut s = Session::open(c, MTU, &opts).unwrap();
+        let mut unchanged = Session::open(c, MTU, &opts).unwrap();
+        let src = vec![0x55; 768];
+        let mut out = [0; 1024];
+        let mut expected = [0; 1024];
+        let fade = s.fade;
+        assert_eq!(s.request(Profile::Ll), Err(SessionError::Unsupported));
+        assert_eq!(s.fade, fade);
+        assert_eq!(
+            (s.profile(), s.target(), s.block_size(), s.interval_ns()),
+            (Profile::Hq, Profile::Hq, 768, 15_000_000)
+        );
+        assert_eq!(s.stream.config(), c);
+        for _ in 0..100 {
+            assert_eq!(
+                s.start_encode(&mut out, 1, 99),
+                unchanged.start_encode(&mut expected, 1, 99)
+            );
+            let a = s.encode(&src, &mut out[12..]).unwrap();
+            let b = unchanged.encode(&src, &mut expected[12..]).unwrap();
+            assert_eq!(
+                (a.consumed, a.written, a.flush),
+                (b.consumed, b.written, b.flush)
+            );
+            assert_eq!(out, expected);
+        }
+    }
+
+    #[test]
     fn open_without_replay_uses_encoder() {
-        let mut s = Session::open(DecoderLevel::R1, Profile::Hq, MTU, &Options::default()).unwrap();
+        let mut s = Session::open(
+            config(DecoderLevel::R1, Profile::Hq),
+            MTU,
+            &Options::default(),
+        )
+        .unwrap();
         assert_eq!(s.start_encode(&mut [0; 64], 0, 0), Ok(12));
         let src = vec![0u8; packet_size(&s)];
         let r = encode_packet(&mut s, &src, &mut [0; 1000]).unwrap();

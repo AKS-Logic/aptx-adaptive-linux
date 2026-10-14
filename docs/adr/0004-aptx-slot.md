@@ -26,6 +26,10 @@ A third slot, `APTX_ADAPTIVE_SLOT=aptx`, is the new default:
 
 So a stale drop-in can't make one file act as the other. `scripts/install-plugin.sh` installs exactly one of the two files and removes the other. `--uninstall` removes both.
 
+## live verification
+
+The October 14 Px7 S2e test used slot `aptx` with default mode `ll`. The plugin logged six real aptX codecs passed through. A host-initiated connect selected `aptx_adaptive_ll`, with the correct LL profile label and no separate aptX HD or aptX profiles. LL → HQ → LL card-profile switches worked. The user confirmed profile selection is tested on October 15. The guard did not fire, as expected for a host-initiated connect. Headset-initiated configuration remains untested ([test status](../../spec/QUESTIONS.md#current-status-2026-10-14)).
+
 ## why this works (PipeWire 1.6.9)
 
 ### one profile per id, over the codecs the device supports

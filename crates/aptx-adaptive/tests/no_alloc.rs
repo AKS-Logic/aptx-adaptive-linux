@@ -55,3 +55,60 @@ fn switch_does_not_allocate() {
         );
     }
 }
+
+#[test]
+fn new_rate_playback_and_changes_stay_bounded_without_allocations() {
+    for (rate, samples) in [(44_100, 88), (96_000, 192)] {
+        let hq = Config {
+            sample_rate: rate,
+            ..config(DecoderLevel::R2, Profile::Hq)
+        };
+        let ll = Config {
+            profile: Profile::Ll,
+            ..hq
+        };
+        let mut stream = Stream::new(hq, 875).unwrap();
+        let pcm: Vec<i32> = (0..samples).map(|i| (i * 7919) % 40_000 - 20_000).collect();
+        let mut out = [0; 1024];
+        let mut packets = [0; 3];
+        let mut drained = 0;
+        let allocations = count(|| {
+            for (phase, total) in packets.iter_mut().enumerate() {
+                if rate == 44_100 {
+                    let c = if phase == 1 { ll } else { hq };
+                    stream.reset(c, table_row(c, 875).unwrap()).unwrap();
+                }
+                let mut gap = 0;
+                for block in 0..10_000 {
+                    if block % 1000 == 0 {
+                        assert!(stream.request_level(if block % 2000 == 0 { 2 } else { 5 }));
+                    }
+                    gap += 1;
+                    if let Some(n) = stream.push(&pcm, &mut out).unwrap() {
+                        assert_eq!(
+                            n,
+                            if rate == 44_100 && phase == 1 {
+                                348
+                            } else {
+                                656
+                            }
+                        );
+                        assert!(gap <= 30, "{rate} stalled for {gap} blocks");
+                        gap = 0;
+                        *total += 1;
+                    }
+                }
+            }
+            while stream.push(&[], &mut out).unwrap().is_some() {
+                drained += 1;
+                assert!(drained <= 1, "{rate} queued more than one packet");
+            }
+        });
+        assert_eq!(allocations, 0, "{rate} allocations or buffer growth");
+        assert!(
+            packets.iter().all(|&n| (300..=1500).contains(&n)),
+            "{rate} {packets:?}"
+        );
+        assert_eq!(stream.config(), hq);
+    }
+}

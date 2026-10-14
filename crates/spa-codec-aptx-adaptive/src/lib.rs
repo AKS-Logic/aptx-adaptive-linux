@@ -251,7 +251,7 @@ unsafe extern "C" fn codec_select_config(
     _flags: u32,
     caps: *const c_void,
     caps_size: usize,
-    _info: *const media_codec_audio_info,
+    info: *const media_codec_audio_info,
     _settings: *const spa_dict,
     config: *mut u8,
     _config_data: *mut *mut c_void,
@@ -260,7 +260,9 @@ unsafe extern "C" fn codec_select_config(
     let Some(caps) = (unsafe { bytes(caps, caps_size) }) else {
         return -EINVAL;
     };
-    match caps::select_config(caps) {
+    // SAFETY: PipeWire passes its rate preference or null.
+    let preferred_rate = unsafe { info.as_ref() }.map(|i| i.rate);
+    match caps::select_config(caps, preferred_rate) {
         Ok(c) => write_out(&c, config),
         Err(e) => caps_err(e),
     }
@@ -320,16 +322,17 @@ unsafe extern "C" fn codec_enum_config(
     let Some(caps) = (unsafe { bytes(caps, caps_size) }) else {
         return -EINVAL;
     };
-    if let Err(e) = caps::validate_config(caps) {
-        return caps_err(e);
-    }
+    let config = match caps::validate_config(caps) {
+        Ok(c) => c,
+        Err(e) => return caps_err(e),
+    };
     if idx > 0 {
         return 0;
     }
     if builder.is_null() || param.is_null() {
         return -EINVAL;
     }
-    let pod = pod::raw_audio_format(id, &caps::STREAM);
+    let pod = pod::raw_audio_format(id, &caps::raw_format(config));
     // SAFETY: builder checked non-null and owned by the caller for this call.
     match unsafe { builder_append(builder, &pod) } {
         Ok(p) => {
@@ -373,9 +376,9 @@ unsafe extern "C" fn codec_validate_config(
         return -EINVAL;
     }
     match caps::validate_config(caps) {
-        Ok(_) => {
+        Ok(config) => {
             // SAFETY: info checked non-null and points at a struct spa_audio_info.
-            unsafe { info.write(audio_info(&caps::STREAM)) };
+            unsafe { info.write(audio_info(&caps::raw_format(config))) };
             0
         }
         Err(e) => caps_err(e),
@@ -523,7 +526,7 @@ unsafe extern "C" fn codec_init(
             rate: info.raw.rate,
             channels: info.raw.channels,
         };
-        let level = caps::check_stream(config, &stream).map_err(caps_err)?;
+        let mut config = caps::check_stream(config, &stream).map_err(caps_err)?;
         let var = |k: &str| std::env::var_os(k);
         // Write errors are ignored so logging cannot panic here.
         let opts = dev::Options::from_env(var).map_err(|e| {
@@ -539,8 +542,8 @@ unsafe extern "C" fn codec_init(
             || entry_profile(codec).unwrap_or(aptx_adaptive::Profile::Hq),
             Props::wanted,
         );
-        let s: Session<dev::AnyCore> =
-            Session::open(level, wanted, mtu, &opts).map_err(session_err)?;
+        config.profile = wanted;
+        let s: Session<dev::AnyCore> = Session::open(config, mtu, &opts).map_err(session_err)?;
         if s.profile() != wanted {
             let _ = writeln!(
                 std::io::stderr(),
