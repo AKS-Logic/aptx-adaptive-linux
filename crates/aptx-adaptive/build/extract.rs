@@ -300,8 +300,8 @@ impl Reader<'_> {
             }
             None if self.known_good => Ok(fallback),
             None => Err(format!(
-                "`{}` isn't in .symtab (stripped?), and the §3.3 fallback offset is only valid \
-                 for the known-good build",
+                "`{}` isn't in .symtab (stripped?), and the file doesn't match the known-good \
+                 build identity, so the §3.3 fallback can't be used",
                 F_MOD.name
             )),
         }

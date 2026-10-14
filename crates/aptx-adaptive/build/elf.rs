@@ -37,10 +37,12 @@ struct Rela {
     addend: i32,
 }
 
-struct Section<'a> {
-    name: &'a str,
+pub struct Section<'a> {
+    pub name: &'a str,
+    pub addr: u32,
+    pub size: u32,
     /// Empty for `SHT_NOBITS`.
-    bytes: &'a [u8],
+    pub bytes: &'a [u8],
     kind: u32,
     offset: usize,
     link: usize,
@@ -52,6 +54,7 @@ type Symbols<'a> = HashMap<&'a str, Sym>;
 pub struct Elf<'a> {
     data: &'a [u8],
     loads: Vec<Load>,
+    sections: Vec<Section<'a>>,
     dynsym: Symbols<'a>,
     dynsym_by_index: Vec<Sym>,
     symtab: Symbols<'a>,
@@ -165,6 +168,8 @@ fn sections(data: &[u8]) -> Result<Vec<Section<'_>>> {
             let size = u32_at(data, s, 20)?;
             Ok(Section {
                 name: cstr(data, offset(shstr, usize_at(data, s, 0)?, 1)?)?,
+                addr: u32_at(data, s, 12)?,
+                size,
                 bytes: if kind == SHT_NOBITS {
                     &[]
                 } else {
@@ -247,10 +252,15 @@ impl<'a> Elf<'a> {
             data,
             loads: loads(data)?,
             rela: rela_dyn(data, &sections)?,
+            sections,
             dynsym,
             dynsym_by_index,
             symtab,
         })
+    }
+
+    pub fn section(&self, name: &str) -> Option<&Section<'a>> {
+        self.sections.iter().find(|s| s.name == name)
     }
 
     pub fn dynsym(&self, name: &str) -> Option<Sym> {

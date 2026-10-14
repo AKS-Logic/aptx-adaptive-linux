@@ -23,7 +23,21 @@ where to get it; with mise, .scratch/libaptXAdaptiveEnc.so in the repo is the de
 /// §5: `<table id> <SHA-256 of its canonical form>` per line.
 const HASHES: &str = include_str!("build/hashes.txt");
 
-const KNOWN_GOOD: &str = "1ac881571cd1db4d256113d4448304016de73fedebc059824b1b2ed09599f0c9";
+struct Section {
+    name: &'static str,
+    addr: u32,
+    size: u32,
+    sha256: &'static str,
+}
+
+/// §1 known-good build identity.
+#[rustfmt::skip]
+const IDENTITY: [Section; 4] = [
+    Section { name: ".text", addr: 0x089A0, size: 96548, sha256: "bfa68d93528ec45041b56b4d008d6ea7e5441ddc97c7a436b33a7667da127788" },
+    Section { name: ".rodata", addr: 0x20328, size: 100_980, sha256: "7eff359c762a4c44282848de93047a032ad004a5202c08448ac40f6936dbff9d" },
+    Section { name: ".data.rel.ro", addr: 0x390A0, size: 572, sha256: "a88ed7e1052559407036e7b66303d72607ec2f53d4e3d9ea5a2d36c16a475727" },
+    Section { name: ".data", addr: 0x392E0, size: 1920, sha256: "6f75e1707084bc195bcdb98f80618ce5d847afd5cfb54cb5831c165590b9121e" },
+];
 
 fn sha256(data: &[u8]) -> String {
     Sha256::digest(data).iter().fold(String::new(), |mut s, b| {
@@ -32,10 +46,21 @@ fn sha256(data: &[u8]) -> String {
     })
 }
 
+fn is_known_good(elf: &elf::Elf) -> bool {
+    IDENTITY.iter().all(|want| {
+        elf.section(want.name).is_some_and(|s| {
+            s.addr == want.addr
+                && s.size == want.size
+                && s.bytes.len() == want.size as usize
+                && sha256(s.bytes) == want.sha256
+        })
+    })
+}
+
 fn tables(path: &Path) -> Result<String, String> {
     let data = fs::read(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
-    let known_good = sha256(&data) == KNOWN_GOOD;
     let elf = elf::Elf::parse(&data).map_err(|e| format!("{}: {e}", path.display()))?;
+    let known_good = is_known_good(&elf);
     let tables = extract::extract(&elf, known_good).map_err(|e| {
         format!(
             "{}: {e}. Only libaptXAdaptiveEnc.so (aptX Adaptive R1/R2) is supported, not the R3 \
@@ -56,7 +81,7 @@ fn tables(path: &Path) -> Result<String, String> {
     }
     if !mismatched.is_empty() {
         let kind = if known_good {
-            "the known-good build"
+            "a file matching the known-good build identity"
         } else {
             "this unrecognised build"
         };
