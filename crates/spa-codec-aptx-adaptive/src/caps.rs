@@ -1,5 +1,7 @@
 //! A2DP capability negotiation (spec `a2dp-integration.md` §1); offsets start at the vendor header.
 
+use std::path::PathBuf;
+
 use aptx_adaptive::{Config, DecoderLevel, Profile};
 
 use crate::ffi::{SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_FORMAT_S24_32_LE};
@@ -157,9 +159,38 @@ pub fn fill_caps() -> Vec<u8> {
 
 /// # Errors
 /// As for [`Caps::parse`], or `Unsupported` without a supported rate and stereo or joint stereo.
+/// Parse a rate out of the override file; anything else means "no preference".
+#[must_use]
+fn parse_rate(text: &str) -> Option<u32> {
+    match text.trim().parse::<u32>() {
+        Ok(hz) => Some(hz),
+        Err(_) => None,
+    }
+}
+
+/// Where the run-time override is read from: `APTX_ADAPTIVE_RATE_FILE`, else
+/// `$XDG_RUNTIME_DIR/aptx-adaptive-rate`.
+fn override_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("APTX_ADAPTIVE_RATE_FILE") {
+        return Some(PathBuf::from(path));
+    }
+    std::env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("aptx-adaptive-rate"))
+}
+
+/// The monitor caches the configured rate when it starts, so changing it used to
+/// mean restarting WirePlumber - which drops the Bluetooth link.  A file read on
+/// every configuration lets the rate change with only the A2DP transport being
+/// rebuilt (the same thing a phone does when it renegotiates a codec), so the
+/// headset stays connected.
+fn runtime_rate() -> Option<u32> {
+    let text = std::fs::read_to_string(override_path()?).ok()?;
+    parse_rate(&text)
+}
+
 pub fn select_config(bytes: &[u8], preferred_rate: Option<u32>) -> Result<Vec<u8>, CapsError> {
     let caps = Caps::parse(bytes)?;
     let rates = caps.rates() & caps.supported_rates();
+    let preferred_rate = runtime_rate().or(preferred_rate);
     let preferred = SUPPORTED_RATES
         .iter()
         .find(|&&(hz, bit)| Some(hz) == preferred_rate && rates & bit != 0);
@@ -542,5 +573,23 @@ mod tests {
         ] {
             assert_eq!(check_stream(&PX7_S2E_CONFIG, &bad), Err(CapsError::Invalid));
         }
+    }
+}
+
+#[cfg(test)]
+mod rate_file_tests {
+    use super::parse_rate;
+
+    #[test]
+    fn parse_rate_accepts_a_plain_number() {
+        assert_eq!(parse_rate("44100"), Some(44_100));
+        assert_eq!(parse_rate(" 96000\n"), Some(96_000));
+    }
+
+    #[test]
+    fn parse_rate_rejects_anything_else() {
+        assert_eq!(parse_rate(""), None);
+        assert_eq!(parse_rate("auto"), None);
+        assert_eq!(parse_rate("48000 Hz"), None);
     }
 }
