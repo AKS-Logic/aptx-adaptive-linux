@@ -19,10 +19,19 @@ const CHANNEL_MODES: usize = 7;
 
 const RATE_MASK: u8 = 0xF8;
 const RATE_44K: u8 = 0x08;
+/* Public sources disagree on the 44.1 kHz bit: the LineageOS header says 0x08,
+ * another variant says 0x40.  The MOMENTUM 5 advertises 0x71 (0x40 | 0x20 |
+ * 0x10), i.e. it uses the 0x40 encoding, and this host's own CAPI codec uses
+ * 0x40 for 44.1 kHz as well.  Accept both so the intersection is not empty. */
+const RATE_44K_ALT: u8 = 0x40;
 const RATE_48K: u8 = 0x10;
 const RATE_96K: u8 = 0x20;
-const SUPPORTED_RATES: [(u32, u8); 3] =
-    [(48_000, RATE_48K), (44_100, RATE_44K), (96_000, RATE_96K)];
+const SUPPORTED_RATES: [(u32, u8); 4] = [
+    (48_000, RATE_48K),
+    (44_100, RATE_44K),
+    (96_000, RATE_96K),
+    (44_100, RATE_44K_ALT),
+];
 
 pub const SOURCE_TYPE_HOST: u8 = 0x02;
 
@@ -116,8 +125,13 @@ impl<'a> Caps<'a> {
     fn supported_rates(self) -> u8 {
         match self.decoder_level() {
             DecoderLevel::R1 => RATE_48K,
-            DecoderLevel::R2 if self.features() & SINK_22_DECODER != 0 => RATE_48K | RATE_96K,
-            DecoderLevel::R2 => RATE_44K | RATE_48K | RATE_96K,
+            // A 2.2 sink at 44.1 kHz is the reference's Lossless configuration,
+            // which wants the R3 encoder we do not have; offer the rate anyway
+            // so the experiment can show whether the sink accepts R2 there.
+            DecoderLevel::R2 if self.features() & SINK_22_DECODER != 0 => {
+                RATE_44K | RATE_44K_ALT | RATE_48K | RATE_96K
+            }
+            DecoderLevel::R2 => RATE_44K | RATE_44K_ALT | RATE_48K | RATE_96K,
         }
     }
 }
