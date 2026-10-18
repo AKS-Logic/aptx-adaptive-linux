@@ -14,8 +14,6 @@
 # ~/.local/lib and ${XDG_CONFIG_HOME:-~/.config}/systemd/user in place.
 #
 # Needs cargo, pkg-config with libspa-0.2, and python3 (not for --uninstall).
-# APTX_ADAPTIVE_SO (default .scratch/libaptXAdaptiveEnc.so in the repo) is the vendor encoder
-# library the build reads the codec tables from (spec/table-extraction.md §1).
 # CARGO_FEATURES (optional) is passed to cargo build --features, e.g. dev-replay.
 # APTX_ADAPTIVE_SLOT (optional, default aptx) picks the plugin file and the codec ids the
 # plugin claims:
@@ -139,14 +137,6 @@ fi
 if [[ $slot == ldac && -e $system_plugin_dir/bluez5/libspa-codec-bluez5-ldac.so ]]; then
 	echo "note: the LDAC plugin is installed. If a headset supports both LDAC and aptX Adaptive," >&2
 	echo "      install with the default APTX_ADAPTIVE_SLOT=aptx (docs/adr/0004-aptx-slot.md)" >&2
-fi
-
-export APTX_ADAPTIVE_SO=${APTX_ADAPTIVE_SO:-$repo/.scratch/libaptXAdaptiveEnc.so}
-if [[ ! -f $APTX_ADAPTIVE_SO ]]; then
-	echo "error: $APTX_ADAPTIVE_SO not found. The codec tables are read from the vendor encoder" >&2
-	echo "       library at build time: put libaptXAdaptiveEnc.so there, or set APTX_ADAPTIVE_SO" >&2
-	echo "       to its absolute path. README.md \"install\" says where to get it." >&2
-	exit 1
 fi
 
 features=()

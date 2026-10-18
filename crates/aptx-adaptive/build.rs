@@ -119,7 +119,6 @@ fn run() -> Result<(), String> {
     };
     let Some(path) = path else {
         fs::write(&target, BUNDLED).map_err(|e| format!("can't write tables.rs: {e}"))?;
-        println!("cargo::warning={ENV} is not set; using the bundled reconstructed tables");
         return Ok(());
     };
     if !path.is_absolute() {
