@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Vendored Rust encoder behind the ported factory: kept out of the workspace so its
+# warnings/lints don't gate this crate, but still built as a path dependency.
+exclude = ["crates/aptx-native"]
 
 [workspace.package]
 edition = "2024"

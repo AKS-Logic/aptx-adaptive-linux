@@ -8,26 +8,16 @@
     reason = "the C ABI names and field names are used as prose"
 )]
 
-use std::ffi::{OsString, c_void};
+use std::ffi::OsString;
 use std::io::Write as _;
 use std::sync::Mutex;
 
-// The same C ABI the C plugin links against (-laptx_native). Keeping it a
-// link-time dependency instead of a Rust path dependency leaves the
-// clean-room workspace's package graph untouched and matches the app's build.
-#[link(name = "aptx_native")]
-unsafe extern "C" {
-    fn aptx_native_encoder_new(rate: u32, mtu: u32) -> *mut c_void;
-    fn aptx_native_encoder_free(handle: *mut c_void);
-    fn aptx_native_encoder_encode(
-        handle: *mut c_void,
-        src: *const i32,
-        frames: usize,
-        dst: *mut u8,
-        dst_size: usize,
-    ) -> isize;
-    fn aptx_native_last_blocks() -> u32;
-}
+// The codec backend is the workspace's Rust `aptx-native` crate (the same C
+// ABI the C plugin used), so no external native library is needed to build.
+use aptx_native::capi::{
+    NativeEncoder, aptx_native_encoder_encode, aptx_native_encoder_free, aptx_native_encoder_new,
+    aptx_native_last_blocks,
+};
 
 use crate::ffi::{
     EINVAL, EIO, ENOSPC, NEED_FLUSH_ALL, NEED_FLUSH_NO, SPA_AUDIO_FORMAT_S32_LE,
@@ -49,7 +39,7 @@ pub(crate) const ENCODER_DELAY_SAMPLES: u32 = 48;
 /// Serializes the process-wide APTX_NATIVE_* writes around handle creation.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-struct Native(*mut c_void);
+struct Native(*mut NativeEncoder);
 
 impl Drop for Native {
     fn drop(&mut self) {
@@ -138,9 +128,7 @@ fn native_start(mode: Mode, rate: u32, mtu: usize, container: u32) -> Result<Nat
         set_var("APTX_NATIVE_NO_CONTAINER", "1");
     }
 
-    // SAFETY: the constructor reads the environment set above and returns an
-    // owned handle or NULL.
-    let handle = unsafe { aptx_native_encoder_new(rate, mtu as u32) };
+    let handle = aptx_native_encoder_new(rate, mtu as u32);
 
     restore("APTX_NATIVE_CALLS", saved_calls);
     restore("APTX_NATIVE_LL", saved_ll);
@@ -434,8 +422,7 @@ impl Session {
         if step == 0 {
             step = (u64::from(samples) * 1_000_000 / u64::from(self.rate)) as u32;
         }
-        // SAFETY: a process-global atomic maintained by the C ABI encoder.
-        let blocks = unsafe { aptx_native_last_blocks() };
+        let blocks = aptx_native_last_blocks();
         if blocks > 0 {
             step = (u64::from(blocks) * 8 * 1_000_000 / u64::from(self.rate)) as u32;
         }

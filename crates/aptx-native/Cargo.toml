@@ -1,0 +1,16 @@
+[package]
+name = "aptx-native"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "aptX Adaptive codec rebuilt natively in Rust (C ABI for the ported plugin factory)"
+
+[lib]
+name = "aptx_native"
+path = "src/lib.rs"
+crate-type = ["lib"]
+
+[features]
+bitalloc-vendor = []
+hires-96k = []

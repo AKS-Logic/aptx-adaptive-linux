@@ -23,6 +23,9 @@ You need `mise` (it provides Rust, Python and uv: run `mise install`) and
 to build:** the reconstructed codec tables are included as Rust source in
 `crates/aptx-adaptive/bundled_tables.rs` (see [`LEGAL.md`](LEGAL.md)).
 
+The ported C-plugin factory also has no native-library dependency: its encoder
+is the in-tree Rust crate `crates/aptx-native`.
+
 Optionally you can regenerate and hash-verify those tables from your own copy of
 the vendor encoder library. Set `APTX_ADAPTIVE_SO` to an absolute path of
 `libaptXAdaptiveEnc.so` and the build extracts from it instead, failing unless

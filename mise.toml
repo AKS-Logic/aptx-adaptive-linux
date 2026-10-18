@@ -5,7 +5,13 @@ python = "3.14.8"
 uv = "0.13.0"
 
 [tasks.check]
-run = ["cargo fmt --all --check", "cargo clippy --workspace --all-targets -- -D warnings", "cargo test --workspace", "cargo clippy -p spa-codec-aptx-adaptive --all-targets --features dev-replay -- -D warnings", "cargo test -p spa-codec-aptx-adaptive --features dev-replay --lib"]
+run = [
+    "cargo fmt -p aptx-adaptive -p spa-codec-aptx-adaptive --check",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "cargo test --workspace",
+    "cargo clippy -p spa-codec-aptx-adaptive --all-targets --features dev-replay -- -D warnings",
+    "cargo test -p spa-codec-aptx-adaptive --features dev-replay --lib",
+]
 
 [tasks.install-plugin]
 run = "./scripts/install-plugin.sh"
