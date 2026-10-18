@@ -1,4 +1,4 @@
-# aptx-linux
+# aptx-adaptive-for-linux
 
 aptX Adaptive for Linux: a clean-room Rust encoder plus a PipeWire Bluetooth codec plugin. It plays audio from your computer straight to an aptX Adaptive headset, with stock BlueZ and PipeWire and no USB dongle. This reverse-engineering project is made to support bose quiet comfort ultra gen 1 and may not directly work with our headphones. Some simple tweaks may allow AI agent to adapt it your headphones. 
 
