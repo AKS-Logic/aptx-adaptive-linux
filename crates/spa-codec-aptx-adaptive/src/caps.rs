@@ -162,10 +162,7 @@ pub fn fill_caps() -> Vec<u8> {
 /// Parse a rate out of the override file; anything else means "no preference".
 #[must_use]
 fn parse_rate(text: &str) -> Option<u32> {
-    match text.trim().parse::<u32>() {
-        Ok(hz) => Some(hz),
-        Err(_) => None,
-    }
+    text.trim().parse::<u32>().ok()
 }
 
 /// Where the run-time override is read from: `APTX_ADAPTIVE_RATE_FILE`, else

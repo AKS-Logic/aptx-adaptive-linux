@@ -1,4 +1,6 @@
-use aptx_adaptive::{table_row_at_level, Config, DecoderLevel, Encoder, Profile, Stream};
+#![allow(clippy::cast_precision_loss, clippy::chunks_exact_to_as_chunks)]
+
+use aptx_adaptive::{Config, DecoderLevel, Encoder, Profile, Stream, table_row_at_level};
 
 fn main() {
     let cfg = Config {
@@ -11,8 +13,10 @@ fn main() {
     // 214 kbps makes the composer pack exactly 150 blocks (1200 samples) in
     // the 656-byte packet, matching the vendor 25 ms stream.
     row.bitrate = 214_000;
-    println!("row period {} packet {} bitrate {} samples/ch {}",
-        row.period_ms, row.packet_bytes, row.bitrate, row.samples_per_channel);
+    println!(
+        "row period {} packet {} bitrate {} samples/ch {}",
+        row.period_ms, row.packet_bytes, row.bitrate, row.samples_per_channel
+    );
     let core = Encoder::new(cfg, row.bitrate).unwrap();
     let mut s = Stream::with_core(core, cfg, row).with_budget(656);
     let per = s.samples_per_packet();
@@ -40,9 +44,19 @@ fn main() {
                 produced += 1;
             }
             Ok(None) => {}
-            Err(e) => { eprintln!("error {e:?}"); break; }
+            Err(e) => {
+                eprintln!("error {e:?}");
+                break;
+            }
         }
     }
-    std::fs::write("/home/alpha/aks-infra/audio/aptx-native/.scratch/aptx_linux_1k_4s.bin", &out_file).unwrap();
-    println!("wrote packets={produced} bytes={} path=aptx_linux_1k_4s.bin", out_file.len());
+    std::fs::write(
+        "/home/alpha/aks-infra/audio/aptx-native/.scratch/aptx_linux_1k_4s.bin",
+        &out_file,
+    )
+    .unwrap();
+    println!(
+        "wrote packets={produced} bytes={} path=aptx_linux_1k_4s.bin",
+        out_file.len()
+    );
 }

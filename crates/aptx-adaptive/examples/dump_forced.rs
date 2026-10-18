@@ -1,3 +1,5 @@
+#![allow(clippy::cast_precision_loss, clippy::chunks_exact_to_as_chunks)]
+
 use aptx_adaptive::{Config, DecoderLevel, Encoder, Profile};
 
 fn swap16(src: &[u8], dst: &mut [u8]) {
@@ -8,7 +10,12 @@ fn swap16(src: &[u8], dst: &mut [u8]) {
 }
 
 fn main() {
-    let cfg = Config { profile: Profile::Hq, sample_rate: 48_000, channels: 2, level: DecoderLevel::R2 };
+    let cfg = Config {
+        profile: Profile::Hq,
+        sample_rate: 48_000,
+        channels: 2,
+        level: DecoderLevel::R2,
+    };
     let mut e = Encoder::new(cfg, 214_000).expect("encoder");
     e.prepare(656).expect("prepare");
     let mut window = vec![0u8; 656 + 64];
@@ -45,5 +52,8 @@ fn main() {
     }
     let path = "/home/alpha/aks-infra/audio/aptx-native/.scratch/aptx_forced_1k_4s.bin";
     std::fs::write(path, &file).unwrap();
-    println!("packets={packets} bytes={} written_early={written_early} -> {path}", file.len());
+    println!(
+        "packets={packets} bytes={} written_early={written_early} -> {path}",
+        file.len()
+    );
 }

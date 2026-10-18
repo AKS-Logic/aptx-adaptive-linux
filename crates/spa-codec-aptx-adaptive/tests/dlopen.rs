@@ -225,8 +225,8 @@ fn rate_preference_and_safe_fallbacks() {
             assert_eq!(
                 config[7..26],
                 [
-                    2, 0x50, 0x64, 0x64, 0x64, 0xff, 0xff, 0, 1, 0x92, 0, 0, 0x0f, 2, 3, 3,
-                    3, 0, 0xaa,
+                    2, 0x50, 0x64, 0x64, 0x64, 0xff, 0xff, 0, 1, 0x92, 0, 0, 0x0f, 2, 3, 3, 3, 0,
+                    0xaa,
                 ]
             );
         }
@@ -397,14 +397,22 @@ fn alternate_44k_and_2p2_44k_are_accepted() {
         (true, 0x0a, 0x80, 0x0a),
         (true, 0x0a, 0x83, 0x0a),
     ] {
-        let mut config = if r2 { r2_caps(0x10, features) } else { PX7_S2E_CONFIG };
+        let mut config = if r2 {
+            r2_caps(0x10, features)
+        } else {
+            PX7_S2E_CONFIG
+        };
         config[6] = byte6;
         config[7] = 2;
         let mut info = validated_info(l.codec, &config);
         // SAFETY: valid buffers.
         let rc = unsafe {
             l.codec.validate_config.unwrap()(
-                l.codec, 0, config.as_ptr().cast(), config.len(), &raw mut info,
+                l.codec,
+                0,
+                config.as_ptr().cast(),
+                config.len(),
+                &raw mut info,
             )
         };
         assert_eq!(rc, 0, "byte6={byte6:#x} features={features:#x}");

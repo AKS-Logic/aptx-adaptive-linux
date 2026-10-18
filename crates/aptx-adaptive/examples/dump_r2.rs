@@ -1,4 +1,6 @@
-use aptx_adaptive::{table_row, Config, DecoderLevel, Profile, Stream};
+#![allow(clippy::cast_precision_loss, clippy::chunks_exact_to_as_chunks)]
+
+use aptx_adaptive::{Config, DecoderLevel, Profile, Stream, table_row};
 
 fn main() {
     let cfg = Config {
@@ -22,8 +24,10 @@ fn main() {
     }
     for q in 1..=7u8 {
         match aptx_adaptive::table_row_at_level(cfg, 656, q) {
-            Ok(row) => println!("quality {q}: period {} ms packet {} bitrate {} samples/ch {}",
-                row.period_ms, row.packet_bytes, row.bitrate, row.samples_per_channel),
+            Ok(row) => println!(
+                "quality {q}: period {} ms packet {} bitrate {} samples/ch {}",
+                row.period_ms, row.packet_bytes, row.bitrate, row.samples_per_channel
+            ),
             Err(e) => println!("quality {q}: {e:?}"),
         }
     }
@@ -31,7 +35,10 @@ fn main() {
         .filter_map(|q| aptx_adaptive::table_row_at_level(cfg, 656, q).ok())
         .find(|r| r.period_ms == 25)
         .expect("25 ms row");
-    println!("chosen row: period {} packet {} bitrate {} samples/ch {}", row.period_ms, row.packet_bytes, row.bitrate, row.samples_per_channel);
+    println!(
+        "chosen row: period {} packet {} bitrate {} samples/ch {}",
+        row.period_ms, row.packet_bytes, row.bitrate, row.samples_per_channel
+    );
     let core = aptx_adaptive::Encoder::new(cfg, row.bitrate).unwrap();
     let mut s = Stream::with_core(core, cfg, row).with_budget(656);
     let n = s.samples_per_packet();
@@ -49,7 +56,11 @@ fn main() {
         match s.push(&pcm, &mut out) {
             Ok(Some(len)) => {
                 println!("push {k}: packet {len} first {:02x?}", &out[..32.min(len)]);
-                std::fs::write("/home/alpha/aks-infra/audio/aptx-native/.scratch/aptx_linux_frame.bin", &out[..len]).unwrap();
+                std::fs::write(
+                    "/home/alpha/aks-infra/audio/aptx-native/.scratch/aptx_linux_frame.bin",
+                    &out[..len],
+                )
+                .unwrap();
             }
             Ok(None) => println!("push {k}: no packet"),
             Err(e) => {

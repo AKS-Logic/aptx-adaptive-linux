@@ -1,3 +1,5 @@
+#![allow(clippy::cast_precision_loss, clippy::chunks_exact_to_as_chunks)]
+
 use aptx_adaptive::{Config, DecoderLevel, Encoder, Profile};
 
 fn push_sine(queue: &mut Vec<i32>, phase: &mut usize, frames: usize) {
@@ -19,10 +21,26 @@ fn swap16(src: &[u8], dst: &mut [u8]) {
 }
 
 fn main() {
-    let cfg = Config { profile: Profile::Hq, sample_rate: 48_000, channels: 2, level: DecoderLevel::R2 };
-    for bitrate in [200_000u32, 202_000, 204_000, 206_000, 208_000, 210_000, 212_000, 214_000, 216_000] {
-        let mut e = match Encoder::new(cfg, bitrate) { Ok(e) => e, Err(err) => { println!("{bitrate}: new {err:?}"); continue; } };
-        if e.prepare(656).is_err() { println!("{bitrate}: prepare failed"); continue; }
+    let cfg = Config {
+        profile: Profile::Hq,
+        sample_rate: 48_000,
+        channels: 2,
+        level: DecoderLevel::R2,
+    };
+    for bitrate in [
+        200_000u32, 202_000, 204_000, 206_000, 208_000, 210_000, 212_000, 214_000, 216_000,
+    ] {
+        let mut e = match Encoder::new(cfg, bitrate) {
+            Ok(e) => e,
+            Err(err) => {
+                println!("{bitrate}: new {err:?}");
+                continue;
+            }
+        };
+        if e.prepare(656).is_err() {
+            println!("{bitrate}: prepare failed");
+            continue;
+        }
         let mut window = vec![0u8; 656 + 64];
         let mut queue: Vec<i32> = Vec::new();
         let mut phase = 0usize;
@@ -32,7 +50,13 @@ fn main() {
         let mut guard = 0usize;
         while packets < 20 && guard < 10000 {
             guard += 1;
-            let p = match e.encode_packet(&queue, &mut window) { Ok(p) => p, Err(err) => { println!("{bitrate}: enc {err:?}"); break; } };
+            let p = match e.encode_packet(&queue, &mut window) {
+                Ok(p) => p,
+                Err(err) => {
+                    println!("{bitrate}: enc {err:?}");
+                    break;
+                }
+            };
             let consumed = p.consumed.min(queue.len());
             queue.drain(..consumed);
             if p.written > 0 {

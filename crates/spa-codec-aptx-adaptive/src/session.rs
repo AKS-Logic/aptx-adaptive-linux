@@ -133,7 +133,7 @@ fn monotonic_seed() -> u32 {
 /// the phone-equivalent epoch; the monotonic fallback at least stays in the same domain
 /// relative to the host clock instead of an arbitrary 0x3048 base.
 fn st0_seed_us(link_seed: Option<u64>, lead_us: u32, fallback_seed: u32) -> u32 {
-    let base = link_seed.map_or(u64::from(fallback_seed), |seed| seed);
+    let base = link_seed.unwrap_or(u64::from(fallback_seed));
     base.saturating_add(u64::from(lead_us)) as u32
 }
 
