@@ -4,10 +4,6 @@ lefthook = "2.2.1"
 python = "3.14.8"
 uv = "0.13.0"
 
-[env]
-# The codec tables are extracted from this file at build time (spec/table-extraction.md §1).
-APTX_ADAPTIVE_SO = "{{ get_env(name='APTX_ADAPTIVE_SO', default=config_root ~ '/.scratch/libaptXAdaptiveEnc.so') }}"
-
 [tasks.check]
 run = ["cargo fmt --all --check", "cargo clippy --workspace --all-targets -- -D warnings", "cargo test --workspace", "cargo clippy -p spa-codec-aptx-adaptive --all-targets --features dev-replay -- -D warnings", "cargo test -p spa-codec-aptx-adaptive --features dev-replay --lib"]
 

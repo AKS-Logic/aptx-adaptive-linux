@@ -1,5 +1,9 @@
-//! Extracts the codec tables from the user's copy of the vendor encoder library and writes
-//! them to `$OUT_DIR/tables.rs` (`spec/table-extraction.md`).
+//! Writes the codec tables to `$OUT_DIR/tables.rs`.
+//!
+//! The reconstructed tables are bundled in `bundled_tables.rs`, so a normal build needs no
+//! vendor library. When `APTX_ADAPTIVE_SO` points at a copy of `libaptXAdaptiveEnc.so`, the
+//! extractor in `build/` regenerates the tables from it and verifies every hash instead
+//! (`spec/table-extraction.md`).
 
 #[path = "build/elf.rs"]
 mod elf;
@@ -15,6 +19,10 @@ use std::{env, fs};
 use sha2::{Digest, Sha256};
 
 const ENV: &str = "APTX_ADAPTIVE_SO";
+
+/// Reconstructed tables, checked against the known-good vendor build. Used when no
+/// `APTX_ADAPTIVE_SO` is supplied (`LEGAL.md`).
+const BUNDLED: &str = include_str!("bundled_tables.rs");
 
 const HOW_TO_GET: &str = "\
 Set APTX_ADAPTIVE_SO to the absolute path of libaptXAdaptiveEnc.so. README.md \"install\" says \
@@ -100,12 +108,20 @@ fn tables(path: &Path) -> Result<String, String> {
 fn run() -> Result<(), String> {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=build");
+    println!("cargo::rerun-if-changed=bundled_tables.rs");
     println!("cargo::rerun-if-env-changed={ENV}");
+    let out = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set")?);
+    let target = out.join("tables.rs");
+
     let path = match env::var_os(ENV) {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => return Err(format!("{ENV} is not set. {HOW_TO_GET}")),
+        Some(p) if !p.is_empty() => Some(PathBuf::from(p)),
+        _ => None,
     };
-    println!("cargo::rerun-if-changed={}", path.display());
+    let Some(path) = path else {
+        fs::write(&target, BUNDLED).map_err(|e| format!("can't write tables.rs: {e}"))?;
+        println!("cargo::warning={ENV} is not set; using the bundled reconstructed tables");
+        return Ok(());
+    };
     if !path.is_absolute() {
         return Err(format!(
             "{ENV}={} is relative; give an absolute path. {HOW_TO_GET}",
@@ -113,14 +129,15 @@ fn run() -> Result<(), String> {
         ));
     }
     if !path.is_file() {
-        return Err(format!(
-            "{ENV}={} doesn't exist. {HOW_TO_GET}",
+        fs::write(&target, BUNDLED).map_err(|e| format!("can't write tables.rs: {e}"))?;
+        println!(
+            "cargo::warning={ENV}={} doesn't exist; using the bundled reconstructed tables",
             path.display()
-        ));
+        );
+        return Ok(());
     }
-    let out = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set")?);
-    fs::write(out.join("tables.rs"), tables(&path)?)
-        .map_err(|e| format!("can't write tables.rs: {e}"))
+    println!("cargo::rerun-if-changed={}", path.display());
+    fs::write(&target, tables(&path)?).map_err(|e| format!("can't write tables.rs: {e}"))
 }
 
 fn main() {

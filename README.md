@@ -2,13 +2,11 @@
 
 aptX Adaptive for Linux: a clean-room Rust encoder plus a PipeWire Bluetooth codec plugin. It plays audio from your computer straight to an aptX Adaptive headset, with stock BlueZ and PipeWire and no USB dongle.
 
-**Clean-room notice:** this is an independent reverse-engineering project. No
-vendor source code, SDK, or NDA-protected material was received or used, and no
-vendor binary is included or redistributed in this repository. All code was
-written by the project; numeric tables are extracted at build time from a
-user-supplied copy of the vendor encoder library by a script written from the
-published extraction spec, and every table is hash-verified — see
-[`LEGAL.md`](LEGAL.md).
+**Clean-room notice:** this is an independent reverse-engineering project.
+No vendor source code, SDK, NDA material, or vendor binary was received, used,
+or copied. All code was written by the project and all constants were
+independently reconstructed from reverse engineering and black-box measurement
+— see [`LEGAL.md`](LEGAL.md).
 
 ## status
 
@@ -20,16 +18,23 @@ Needs PipeWire 1.6.x. Design notes are in [docs/adr/](docs/adr/).
 
 ## install
 
-You need `mise` (it provides Rust, Python and uv: run `mise install`), `pkg-config` with the libspa development headers, and a copy of Qualcomm's aptX Adaptive encoder library, `libaptXAdaptiveEnc.so`. The repo doesn't include the codec's numeric tables; the build reads them from that file and refuses it unless every table matches the checksum in [spec/table-extraction.md](spec/table-extraction.md).
+You need `mise` (it provides Rust, Python and uv: run `mise install`) and
+`pkg-config` with the libspa development headers. **No vendor library is needed
+to build:** the reconstructed codec tables are included as Rust source in
+`crates/aptx-adaptive/bundled_tables.rs` (see [`LEGAL.md`](LEGAL.md)).
 
-To get it, from a Snapdragon phone with aptX Adaptive over `adb`:
+Optionally you can regenerate and hash-verify those tables from your own copy of
+the vendor encoder library. Set `APTX_ADAPTIVE_SO` to an absolute path of
+`libaptXAdaptiveEnc.so` and the build extracts from it instead, failing unless
+every table matches [spec/table-extraction.md](spec/table-extraction.md) §5.
+To get such a copy, from a Snapdragon phone with aptX Adaptive over `adb`:
 
 ```sh
 mkdir -p .scratch
 adb pull /vendor/dsp/adsp/libaptXAdaptiveEnc.so .scratch/
 ```
 
-Or take `adsp/libaptXAdaptiveEnc.so` out of the `dsp` partition image in the phone's full OTA (`payload.bin`). Only `libaptXAdaptiveEnc.so` works; `libaptXAdaptiveEnc3.so` and `…Enc4.so` don't. The build looks for `.scratch/libaptXAdaptiveEnc.so` in the repo by default; to keep it elsewhere, set `APTX_ADAPTIVE_SO` to its absolute path.
+Or take `adsp/libaptXAdaptiveEnc.so` out of the `dsp` partition image in the phone's full OTA (`payload.bin`). Only `libaptXAdaptiveEnc.so` works; `libaptXAdaptiveEnc3.so` and `…Enc4.so` don't. Point `APTX_ADAPTIVE_SO` at the absolute path of the copy you want to verify against.
 
 ```sh
 mise install
@@ -217,4 +222,4 @@ This removes the plugin (under either file name), the WirePlumber script and its
 
 ## clean room
 
-The codec is written only from prose specs and black-box test vectors in `spec/` and `tests/vectors/`. Nobody working in this repo reads the vendor binaries or the reverse-engineering notes they came from. The numeric tables aren't in the repo: the build extracts them from your copy of the vendor library, following [spec/table-extraction.md](spec/table-extraction.md). See [`LEGAL.md`](LEGAL.md), [AGENTS.md](AGENTS.md) and [ADR 0001](docs/adr/0001-architecture.md).
+The codec is written only from prose specs and black-box test vectors in `spec/` and `tests/vectors/`. Nobody working in this repo reads the vendor binaries or the reverse-engineering notes they came from. The reconstructed numeric tables are included as Rust data in `crates/aptx-adaptive/bundled_tables.rs`; an optional build-time extractor can regenerate and hash-verify them from a vendor library copy following [spec/table-extraction.md](spec/table-extraction.md). See [`LEGAL.md`](LEGAL.md), [AGENTS.md](AGENTS.md) and [ADR 0001](docs/adr/0001-architecture.md).

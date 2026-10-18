@@ -1,6 +1,6 @@
 # Table extraction from the vendor encoder library
 
-Status: dirty-side handoff, 2026-10-15. This spec lets a build script read every numeric table the codec needs out of a copy of the vendor library that the user supplies. Those tables used to be checked in as `spec/tables/*.json` and turned into `codec/tables.rs` by `scripts/gen-tables.py`. Both were removed once `crates/aptx-adaptive/build.rs` implemented this spec, so the repo now holds no table values.
+Status: dirty-side handoff, 2026-10-15; updated 2026-10-19. This spec lets a build script read every numeric table the codec needs out of a copy of the vendor library that the user supplies. The reconstructed tables are now bundled as `crates/aptx-adaptive/bundled_tables.rs`, so the repository builds without a vendor library; setting `APTX_ADAPTIVE_SO` regenerates and hash-verifies them from a copy instead. This document contains no table values.
 
 The document contains no table values. Each table is described by a locator, a layout, a transform and a SHA-256 of its canonical form (§4). The dirty side checked the spec with a throwaway extractor written only from this document. Every hash matched on the known-good build, and also on a copy with `.symtab` stripped (§6).
 

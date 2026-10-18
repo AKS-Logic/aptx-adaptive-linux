@@ -15,12 +15,6 @@ by static analysis and measurement of lawfully obtained shipped binaries, and
 by black-box observation of on-air data. They were not copied from any vendor
 header, source file, or SDK.
 
-The codec tables are not stored in this repository. A build script written only
-from the published table-extraction specification reads them mechanically from a
-user-supplied copy of the vendor encoder library and fails the build unless every
-table matches its expected hash. That script is the only place a vendor binary is
-touched; no vendor binary, table dump, or decompiled output is included here.
-
 ## Sources of information
 
 1. **Public specifications and public source code** — Bluetooth SIG A2DP
@@ -41,12 +35,8 @@ touched; no vendor binary, table dump, or decompiled output is included here.
 * **Included:** original MIT-licensed code and documentation; reconstructed
   numeric tables required for interoperability.
 * **Not included:** Qualcomm binaries, SDKs, headers, confidential documents,
-  or source code. The Rust crate does not link against or redistribute any
-  vendor library. Building the codec crate from source requires a user-supplied
-  copy of the vendor encoder library: a build script written only from the
-  published table-extraction specification reads the numeric tables from it and
-  fails unless every table matches its expected hash. No vendor binary, table
-  dump, or decompiled output is included in this repository.
+  or source code. The Rust crate does not link against, load, or require any
+  vendor library at build time.
 
 ## License
 
