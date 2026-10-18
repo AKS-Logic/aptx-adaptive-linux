@@ -187,13 +187,50 @@ fn runtime_rate() -> Option<u32> {
     parse_rate(&text)
 }
 
+/// DEBUG/TEST ONLY (96 kHz negotiation investigation): parse the value of
+/// `APTX_ADAPTIVE_FORCE_RATE`. Anything but a plain number means "no override".
+#[must_use]
+fn forced_rate_from(value: Option<&str>) -> Option<u32> {
+    value.and_then(parse_rate)
+}
+
+/// DEBUG/TEST ONLY (96 kHz negotiation investigation): `APTX_ADAPTIVE_FORCE_RATE`
+/// makes [`select_config`] emit a rate bit the sink did not advertise, so 96 kHz
+/// can be exercised against a sink whose caps lack [`RATE_96K`]. Unset in normal
+/// operation; see `select_config_with` for the selection rule.
+fn forced_rate() -> Option<u32> {
+    match std::env::var("APTX_ADAPTIVE_FORCE_RATE") {
+        Ok(text) => forced_rate_from(Some(&text)),
+        Err(_) => None,
+    }
+}
+
 pub fn select_config(bytes: &[u8], preferred_rate: Option<u32>) -> Result<Vec<u8>, CapsError> {
+    select_config_with(bytes, preferred_rate, forced_rate())
+}
+
+/// `forced_hz` is the DEBUG/TEST ONLY override: when it names an entry of
+/// [`SUPPORTED_RATES`], that rate bit wins without consulting the sink's
+/// advertised bits (`rates`). The stereo/joint-stereo requirement still applies,
+/// and a value outside [`SUPPORTED_RATES`] falls back to the normal selection.
+/// `None` is the production path and behaves exactly as before.
+fn select_config_with(
+    bytes: &[u8],
+    preferred_rate: Option<u32>,
+    forced_hz: Option<u32>,
+) -> Result<Vec<u8>, CapsError> {
     let caps = Caps::parse(bytes)?;
     let rates = caps.rates() & caps.supported_rates();
     let preferred_rate = runtime_rate().or(preferred_rate);
-    let preferred = SUPPORTED_RATES
+    // DEBUG/TEST ONLY: this is the override; it deliberately ignores `rates`.
+    let forced = SUPPORTED_RATES
         .iter()
-        .find(|&&(hz, bit)| Some(hz) == preferred_rate && rates & bit != 0);
+        .find(|&&(hz, _)| Some(hz) == forced_hz);
+    let preferred = forced.or_else(|| {
+        SUPPORTED_RATES
+            .iter()
+            .find(|&&(hz, bit)| Some(hz) == preferred_rate && rates & bit != 0)
+    });
     let &(_, rate) = preferred
         .or_else(|| SUPPORTED_RATES.iter().find(|&&(_, bit)| rates & bit != 0))
         .ok_or(CapsError::Unsupported)?;
@@ -473,6 +510,35 @@ mod tests {
         assert_eq!(select_config(&caps).unwrap()[RATES], 0x12);
     }
 
+    // DEBUG/TEST ONLY: 96 kHz negotiation investigation. PX7_S2E advertises
+    // 0x18 (44.1/48 kHz), so 0x20 is absent and the normal intersection can
+    // never pick 96 kHz.
+    #[test]
+    fn forced_rate_wins_over_sink_caps() {
+        assert_eq!(PX7_S2E[RATES] & RATE_MASK & RATE_96K, 0);
+        let config = select_config_with(&PX7_S2E, None, Some(96_000)).unwrap();
+        assert_eq!(config[RATES], RATE_96K | SOURCE_TYPE_HOST);
+        assert_eq!(config[RATES], 0x22);
+        // The channel-mode requirement is unchanged.
+        assert_eq!(config[CHANNEL_MODES], CHANNEL_STEREO);
+    }
+
+    #[test]
+    fn forced_rate_outside_supported_rates_falls_back() {
+        for hz in [88_200, 192_000] {
+            assert_eq!(
+                select_config_with(&PX7_S2E, None, Some(hz)).unwrap(),
+                PX7_S2E_CONFIG,
+                "{hz}"
+            );
+        }
+        // The unforced production path stays byte-identical.
+        assert_eq!(
+            select_config_with(&PX7_S2E, None, None).unwrap(),
+            PX7_S2E_CONFIG
+        );
+    }
+
     #[test]
     fn select_config_replaces_zero_latency() {
         let config = select_config(&PX7_S2E).unwrap();
@@ -578,7 +644,7 @@ mod tests {
 
 #[cfg(test)]
 mod rate_file_tests {
-    use super::parse_rate;
+    use super::{forced_rate_from, parse_rate};
 
     #[test]
     fn parse_rate_accepts_a_plain_number() {
@@ -591,5 +657,15 @@ mod rate_file_tests {
         assert_eq!(parse_rate(""), None);
         assert_eq!(parse_rate("auto"), None);
         assert_eq!(parse_rate("48000 Hz"), None);
+    }
+
+    // DEBUG/TEST ONLY: covers the env-value parsing without mutating the process
+    // environment, so parallel tests can't see a forced rate.
+    #[test]
+    fn forced_rate_from_requires_a_plain_number() {
+        assert_eq!(forced_rate_from(Some("96000")), Some(96_000));
+        assert_eq!(forced_rate_from(Some(" 96000\n")), Some(96_000));
+        assert_eq!(forced_rate_from(None), None);
+        assert_eq!(forced_rate_from(Some("auto")), None);
     }
 }
