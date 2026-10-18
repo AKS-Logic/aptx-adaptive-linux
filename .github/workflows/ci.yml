@@ -6,15 +6,17 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      APTX_ADAPTIVE_SO_URL: ${{ secrets.APTX_ADAPTIVE_SO_URL }}
     steps:
       - uses: actions/checkout@v5
       - uses: jdx/mise-action@v3
       - name: fetch the vendor library for optional table verification
-        if: ${{ secrets.APTX_ADAPTIVE_SO_URL != '' }}
+        if: env.APTX_ADAPTIVE_SO_URL != ''
         run: |
           mkdir -p .scratch
           curl --fail --silent --show-error --location --retry 3 \
             --output "$GITHUB_WORKSPACE/.scratch/libaptXAdaptiveEnc.so" \
-            "${{ secrets.APTX_ADAPTIVE_SO_URL }}"
+            "$APTX_ADAPTIVE_SO_URL"
           echo "APTX_ADAPTIVE_SO=$GITHUB_WORKSPACE/.scratch/libaptXAdaptiveEnc.so" >> "$GITHUB_ENV"
       - run: mise run check
