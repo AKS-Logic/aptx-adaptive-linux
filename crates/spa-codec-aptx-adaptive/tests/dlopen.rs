@@ -208,13 +208,16 @@ fn rate_preference_and_safe_fallbacks() {
         (0x38, 0x03, Some(192_000), 0x12),
         (0x28, 0x03, Some(48_000), 0x0a),
         (0x20, 0x03, None, 0x22),
-        (0x38, 0x83, Some(44_100), 0x12),
-        (0x28, 0x80, Some(44_100), 0x22),
+        (0x38, 0x83, Some(44_100), 0x0a),
+        (0x28, 0x80, Some(44_100), 0x0a),
         (0x38, 0xff, Some(96_000), 0x22),
     ] {
         for c in [l.codec, l.ll] {
             let (n, config) = select_preferred(c, &r2_caps(rates, features), preferred);
-            assert_eq!(n, 40);
+            assert_eq!(
+                n, 40,
+                "rates={rates:#x} features={features:#x} preferred={preferred:?}"
+            );
             assert_eq!(
                 config[6], expected,
                 "{rates:#x} {features:#x} {preferred:?}"
@@ -222,8 +225,8 @@ fn rate_preference_and_safe_fallbacks() {
             assert_eq!(
                 config[7..26],
                 [
-                    2, 0x50, 0x64, 0x64, 0x64, 0xff, 0xff, 0, 1, 0, 0, 0, 0x0f, 2, 3, 3, 3, 0,
-                    0xaa,
+                    2, 0x50, 0x64, 0x64, 0x64, 0xff, 0xff, 0, 1, 0x92, 0, 0, 0x0f, 2, 3, 3,
+                    3, 0, 0xaa,
                 ]
             );
         }
@@ -234,8 +237,16 @@ fn rate_preference_and_safe_fallbacks() {
             PX7_S2E_CONFIG
         );
     }
-    for caps in [r2_caps(0x08, 0x80), r2_caps(0x08, 0x83), r2_caps(0x40, 0)] {
-        assert_eq!(select_preferred(l.codec, &caps, Some(44_100)).0, -ENOTSUP);
+    // baizhu945's fork: 44.1 kHz is offered to 2.2 sinks and the alternate
+    // 0x40 rate bit is accepted, so these are now valid configurations.
+    for (caps, want) in [
+        (r2_caps(0x08, 0x80), 0x0a),
+        (r2_caps(0x08, 0x83), 0x0a),
+        (r2_caps(0x40, 0), 0x42),
+    ] {
+        let (n, config) = select_preferred(l.codec, &caps, Some(44_100));
+        assert_eq!(n, 40);
+        assert_eq!(config[6], want);
     }
 }
 
@@ -377,6 +388,35 @@ fn new_rate_init_rejects_pcm_mismatches() {
 }
 
 #[test]
+fn alternate_44k_and_2p2_44k_are_accepted() {
+    let l = load();
+    // 0x40 is the alternate 44.1 kHz bit; baizhu945's fork accepts it so the
+    // MOMENTUM 5 (0x71 caps) can negotiate 44.1 kHz instead of falling to 48k.
+    for (r2, byte6, features, want) in [
+        (true, 0x42, 0x03, 0x42),
+        (true, 0x0a, 0x80, 0x0a),
+        (true, 0x0a, 0x83, 0x0a),
+    ] {
+        let mut config = if r2 { r2_caps(0x10, features) } else { PX7_S2E_CONFIG };
+        config[6] = byte6;
+        config[7] = 2;
+        let mut info = validated_info(l.codec, &config);
+        // SAFETY: valid buffers.
+        let rc = unsafe {
+            l.codec.validate_config.unwrap()(
+                l.codec, 0, config.as_ptr().cast(), config.len(), &raw mut info,
+            )
+        };
+        assert_eq!(rc, 0, "byte6={byte6:#x} features={features:#x}");
+        let (n, out) = select_preferred(l.codec, &config[..], None);
+        assert_eq!(n, 40);
+        if want != 0 {
+            assert_eq!(out[6], want, "byte6={byte6:#x} features={features:#x}");
+        }
+    }
+}
+
+#[test]
 fn invalid_rate_masks_and_r1_non48_are_rejected() {
     let l = load();
     for (r2, byte6, features) in [
@@ -384,13 +424,10 @@ fn invalid_rate_masks_and_r1_non48_are_rejected() {
         (true, 0x1a, 0),
         (true, 0x2a, 0),
         (true, 0x32, 0),
-        (true, 0x42, 0),
         (true, 0x82, 0),
         (true, 0xa2, 0),
         (false, 0x0a, 0),
         (false, 0x22, 0),
-        (true, 0x0a, 0x80),
-        (true, 0x0a, 0x83),
     ] {
         let mut config = if r2 {
             r2_caps(0x10, features)
@@ -1501,6 +1538,7 @@ fn fill_caps(c: &media_codec) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "requires a stock aptX plugin; this host installs the adaptive plugin as the aptX plugin"]
 fn aptx_slot_passes_real_codecs_through() {
     let Some(dir) = std::env::var_os(PLUGIN_DIR_VAR) else {
         let Some(real) = real_aptx() else { return };
