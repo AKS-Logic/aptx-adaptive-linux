@@ -7,6 +7,11 @@ reverse-engineering project is made to support the Bose Quiet Comfort Ultra
 (gen 1) and may not work directly with other headphones; some simple tweaks
 may allow an AI agent to adapt it to yours.
 
+**Clean-room notice:** this is an independent clean-room reimplementation. No
+vendor source code, SDK, headers, NDA material, or vendor binary is included
+or redistributed in this repository; all original code was written by the
+project. See [`LEGAL.md`](LEGAL.md) for the full statement.
+
 ## what it can do
 
 - **Two listening modes on one headset.** High-quality (HQ) and Low Latency
@@ -158,8 +163,28 @@ systemctl --user restart wireplumber pipewire
 This removes the plugin, the WirePlumber guard script and configuration, and
 the systemd drop-ins. It is safe to run twice.
 
-## license
+## legal
 
-MIT; see [`LICENSE`](LICENSE). aptX, aptX Adaptive, aptX HD and aptX Low
-Latency are trademarks of Qualcomm Incorporated. This project is not
-affiliated with, sponsored by or endorsed by Qualcomm.
+This repository is an independent, clean-room reimplementation of aptX
+Adaptive and its A2DP transport for Linux. It contains no vendor source code,
+SDK, headers, confidential documents or vendor binaries; all original code and
+documentation was written by the project, and reconstructed numeric data is
+included only for interoperability. The full legal notes — including sources
+of information, jurisdiction and limitation of liability — are in
+[`LEGAL.md`](LEGAL.md).
+
+Trademarks:
+
+- `aptX`, `aptX Adaptive`, `aptX HD`, `aptX Low Latency` and related marks are
+  trademarks of Qualcomm Incorporated.
+- Bluetooth and the Bluetooth word mark are trademarks of the Bluetooth SIG,
+  Inc.
+- PipeWire, WirePlumber, BlueZ and Linux are trademarks or registered
+  trademarks of their respective owners.
+- All other trademarks are the property of their respective owners.
+
+This project is not affiliated with, sponsored by or endorsed by Qualcomm or
+the Bluetooth SIG.
+
+All original code and documentation is MIT-licensed; see
+[`LICENSE`](LICENSE).
