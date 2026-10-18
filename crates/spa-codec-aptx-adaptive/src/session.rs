@@ -10,6 +10,7 @@ use aptx_adaptive::{Config, Core, Encoder, Error, Profile, Row, Stream, packet_b
 
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::path::Path;
 
 use crate::dev::{AnyCore, Options, Replay};
 use crate::drift::Drift;
@@ -31,6 +32,115 @@ pub fn mode_ssrc(profile: Profile) -> u32 {
     match profile {
         Profile::Hq => 0xA3,
         Profile::Ll => 0xA1,
+    }
+}
+
+/// The snapshot a watcher keeps fresh so a host encoder can reconstruct the Bluetooth
+/// piconet clock. `APTX_ADAPTIVE_CLOCK_FILE` overrides it.
+const DEFAULT_CLOCK_FILE: &str = "/run/user/1000/aptx-linkclock";
+
+/// Piconet clock ticks are 312.5 µs, so one tick is `625 / 2` µs.
+const LINK_TICK_US_NUM: u64 = 625;
+const LINK_TICK_US_DEN: u64 = 2;
+
+/// LL and Hi-Res source leads in milliseconds, from the modes header's TTP body bytes 8/9.
+const TTP_LEAD_LL_MS: u32 = 60;
+const TTP_LEAD_HQ_MS: u32 = 200;
+
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+unsafe extern "C" {
+    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
+}
+
+const CLOCK_MONOTONIC: i32 = 1;
+
+fn monotonic_us() -> u64 {
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: CLOCK_MONOTONIC is valid and ts is a writable timespec.
+    let rc = unsafe { clock_gettime(CLOCK_MONOTONIC, &raw mut ts) };
+    if rc != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add((ts.tv_nsec as u64) / 1000)
+}
+
+/// Parse a link-clock snapshot: `"<monotonic_us> <piconet_clock>"` or a bare piconet
+/// clock. Returns the link clock in µs, `clock * 625 / 2 + age_us`; a two-field file ages
+/// the snapshot by `now_mono_us - monotonic_us`. A non-numeric second field is ignored,
+/// leaving the bare-clock form, and junk before the first number means no seed.
+fn parse_link_clock_seed(text: &str, now_mono_us: u64) -> Option<u64> {
+    let mut fields = text.split_whitespace();
+    let mono_us = fields.next()?.parse::<u64>().ok()?;
+    let piconet = fields.next().and_then(|field| field.parse::<u64>().ok());
+    let clock = piconet.unwrap_or(mono_us);
+    if clock == 0 {
+        return None;
+    }
+    let age_us = match piconet {
+        Some(_) if mono_us != 0 && now_mono_us > mono_us => now_mono_us - mono_us,
+        _ => 0,
+    };
+    Some(
+        clock
+            .saturating_mul(LINK_TICK_US_NUM)
+            .saturating_div(LINK_TICK_US_DEN)
+            .saturating_add(age_us),
+    )
+}
+
+/// Read `clock_file` and turn it into a microsecond link-clock seed, or `None` when the
+/// file is absent, unreadable, or holds no usable clock. Pure apart from the read, so the
+/// parser and the arithmetic above are unit-tested without a live watcher.
+fn link_clock_seed_us(clock_file: Option<&Path>, now_mono_us: u64) -> Option<u64> {
+    let text = std::fs::read_to_string(clock_file?).ok()?;
+    parse_link_clock_seed(&text, now_mono_us)
+}
+
+const fn default_ttp_lead_ms(profile: Profile) -> u32 {
+    match profile {
+        Profile::Ll => TTP_LEAD_LL_MS,
+        Profile::Hq => TTP_LEAD_HQ_MS,
+    }
+}
+
+/// `APTX_ADAPTIVE_TTP_LEAD_MS` when set and numeric, else the profile's nominal lead.
+fn ttp_lead_us(profile: Profile) -> u32 {
+    std::env::var("APTX_ADAPTIVE_TTP_LEAD_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(default_ttp_lead_ms(profile))
+        .saturating_mul(1_000)
+}
+
+/// Fallback ST0 seed when no link-clock snapshot is available: the host's monotonic
+/// clock. The pre-fix wall-clock base (`0x3048_0000 + subsec`) is never used again — it
+/// sits minutes outside the sink's playout window and reproduces the Bose silence.
+fn monotonic_seed() -> u32 {
+    (monotonic_us() & 0xffff_ffff) as u32
+}
+
+/// The ST0 seed is always the chosen epoch plus the mode's TTP lead. A link-clock seed is
+/// the phone-equivalent epoch; the monotonic fallback at least stays in the same domain
+/// relative to the host clock instead of an arbitrary 0x3048 base.
+fn st0_seed_us(link_seed: Option<u64>, lead_us: u32, fallback_seed: u32) -> u32 {
+    let base = link_seed.map_or(u64::from(fallback_seed), |seed| seed);
+    base.saturating_add(u64::from(lead_us)) as u32
+}
+
+const fn profile_log_name(profile: Profile) -> &'static str {
+    match profile {
+        Profile::Ll => "aptx_adaptive_ll",
+        Profile::Hq => "aptx_adaptive_hires",
     }
 }
 
@@ -127,9 +237,13 @@ pub struct Session<C> {
     /// packets are what they are.
     abr: bool,
     logged: (Profile, (u8, u32)),
-    /// ST0 mode: the µs time-to-play clock (spec §7D). Seeded arbitrarily, advanced by the
-    /// packet duration on every emitted packet.
+    /// ST0 mode: the µs time-to-play clock (spec §7D). Seeded from the Bluetooth link
+    /// clock (plus the TTP lead) on the first packet, or from wall time when no link-clock
+    /// snapshot exists, then advanced by the packet duration on every emitted packet.
     st0_ts_us: u32,
+    /// Whether `st0_ts_us` has been seeded for this stream. The link clock is read lazily
+    /// so a stream that never sends ST0 packets leaves it untouched.
+    st0_seeded: bool,
 }
 
 /// `reduce_bitpool` never goes below this level (§7L); level 1 is treated as 2 anyway.
@@ -267,11 +381,8 @@ impl<C: Core> Session<C> {
             refused: 0,
             abr: true,
             logged: (c.profile, (stream_level, stream_bitrate)),
-            st0_ts_us: (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_micros())
-                .unwrap_or(0))
-            .wrapping_add(0x3048_0000),
+            st0_ts_us: monotonic_seed(),
+            st0_seeded: false,
         })
     }
 
@@ -496,6 +607,37 @@ impl<C: Core> Session<C> {
         );
     }
 
+    /// Seed the ST0 time-to-play clock once, when the first packet is framed.
+    ///
+    /// The old audible plugin seeds from the Bluetooth piconet clock written by the
+    /// external watcher: RTP time is the sink's absolute link time plus the mode's TTP
+    /// lead. Read `APTX_ADAPTIVE_CLOCK_FILE` when set, else
+    /// [`DEFAULT_CLOCK_FILE`]. Without a usable snapshot, fall back to the host monotonic
+    /// clock plus the lead; the old wall-clock base is never reused.
+    fn seed_st0(&mut self) {
+        let env_file = std::env::var_os("APTX_ADAPTIVE_CLOCK_FILE");
+        let path = match env_file.as_deref() {
+            Some(value) if !value.is_empty() => Path::new(value),
+            _ => Path::new(DEFAULT_CLOCK_FILE),
+        };
+        let link_seed = link_clock_seed_us(Some(path), monotonic_us());
+        let lead_us = ttp_lead_us(self.profile());
+        self.st0_ts_us = st0_seed_us(link_seed, lead_us, monotonic_seed());
+        self.st0_seeded = true;
+        if !cfg!(test) {
+            let (seed_source, logged_lead_ms) = match link_seed {
+                Some(_) => ("link-clock", lead_us / 1_000),
+                None => ("monotonic", 0),
+            };
+            let _ = writeln!(
+                std::io::stderr(),
+                "aptx-adaptive: st0 seed={seed_source} seed_us={} lead={logged_lead_ms} mode={}",
+                self.st0_ts_us,
+                profile_log_name(self.profile()),
+            );
+        }
+    }
+
     /// Writes the RTP header (and the dev SCMS-T byte) and returns its length. PipeWire's
     /// sample-count `_timestamp` isn't used: §7F defines its own.
     ///
@@ -516,6 +658,9 @@ impl<C: Core> Session<C> {
         h[1] = RTP_PAYLOAD_TYPE;
         h[2..4].copy_from_slice(&seqnum.to_be_bytes());
         if st0_mode() {
+            if !self.st0_seeded {
+                self.seed_st0();
+            }
             h[4..8].copy_from_slice(&self.st0_ts_us.to_be_bytes());
             let step = (self.interval_ns() / 1_000) as u32;
             self.st0_ts_us = self.st0_ts_us.wrapping_add(step);
@@ -1561,5 +1706,78 @@ mod tests {
         let r = encode_packet(&mut s, &src, &mut dst).unwrap();
         assert_eq!((r.written, r.flush), (656, true));
         assert_eq!((dst[0] & 0x7F, dst[1], dst[3]), (0x01, 0x00, 0xA1));
+    }
+
+    /// `759145` piconet ticks are `759145 * 312.5` µs, truncated to a whole µs.
+    const CLOCK_SEED: u64 = 237_232_812;
+
+    #[test]
+    fn link_clock_parser_accepts_a_bare_clock() {
+        assert_eq!(parse_link_clock_seed("759145", 0), Some(CLOCK_SEED));
+        assert_eq!(
+            parse_link_clock_seed("  759145\n", 1_000_000),
+            Some(CLOCK_SEED),
+            "a bare clock is never aged"
+        );
+    }
+
+    #[test]
+    fn link_clock_parser_ages_a_two_field_snapshot() {
+        assert_eq!(
+            parse_link_clock_seed("1000000 759145", 1_500_000),
+            Some(CLOCK_SEED + 500_000)
+        );
+        assert_eq!(
+            parse_link_clock_seed("1000000 759145", 900_000),
+            Some(CLOCK_SEED),
+            "a snapshot from the future is used as-is"
+        );
+        assert_eq!(
+            parse_link_clock_seed("0 759145", 5_000_000),
+            Some(CLOCK_SEED),
+            "a zero monotonic field disables ageing"
+        );
+    }
+
+    #[test]
+    fn link_clock_parser_ignores_junk() {
+        for text in ["", "   ", "junk", "junk 759145", "-1", "0", "0 0"] {
+            assert_eq!(parse_link_clock_seed(text, 1_000_000), None, "{text:?}");
+        }
+        assert_eq!(
+            parse_link_clock_seed("759145 junk", 1_000_000),
+            Some(CLOCK_SEED),
+            "an unparsable second field leaves the bare-clock form"
+        );
+        assert_eq!(
+            parse_link_clock_seed("759145 42 extra", 1_000_000),
+            Some(253_980),
+            "trailing fields are ignored; 42 ticks plus 240_855 µs of age"
+        );
+    }
+
+    #[test]
+    fn link_clock_helper_without_a_file_is_none() {
+        assert_eq!(link_clock_seed_us(None, 1_000_000), None);
+        assert_eq!(
+            link_clock_seed_us(Some(Path::new("/nonexistent/aptx-linkclock")), 1_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn st0_seed_always_adds_the_lead() {
+        assert_eq!(
+            st0_seed_us(Some(63_640_312), 60_000, 0x3048_0000),
+            63_700_312
+        );
+        assert_eq!(st0_seed_us(Some(1_000), 200_000, 0), 201_000);
+        assert_eq!(
+            st0_seed_us(None, 60_000, 0x3048_1234),
+            0x3048_1234u32.wrapping_add(60_000),
+            "the fallback also gets the lead"
+        );
+        assert_eq!(default_ttp_lead_ms(Profile::Ll), 60);
+        assert_eq!(default_ttp_lead_ms(Profile::Hq), 200);
     }
 }
