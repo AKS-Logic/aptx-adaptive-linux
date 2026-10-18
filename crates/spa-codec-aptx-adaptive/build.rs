@@ -18,4 +18,12 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| FALLBACK.to_owned());
     println!("cargo::rustc-env=APTX_ADAPTIVE_SYSTEM_PLUGINDIR={dir}");
+
+    // The ported native-encoder codec links the same libaptx_native.so as the
+    // C plugin. It is in /usr/lib here; APTX_NATIVE_LIB_DIR points the linker
+    // at a build tree instead.
+    println!("cargo::rerun-if-env-changed=APTX_NATIVE_LIB_DIR");
+    if let Ok(dir) = std::env::var("APTX_NATIVE_LIB_DIR") {
+        println!("cargo::rustc-link-search=native={dir}");
+    }
 }

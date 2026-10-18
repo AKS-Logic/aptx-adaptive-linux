@@ -9,6 +9,18 @@ pub const CODEC_DESCRIPTION: &CStr = c"aptX Adaptive";
 pub const LL_NAME: &CStr = c"aptx_adaptive_ll";
 pub const LL_DESCRIPTION: &CStr = c"aptX Adaptive (Low Latency)";
 
+// The native-encoder port of `a2dp-codec-aptx-adaptive.c` uses the C plugin's
+// own strings: two media codecs sharing one endpoint, exported by a separate
+// SPA factory so the pure-Rust plugin above keeps its existing ABI.
+pub const ADAPTIVE_LL_NAME: &CStr = c"aptx_adaptive_ll";
+pub const ADAPTIVE_LL_DESCRIPTION: &CStr = c"aptX Adaptive LL";
+pub const ADAPTIVE_HIRES_NAME: &CStr = c"aptx_adaptive_hires";
+pub const ADAPTIVE_HIRES_DESCRIPTION: &CStr = c"aptX Adaptive Hi-Res";
+pub const ADAPTIVE_ENDPOINT: &CStr = c"aptx_adaptive";
+pub const FACTORY_NAME_NATIVE: &CStr = c"api.codec.bluez5.media.aptx_adaptive";
+pub const FACTORY_DESCRIPTION_NATIVE: &CStr =
+    c"aptX Adaptive native encoder plugin (Rust port of a2dp-codec-aptx-adaptive.c)";
+
 pub const VENDOR_ID: u32 = 0x0000_00D7;
 pub const CODEC_ID: u16 = 0x00AD;
 

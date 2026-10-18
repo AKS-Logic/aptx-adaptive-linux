@@ -14,8 +14,20 @@ use std::io::Write as _;
 use crate::dev::{AnyCore, Options, Replay};
 use crate::drift::Drift;
 
+/// `APTX_ADAPTIVE_ST0`: emulate a Snapdragon-style source for sinks whose firmware only
+/// accepts source type 0 (spec §7D/§7E). The RTP timestamp becomes a µs time-to-play clock
+/// advancing by the packet's audio duration, and the SSRC is the phone's `00 00 00 AE`
+/// marker instead of the §7F latency-mode value.
+pub fn st0_mode() -> bool {
+    std::env::var_os("APTX_ADAPTIVE_ST0").is_some()
+}
+
 /// The §7F SSRC for a profile: the whole 32-bit value selects the sink's latency mode.
+/// In ST0 mode the phone sends `0xAE` regardless of profile (spec §7D).
 pub fn mode_ssrc(profile: Profile) -> u32 {
+    if st0_mode() {
+        return 0x0000_00ae;
+    }
     match profile {
         Profile::Hq => 0xA3,
         Profile::Ll => 0xA1,
@@ -115,6 +127,9 @@ pub struct Session<C> {
     /// packets are what they are.
     abr: bool,
     logged: (Profile, (u8, u32)),
+    /// ST0 mode: the µs time-to-play clock (spec §7D). Seeded arbitrarily, advanced by the
+    /// packet duration on every emitted packet.
+    st0_ts_us: u32,
 }
 
 /// `reduce_bitpool` never goes below this level (§7L); level 1 is treated as 2 anyway.
@@ -252,6 +267,11 @@ impl<C: Core> Session<C> {
             refused: 0,
             abr: true,
             logged: (c.profile, (stream_level, stream_bitrate)),
+            st0_ts_us: (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_micros())
+                .unwrap_or(0))
+            .wrapping_add(0x3048_0000),
         })
     }
 
@@ -495,7 +515,13 @@ impl<C: Core> Session<C> {
         h[0] = 2 << 6;
         h[1] = RTP_PAYLOAD_TYPE;
         h[2..4].copy_from_slice(&seqnum.to_be_bytes());
-        h[4..8].copy_from_slice(&self.rtp_timestamp().to_be_bytes());
+        if st0_mode() {
+            h[4..8].copy_from_slice(&self.st0_ts_us.to_be_bytes());
+            let step = (self.interval_ns() / 1_000) as u32;
+            self.st0_ts_us = self.st0_ts_us.wrapping_add(step);
+        } else {
+            h[4..8].copy_from_slice(&self.rtp_timestamp().to_be_bytes());
+        }
         h[8..12].copy_from_slice(&mode_ssrc(self.profile()).to_be_bytes());
         if let Some(b) = self.scmst {
             h[RTP_HEADER_LEN] = b;

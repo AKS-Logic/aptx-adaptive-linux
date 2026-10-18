@@ -12,8 +12,10 @@ mod ffi;
 #[cfg(test)]
 mod fixtures;
 mod ids;
+mod modes;
 mod passthrough;
 mod pod;
+mod ported;
 mod props;
 mod session;
 mod slot;
@@ -270,7 +272,10 @@ unsafe extern "C" fn codec_select_config(
 
 /// # Safety
 /// `b` must be a valid, initialised builder.
-unsafe fn builder_append(b: *mut spa_pod_builder, data: &[u8]) -> Result<*mut spa_pod, c_int> {
+pub(crate) unsafe fn builder_append(
+    b: *mut spa_pod_builder,
+    data: &[u8],
+) -> Result<*mut spa_pod, c_int> {
     // SAFETY: caller contract; fields are plain data.
     unsafe {
         let len = u32::try_from(data.len()).map_err(|_| -ENOSPC)?;
@@ -827,6 +832,7 @@ pub unsafe extern "C" fn spa_handle_factory_enum(
         *factory = match *index {
             0 => &raw const FACTORY_APTX.0,
             1 => &raw const FACTORY_LC3PLUS.0,
+            2 => ptr::from_ref(ported::factory_ref()),
             _ => return 0,
         };
         *index += 1;

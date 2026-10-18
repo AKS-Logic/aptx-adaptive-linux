@@ -6,6 +6,7 @@
 mod ffi;
 #[path = "../src/fixtures.rs"]
 mod fixtures;
+#[expect(dead_code, reason = "the test uses a subset of the shared ids")]
 #[path = "../src/ids.rs"]
 mod ids;
 
@@ -115,8 +116,12 @@ fn load_from(path: &Path, factory_name: &CStr) -> Loaded {
     if ours {
         assert_eq!(
             names,
-            [ids::FACTORY_NAME_APTX, ids::FACTORY_NAME_LC3PLUS],
-            "both file names' factories"
+            [
+                ids::FACTORY_NAME_APTX,
+                ids::FACTORY_NAME_LC3PLUS,
+                ids::FACTORY_NAME_NATIVE,
+            ],
+            "both file names' factories plus the native-encoder port"
         );
     }
 

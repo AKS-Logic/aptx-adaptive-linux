@@ -174,3 +174,45 @@ stage_tests! {
     cfg3_sine: "cfg3_48k_sine", Variant::Cfg3, 48_000;
     cfg3_96k_noise: "cfg3_96k_noise", Variant::Cfg3, 96_000;
 }
+
+#[cfg(test)]
+mod vendor_capture {
+    use super::*;
+    use crate::codec::decode::Frame;
+
+    #[test]
+    fn parse_vendor_capture() {
+        let path = match std::env::var("VENDOR_CAPTURE") {
+            Ok(p) if !p.is_empty() => p,
+            _ => return,
+        };
+        let data = fs::read(&path).unwrap();
+        let mut payloads = Vec::new();
+        let mut n = 0;
+        for rec in data.chunks_exact(664) {
+            // raw order: undo the OTA pairwise byte swap
+            let mut raw = [0u8; 656];
+            let p = &rec[8..664];
+            for i in (0..656).step_by(2) {
+                raw[i] = p[i + 1];
+                raw[i + 1] = p[i];
+            }
+            payloads.extend_from_slice(&raw);
+            n += 1;
+        }
+        let params = Params { variant: Variant::Cfg3, sample_rate: 48_000 };
+        let frames = decode(params, &payloads, 656);
+        println!("{n} records -> {} frames", frames.len());
+        let mut per_packet = std::collections::BTreeMap::new();
+        for f in &frames {
+            per_packet.entry(f.packet).or_insert_with(Vec::new).push((f.blocks(), f.bits.clone()));
+        }
+        for (pkt, v) in &per_packet {
+            let sum: usize = v.iter().map(|x| x.0).sum();
+            println!("packet {pkt}: blocks {sum} frames {:?}", v.iter().map(|x| x.0).collect::<Vec<_>>());
+            if *pkt < 3 { for (b, bits) in v { println!("    frame {b} alloc {bits:?}"); } }
+        }
+        let all: usize = frames.iter().map(Frame::blocks).sum();
+        println!("  total blocks {all} over {} frames in {} packets", frames.len(), per_packet.len());
+    }
+}

@@ -156,12 +156,20 @@ pub fn select_config(bytes: &[u8], preferred_rate: Option<u32>) -> Result<Vec<u8
         .into_iter()
         .find(|m| caps.channel_modes() & m != 0)
         .ok_or(CapsError::Unsupported)?;
-    let rate = rate | SOURCE_TYPE_HOST;
+    let source_type = if crate::session::st0_mode() {
+        0x00
+    } else {
+        SOURCE_TYPE_HOST
+    };
+    let rate = rate | source_type;
     let config = match caps.decoder_level() {
         DecoderLevel::R2 => {
-            // Our low byte is 0, so the AND is always 0; that's what §7J asks for.
-            let features = (FEATURES_R2_0 & !FEATURES_LOW_BYTE)
-                | (FEATURES_R2_0 & caps.features() & FEATURES_LOW_BYTE);
+            // The supported-features low byte comes from the source. A zero low byte
+            // makes some sinks restart their firmware on SetConfiguration: the Bose QC
+            // Ultra 2 reboots immediately, and the shop-floor fix here is the byte a
+            // working Snapdragon phone sends to this sink class.
+            const FEATURES_LOW: u32 = 0x92;
+            let features = (FEATURES_R2_0 & !FEATURES_LOW_BYTE) | FEATURES_LOW;
             element(bytes.len(), rate, mode, &r2_data(features))
         }
         DecoderLevel::R1 => {
@@ -316,7 +324,7 @@ mod tests {
         let want: [u8; CAPS_LEN] = [
             0xd7, 0, 0, 0, 0xad, 0, 0x12, 0x02,
             0x50, 0x64, 0x64, 0x64, 0xff, 0xff, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x0f, 0x02, 0x03, 0x03, 0x03, 0x00, 0xaa,
+            0x92, 0x00, 0x00, 0x0f, 0x02, 0x03, 0x03, 0x03, 0x00, 0xaa,
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         assert_eq!(config, want);
@@ -324,11 +332,13 @@ mod tests {
     }
 
     #[test]
-    fn r2_features_low_byte_is_anded() {
+    fn r2_features_low_byte_is_the_source_byte() {
+        // 0x92 is what a working Snapdragon phone sends to this sink class; a zero low
+        // byte makes some sinks (Bose QC Ultra 2) restart on SetConfiguration.
         for sink in [0x0F00_0000, 0x0F00_0003, 0x0F00_0017, 0xFFFF_FFFF] {
             let config = select_config(&r2_caps(sink)).unwrap();
             let got = u32::from_le_bytes(config[FEATURES..SETUP_PREFS].try_into().unwrap());
-            assert_eq!(got, 0x0F00_0000, "{sink:#010x}");
+            assert_eq!(got, 0x0F00_0092, "{sink:#010x}");
         }
     }
 
@@ -346,7 +356,7 @@ mod tests {
         assert_eq!(c.features(), 0x0F00_0003);
         let config = select_config(&caps).unwrap();
         assert_eq!(config[RATES..=CHANNEL_MODES], [0x12, CHANNEL_STEREO]);
-        assert_eq!(config[FEATURES], 0);
+        assert_eq!(config[FEATURES], 0x92);
         assert_eq!(config[EXT_VERSION], 1);
         assert_eq!(validate_config(&config), Ok(self::config(DecoderLevel::R2)));
     }

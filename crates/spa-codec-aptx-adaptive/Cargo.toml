@@ -10,6 +10,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 aptx-adaptive = { path = "../aptx-adaptive" }
+# The ported C plugin's codec backend is the same C ABI the C plugin links
+# (-laptx_native); no Rust source from the native crate is pulled in.
 
 [features]
 # DEV ONLY: honour APTX_ADAPTIVE_REPLAY (see src/dev.rs). Off in normal installs.
