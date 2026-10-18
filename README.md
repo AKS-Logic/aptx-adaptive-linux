@@ -10,7 +10,7 @@ independently reconstructed from reverse engineering and black-box measurement
 
 ## status
 
-- **Works:** Bowers & Wilkins Px7 S2e, 48 kHz stereo, HQ and low latency. HQ starts at 364 kbps and reached 427 kbps through adaptive bitrate in a live test. LL runs at 265 kbps. Runtime HQ → LL → HQ switching, LL on connect, and card-profile switches have been tested ([test status](spec/QUESTIONS.md#current-status-2026-10-14)).
+- **Works:** Bose Quiet Comfort Ultra (gen 1), 48 kHz stereo, HQ and low latency. HQ starts at 364 kbps and reached 427 kbps through adaptive bitrate in a live test. LL runs at 265 kbps. Runtime HQ → LL → HQ switching, LL on connect, and card-profile switches have been tested ([test status](spec/QUESTIONS.md#current-status-2026-10-14)).
 - **Untested:** congestion-driven bitrate reduction on hardware, and every other headset, including R2 sinks.
 - **Offline-tested:** R2 stereo at 44.1 kHz in HQ or LL, and 96 kHz in HQ. Reference packets and compiled plugin callbacks pass; playback on an R2 headset remains unverified. R1 headsets, including the Px7, stay at 48 kHz.
 
