@@ -2,6 +2,14 @@
 
 aptX Adaptive for Linux: a clean-room Rust encoder plus a PipeWire Bluetooth codec plugin. It plays audio from your computer straight to an aptX Adaptive headset, with stock BlueZ and PipeWire and no USB dongle.
 
+**Clean-room notice:** this is an independent reverse-engineering project. No
+vendor source code, SDK, or NDA-protected material was received or used, and no
+vendor binary is included or redistributed in this repository. All code was
+written by the project; numeric tables are extracted at build time from a
+user-supplied copy of the vendor encoder library by a script written from the
+published extraction spec, and every table is hash-verified — see
+[`LEGAL.md`](LEGAL.md).
+
 ## status
 
 - **Works:** Bowers & Wilkins Px7 S2e, 48 kHz stereo, HQ and low latency. HQ starts at 364 kbps and reached 427 kbps through adaptive bitrate in a live test. LL runs at 265 kbps. Runtime HQ → LL → HQ switching, LL on connect, and card-profile switches have been tested ([test status](spec/QUESTIONS.md#current-status-2026-10-14)).
@@ -209,4 +217,4 @@ This removes the plugin (under either file name), the WirePlumber script and its
 
 ## clean room
 
-The codec is written only from prose specs and black-box test vectors in `spec/` and `tests/vectors/`. Nobody working in this repo reads the vendor binaries or the reverse-engineering notes they came from. The numeric tables aren't in the repo: the build extracts them from your copy of the vendor library, following [spec/table-extraction.md](spec/table-extraction.md). See [AGENTS.md](AGENTS.md) and [ADR 0001](docs/adr/0001-architecture.md).
+The codec is written only from prose specs and black-box test vectors in `spec/` and `tests/vectors/`. Nobody working in this repo reads the vendor binaries or the reverse-engineering notes they came from. The numeric tables aren't in the repo: the build extracts them from your copy of the vendor library, following [spec/table-extraction.md](spec/table-extraction.md). See [`LEGAL.md`](LEGAL.md), [AGENTS.md](AGENTS.md) and [ADR 0001](docs/adr/0001-architecture.md).
