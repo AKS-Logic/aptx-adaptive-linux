@@ -1,7 +1,8 @@
 # aptx-adaptive-for-linux
 
-This code is a research project which shows that AI is capable of integrating audio
-technologies and demonstrates the AI capability in clean room implementation of Bluetooth codecs.
+This is a research project which shows that AI is capable of integrating audio
+technologies and demonstrates the AI capability in clean room implementation of 
+Bluetooth codecs.
 
 aptX Adaptive for Linux contains a Rust encoder and PipeWire Bluetooth codec plugin.
 It streams audio from a Linux desktop to aptX Adaptive headphones over stock
