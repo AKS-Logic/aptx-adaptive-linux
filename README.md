@@ -24,9 +24,14 @@ card profiles, and you can switch between them while playing:
 
 | card profile | mode | what it optimises |
 |---|---|---|
-| `a2dp-sink` | **HQ** | quality: pinned at the top bitrate row, 427 kbps / 12 ms |
+| `a2dp-sink-aptx_adaptive_hq` | **HQ** | quality: pinned at the top bitrate row, 427 kbps / 12 ms |
 | `a2dp-sink-aptx_adaptive` | **adaptive** | scales: starts at 204 kbps and climbs to 427 kbps as the link allows |
-| `a2dp-sink-aptx_adaptive_ll` | **LL** | latency: 10 ms frames, 348-byte payload, ~270 kbps |
+| `a2dp-sink` | **LL** | latency: 10 ms frames, 348-byte payload, ~270 kbps |
+
+The plain `a2dp-sink` profile is the one a fresh connection uses, and with this layout it is
+the LL profile. Which name gets the plain form is assigned by PipeWire rather than by this
+plugin, so check `pactl list cards` before scripting a profile switch. WirePlumber remembers
+the last profile you picked for a headset.
 
 HQ never steps its ladder — it holds level 5 and accepts the extra latency. Adaptive starts
 at the bottom row and steps up when the connection allows, dropping back when it does not;
@@ -110,9 +115,8 @@ mise run install-plugin
 systemctl --user restart wireplumber pipewire
 ```
 
-This builds the plugin and installs **two** files under `~/.local/lib/spa-0.2/bluez5/`:
-the aptX plugin file and `libspa-codec-bluez5-aptx_adaptive_hq.so`, which exports the HQ
-profile from its own factory. It also writes systemd user drop-ins. In the default slot it
+This builds the plugin and installs **one** file under `~/.local/lib/spa-0.2/bluez5/`,
+which exports all three endpoints, and writes systemd user drop-ins. In the default slot it
 installs a small WirePlumber guard script that recovers a headset which configured aptX HD
 under an aptX Adaptive profile. Re-running it is safe.
 
@@ -244,7 +248,7 @@ scripts/install-plugin.sh --uninstall
 systemctl --user restart wireplumber pipewire
 ```
 
-This removes both plugin files, the WirePlumber guard script and configuration, and
+This removes the plugin file, the WirePlumber guard script and configuration, and
 the systemd drop-ins. It is safe to run twice.
 
 ## legal
