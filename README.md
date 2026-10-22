@@ -9,8 +9,8 @@ It streams audio from a Linux desktop to aptX Adaptive headphones over stock
 BlueZ and PipeWire, with no USB dongle and no external codec files. 
 This project was tested with Bose Quiet Comfort Ultra (gen 1).
 It may or may not work directly with other headphones; some simple tweaks
-made by an AI agent may allow it to further be adapted to different headphones,
-demonstrating its capability even more.
+made by AI agent may allow it to work with other headphones and machines,
+demonstrating AI's capability even more.
 
 **Clean-room notice:** this is an independent clean-room reimplementation. No
 vendor source code, SDK, headers, NDA material, or vendor binary is included
