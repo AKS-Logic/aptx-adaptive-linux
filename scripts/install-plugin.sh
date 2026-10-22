@@ -34,8 +34,9 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 user_plugin_dir=$HOME/.local/lib/spa-0.2
 aptx_dest=$user_plugin_dir/bluez5/libspa-codec-bluez5-aptx.so
-# HQ is exported by its own factory and must live in its own file: a third
-# endpoint inside one plugin file is not registered by BlueZ.
+# Older installs used a second plugin file for the HQ profile. It is no longer
+# needed: one file exports all three endpoints. Keep the path so the installer
+# can remove a leftover copy.
 aptx_hq_dest=$user_plugin_dir/bluez5/libspa-codec-bluez5-aptx_adaptive_hq.so
 lc3plus_dest=$user_plugin_dir/bluez5/libspa-codec-bluez5-lc3plus.so
 units=(wireplumber.service pipewire.service)
@@ -153,12 +154,9 @@ target_dir=$(cargo metadata --manifest-path "$repo/Cargo.toml" --format-version 
 install -Dm644 "$target_dir/release/libspa_codec_aptx_adaptive.so" "$dest"
 echo "installed $dest"
 remove "$other_dest"
-if [[ $slot == aptx ]]; then
-	install -Dm644 "$target_dir/release/libspa_codec_aptx_adaptive.so" "$aptx_hq_dest"
-	echo "installed $aptx_hq_dest"
-else
-	remove "$aptx_hq_dest"
-fi
+# Single plugin file exports HQ, adaptive and LL as three endpoints
+# (APTX_ADAPTIVE_THREE_PROFILES below); drop any leftover HQ file.
+remove "$aptx_hq_dest"
 
 if [[ $slot == aptx ]]; then
 	# Recovers a headset that configured the real aptX HD under our profile (ADR 0004).
@@ -180,6 +178,7 @@ Environment=\"SPA_PLUGIN_DIR=$user_plugin_dir:$system_plugin_dir\"
 Environment=\"APTX_ADAPTIVE_SLOT=$slot\"
 Environment=\"APTX_ADAPTIVE_DEFAULT_MODE=$default_mode\"
 Environment=\"APTX_ADAPTIVE_ST0=1\"
+Environment=\"APTX_ADAPTIVE_THREE_PROFILES=1\"
 Environment=\"APTX_ADAPTIVE_START_LOW=1\"
 MemoryDenyWriteExecute=no
 "
