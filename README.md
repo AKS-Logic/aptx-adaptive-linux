@@ -104,9 +104,13 @@ pacman then keeps our build and writes the package copy as `.pacnew`. Pinning do
 prevent ABI drift: after any `pipewire` or `bluez` upgrade, check and rebuild with the two
 scripts below.
 
-The changes themselves are tracked as diffs in [`patches/`](patches/README.md) — PipeWire
-1.6.9 and BlueZ 5.87, no upstream source included. Read that file for what each hunk does and
-how to apply it to a clean checkout.
+The changes themselves are tracked as diffs in [`patches/`](patches/README.md), against the
+exact commits we built and installed — PipeWire `8fa27ca` (1.6.9) and BlueZ `dd9d5ba` (5.87).
+One PipeWire patch and three BlueZ patches; no upstream source is included. Each set was
+verified by applying it to a clean checkout of its base and comparing every modified file
+against our build tree: 10/10 for PipeWire, 7/7 for BlueZ. The BlueZ patches must be applied
+in order — `0003` carries changes the two named fixes do not cover, and skipping it yields a
+binary that differs from ours.
 
 Building needs `mise` (it provides Rust, Python and uv), `pkg-config` with the libspa
 development files, and `python3`.
