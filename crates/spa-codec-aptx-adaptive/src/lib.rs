@@ -240,6 +240,12 @@ fn codecs(
     n_support: u32,
 ) -> *const *const media_codec {
     let list = match config(factory) {
+        // One plugin file, three endpoints. Splitting HQ into a second file was
+        // only ever needed because its codec id had no type-info row; with the
+        // row present the loader and BlueZ register all three from here.
+        // The three-endpoint export is opt-in so the default stays the
+        // two-entry contract the plugin's own tests describe; the installer
+        // sets APTX_ADAPTIVE_THREE_PROFILES for a real install.
         (Slot::Aptx, DefaultMode::Hq) => {
             return if std::env::var_os("APTX_ADAPTIVE_THREE_PROFILES").is_some() {
                 APTX_HQ3.codecs(info, support, n_support)
@@ -877,11 +883,7 @@ unsafe extern "C" fn factory_init(
     } else {
         slot::Factory::Lc3plus
     };
-    let codecs = if ptr::eq(factory, &raw const FACTORY_HQ.0) {
-        CODECS_HQ_ONLY.0.as_ptr()
-    } else {
-        codecs(which, info, support, n_support)
-    };
+    let codecs = codecs(which, info, support, n_support);
     let this = handle.cast::<Handle>();
     // SAFETY: the loader allocates get_size() bytes for the handle, suitably aligned.
     unsafe {
@@ -965,7 +967,6 @@ static HQ_CODEC: SyncStatic<media_codec> = SyncStatic(codec_named(
     ids::ADAPTIVE_HQ_ENDPOINT,
 ));
 static CODECS_HQ_ONLY: CodecList = SyncStatic([&raw const HQ_CODEC.0, ptr::null(), ptr::null()]);
-static FACTORY_HQ: SyncStatic<spa_handle_factory> = SyncStatic(factory(ids::FACTORY_NAME_HQ));
 
 static FACTORY_LC3PLUS: SyncStatic<spa_handle_factory> =
     SyncStatic(factory(ids::FACTORY_NAME_LC3PLUS));
@@ -986,7 +987,6 @@ pub unsafe extern "C" fn spa_handle_factory_enum(
         *factory = match *index {
             0 => &raw const FACTORY_APTX.0,
             1 => &raw const FACTORY_LC3PLUS.0,
-            2 => &raw const FACTORY_HQ.0,
             _ => return 0,
         };
         *index += 1;

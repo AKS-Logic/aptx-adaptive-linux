@@ -116,12 +116,8 @@ fn load_from(path: &Path, factory_name: &CStr) -> Loaded {
     if ours {
         assert_eq!(
             names,
-            [
-                ids::FACTORY_NAME_APTX,
-                ids::FACTORY_NAME_LC3PLUS,
-                ids::FACTORY_NAME_HQ,
-            ],
-            "both file names' factories plus the HQ-only factory"
+            [ids::FACTORY_NAME_APTX, ids::FACTORY_NAME_LC3PLUS],
+            "one factory per plugin file name; HQ is an endpoint of the aptx file"
         );
     }
 
@@ -1692,20 +1688,4 @@ fn aptx_slot_without_real_plugin_exports_only_ours() {
     );
     check_alias(l.ll, l.codec, SPA_BLUETOOTH_AUDIO_CODEC_APTX);
     std::process::exit(SLOT_CHILD_OK);
-}
-
-#[test]
-fn hq_factory_exports_one_entry() {
-    let l = load_from(plugin_path(), ids::FACTORY_NAME_HQ);
-    assert_eq!(l.all.len(), 1, "HQ factory must export exactly one entry");
-    let c = l.all[0];
-    assert_eq!(c.id, 0x0303);
-    // SAFETY: static NUL-terminated string.
-    assert_eq!(unsafe { CStr::from_ptr(c.name) }, ids::ADAPTIVE_HQ_NAME);
-    // SAFETY: static NUL-terminated string.
-    assert_eq!(
-        unsafe { CStr::from_ptr(c.endpoint_name) },
-        ids::ADAPTIVE_HQ_ENDPOINT
-    );
-    assert!(c.fill_caps.is_some());
 }
