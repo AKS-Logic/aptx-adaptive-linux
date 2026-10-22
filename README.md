@@ -115,7 +115,7 @@ binary that differs from ours.
 Building needs `mise` (it provides Rust, Python and uv), `pkg-config` with the libspa
 development files, and `python3`.
 
-### Community hardware report
+### community hardware report
 
 **Audio-Technica ATH-TWX9MK2 + Steam Deck:** successfully tested on SteamOS 3.9.3
 (build 20261015.100), PipeWire 1.6.8, WirePlumber 0.5.18 and BlueZ 5.87.
