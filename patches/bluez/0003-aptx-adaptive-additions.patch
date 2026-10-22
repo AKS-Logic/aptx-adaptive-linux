@@ -1,0 +1,715 @@
+diff --git a/profiles/audio/a2dp.c b/profiles/audio/a2dp.c
+index 858023d..0b18de9 100644
+--- a/profiles/audio/a2dp.c
++++ b/profiles/audio/a2dp.c
+@@ -20,6 +20,9 @@
+ #include <stdio.h>
+ #include <errno.h>
+ #include <limits.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ 
+ #include <dbus/dbus.h>
+ #include <glib.h>
+@@ -54,6 +57,7 @@
+ #include "a2dp.h"
+ #include "a2dp-codecs.h"
+ #include "media.h"
++#include "transport.h"
+ 
+ /* The duration that streams without users are allowed to stay in
+  * STREAMING state. */
+@@ -741,6 +745,10 @@ static void a2dp_stream_destroy(struct a2dp_sep *sep,
+ 		a2dp_stream_free(astream);
+ }
+ 
++/* The stream that is running, recorded when it starts, so the run-time
++ * reconfigure does not have to guess the AVDTP session. */
++static struct avdtp_stream *last_stream;
++
+ static void stream_state_changed(struct avdtp_stream *stream,
+ 					avdtp_state_t old_state,
+ 					avdtp_state_t new_state,
+@@ -751,6 +759,13 @@ static void stream_state_changed(struct avdtp_stream *stream,
+ 	struct a2dp_stream *a2dp_stream;
+ 	struct btd_device *dev = NULL;
+ 
++	if (new_state == AVDTP_STATE_STREAMING)
++		last_stream = stream;
++	else if (stream == last_stream &&
++			(new_state == AVDTP_STATE_IDLE ||
++				new_state == AVDTP_STATE_ABORTING))
++		last_stream = NULL;
++
+ 	if (new_state == AVDTP_STATE_OPEN) {
+ 		struct a2dp_setup *setup;
+ 		int err;
+@@ -1751,6 +1766,328 @@ static struct a2dp_remote_sep *find_remote_sep(struct a2dp_channel *chan,
+ 	return queue_find(chan->seps, match_remote_sep, rsep);
+ }
+ 
++static void caps_add_codec(GSList **l, uint8_t codec, uint8_t *caps,
++							size_t size);
++
++static struct a2dp_server *find_server(GSList *servers,
++					struct btd_adapter *adapter);
++
++/* Single-flight state for a run-time codec reconfiguration: the peer MOMENTUM 5
++ * rejects AVDTP RECONFIGURE (0x17), so the configuration is changed the way
++ * BlueZ already does it for a new codec: the stream is closed and set up again
++ * with the new capabilities, which keeps the ACL and the connection. */
++static struct {
++	struct avdtp *session;
++	struct a2dp_sep *sep;
++	GSList *caps;
++	a2dp_reconfigure_cb_t cb;
++	void *user_data;
++	gint64 started;
++} reconfig;
++
++/* bluetoothd runs with a restricted capability set (no CAP_DAC_OVERRIDE), so it
++ * cannot read the user's $XDG_RUNTIME_DIR.  The request and status files live
++ * in a directory the daemon owns instead: the request is world-writable so the
++ * unprivileged control tool can drop a nonce in it, the status is world
++ * readable so the tool can see the outcome.
++ */
++#define RECONF_DIR "/run/aptx-adaptive"
++#define RECONF_REQUEST RECONF_DIR "/request"
++#define RECONF_STATUS RECONF_DIR "/status"
++
++static gboolean rate_seen_init;
++static char *rate_seen;
++
++static void reconf_status_write(const char *state)
++{
++	if (!g_file_set_contents(RECONF_STATUS, state, -1, NULL)) {
++		error("reconfigure: unable to write " RECONF_STATUS);
++		return;
++	}
++
++	chmod(RECONF_STATUS, 0644);
++}
++
++static char *request_read(void)
++{
++	char buf[64];
++	size_t len;
++	FILE *f;
++
++	f = fopen(RECONF_REQUEST, "r");
++	if (!f)
++		return NULL;
++
++	if (!fgets(buf, sizeof(buf), f)) {
++		fclose(f);
++		return NULL;
++	}
++
++	fclose(f);
++
++	len = strlen(buf);
++	while (len && g_ascii_isspace(buf[len - 1]))
++		buf[--len] = '\0';
++
++	return g_strdup(buf);
++}
++
++static void reconfigure_finish(int err)
++{
++	a2dp_reconfigure_cb_t cb = reconfig.cb;
++	void *user_data = reconfig.user_data;
++	char status[96];
++
++	if (err < 0)
++		g_snprintf(status, sizeof(status), "%s error %s",
++				rate_seen ? rate_seen : "-", strerror(-err));
++	else
++		g_snprintf(status, sizeof(status), "%s ok",
++				rate_seen ? rate_seen : "-");
++
++	reconf_status_write(status);
++
++	/* a2dp_config() hands a copy of the list to its setup, which owns the
++	 * capability elements: only the nodes may be freed here. */
++	g_slist_free(reconfig.caps);
++
++	memset(&reconfig, 0, sizeof(reconfig));
++
++	if (cb)
++		cb(NULL, err, user_data);
++}
++
++static void reconfigure_config_cb(struct avdtp *session, struct a2dp_sep *sep,
++					struct avdtp_stream *stream, int err,
++					void *user_data)
++{
++	if (err < 0) {
++		error("reconfigure: unable to set up the stream: %s",
++							strerror(-err));
++		reconfigure_finish(err);
++		return;
++	}
++
++	DBG("reconfigure: stream re-opened with the new configuration");
++
++	reconfigure_finish(0);
++}
++
++static void reconfigure_select_cb(struct a2dp_setup *setup, void *ret,
++					int size)
++{
++	GSList *caps = NULL;
++
++	if (size < 0) {
++		error("Unable to select a configuration for the rate change");
++		reconfigure_finish(-EINVAL);
++		return;
++	}
++
++	caps_add_codec(&caps, reconfig.sep->codec, ret, size);
++
++	/* The elements are handed over to a2dp_config()'s setup below. */
++	g_slist_free(reconfig.caps);
++	reconfig.caps = caps;
++
++	/* a2dp_config() closes a stream that is already open and negotiates it
++	 * again with these capabilities, so the codec configuration - including
++	 * the sample rate - changes while the connection stays up. */
++	if (a2dp_config(reconfig.session, reconfig.sep, reconfigure_config_cb,
++								caps, NULL))
++		return;
++
++	error("reconfigure: unable to renegotiate the stream");
++	reconfigure_finish(-EIO);
++}
++
++static gint match_sep_lsep(gconstpointer data, gconstpointer user_data)
++{
++	const struct a2dp_sep *sep = data;
++
++	if (sep->endpoint == NULL || sep->lsep != user_data)
++		return -1;
++
++	return 0;
++}
++
++static struct a2dp_sep *find_sep_by_lsep(struct a2dp_server *server,
++					struct avdtp_local_sep *lsep)
++{
++	GSList *l;
++
++	if (!lsep)
++		return NULL;
++
++	l = g_slist_find_custom(server->sinks, lsep, match_sep_lsep);
++	if (!l)
++		l = g_slist_find_custom(server->sources, lsep, match_sep_lsep);
++
++	return l ? l->data : NULL;
++}
++
++unsigned int a2dp_reconfigure_stream(struct avdtp *session,
++				a2dp_reconfigure_cb_t cb, void *user_data)
++{
++	struct a2dp_channel *chan;
++	struct a2dp_server *server;
++	struct a2dp_sep *sep;
++	struct avdtp *rec_session;
++	struct avdtp_remote_sep *rsep;
++	struct avdtp_service_capability *service;
++	struct avdtp_media_codec_capability *codec;
++	int err;
++
++	if (reconfig.session) {
++		/* A reply that never came must not block every later attempt. */
++		if (g_get_monotonic_time() - reconfig.started <
++					10 * G_TIME_SPAN_SECOND)
++			return 0;
++		error("previous reconfigure timed out, starting over");
++		reconfigure_finish(-ETIMEDOUT);
++	}
++
++	if (!last_stream) {
++		error("reconfigure: no recorded stream");
++		return 0;
++	}
++
++	rec_session = avdtp_stream_get_session(last_stream);
++	if (rec_session)
++		session = rec_session;
++
++	chan = find_channel(session);
++	if (!chan) {
++		error("reconfigure: no channel");
++		return 0;
++	}
++
++	server = find_server(servers, device_get_adapter(chan->device));
++	if (!server) {
++		error("reconfigure: no server");
++		return 0;
++	}
++
++	/* The *capabilities of the remote SEP* - not the configuration that is
++	 * in force - so the endpoint can pick any rate the peer offers. */
++	rsep = avdtp_stream_get_remote_sep(last_stream);
++	if (!rsep) {
++		error("reconfigure: no remote sep for the stream");
++		return 0;
++	}
++
++	service = avdtp_get_codec(rsep);
++	if (!service) {
++		error("reconfigure: remote sep has no codec");
++		return 0;
++	}
++
++	codec = (struct avdtp_media_codec_capability *) service->data;
++
++	/* The local SEP that owns the running stream, i.e. the endpoint to ask
++	 * for the new configuration (Adaptive, not plain aptX). */
++	sep = find_sep_by_lsep(server, avdtp_stream_get_lsep(last_stream));
++	if (!sep || !sep->endpoint) {
++		error("reconfigure: no local endpoint sep");
++		return 0;
++	}
++
++	reconfig.session = session;
++	reconfig.sep = sep;
++	reconfig.cb = cb;
++	reconfig.user_data = user_data;
++	reconfig.started = g_get_monotonic_time();
++
++	/* Ask the endpoint (PipeWire) for a configuration again; the SPA codec
++	 * reads the wanted rate from its run-time file at this point. */
++	err = sep->endpoint->select_configuration(sep, codec->data,
++					service->length - sizeof(*codec),
++					NULL, reconfigure_select_cb,
++					sep->user_data);
++	if (err == 0)
++		return 1;
++
++	memset(&reconfig, 0, sizeof(reconfig));
++
++	return 0;
++}
++
++static gboolean rate_poll(gpointer user_data)
++{
++	char *value = request_read();
++
++	if (!value) {
++		/* No request file yet: remember that, so the first request that
++		 * appears afterwards is acted on. */
++		rate_seen_init = TRUE;
++		return G_SOURCE_CONTINUE;
++	}
++
++	if (!rate_seen_init) {
++		/* Remember what had been requested before bluetoothd started,
++		 * so an old request does not reconfigure a fresh link. */
++		rate_seen_init = TRUE;
++		rate_seen = value;
++		return G_SOURCE_CONTINUE;
++	}
++
++	if (!g_strcmp0(rate_seen, value)) {
++		g_free(value);
++		return G_SOURCE_CONTINUE;
++	}
++
++	g_free(rate_seen);
++	rate_seen = value;
++
++	DBG("reconfigure request: %s", value);
++
++	if (!last_stream) {
++		char status[96];
++
++		g_snprintf(status, sizeof(status), "%s error no stream", value);
++		reconf_status_write(status);
++		return G_SOURCE_CONTINUE;
++	}
++
++	a2dp_reconfigure_stream(NULL, NULL, NULL);
++
++	return G_SOURCE_CONTINUE;
++}
++
++static void rate_poll_start(void)
++{
++	static gboolean started;
++	int fd;
++
++	if (started)
++		return;
++
++	started = TRUE;
++
++	if (g_mkdir_with_parents(RECONF_DIR, 0755) < 0)
++		error("reconfigure: cannot create " RECONF_DIR);
++	/* bluetoothd runs with a restrictive umask, so the directory may end up
++	 * unreadable for the unprivileged control tool; it must stay traversable
++	 * for the request file to be usable. */
++	if (chmod(RECONF_DIR, 0755) < 0)
++		error("reconfigure: cannot chmod " RECONF_DIR);
++
++	/* The control tool runs unprivileged: it has to be able to write the
++	 * request file, and to read the status file. */
++	fd = open(RECONF_REQUEST, O_CREAT | O_RDWR, 0666);
++	if (fd < 0)
++		error("reconfigure: cannot create " RECONF_REQUEST);
++	else {
++		if (fchmod(fd, 0666) < 0)
++			error("reconfigure: cannot chmod " RECONF_REQUEST);
++		close(fd);
++	}
++
++	DBG("watching " RECONF_REQUEST " for reconfigure requests");
++
++	g_timeout_add_seconds(1, rate_poll, NULL);
++}
++
+ static gboolean a2dp_reconfigure(gpointer data)
+ {
+ 	struct a2dp_setup *setup = data;
+@@ -3212,6 +3549,8 @@ static struct a2dp_server *a2dp_server_register(struct btd_adapter *adapter)
+ 
+ 	servers = g_slist_append(servers, server);
+ 
++	rate_poll_start();
++
+ 	return server;
+ }
+ 
+diff --git a/profiles/audio/a2dp.h b/profiles/audio/a2dp.h
+index e742b5d..4ee9c74 100644
+--- a/profiles/audio/a2dp.h
++++ b/profiles/audio/a2dp.h
+@@ -73,6 +73,15 @@ unsigned int a2dp_config(struct avdtp *session, struct a2dp_sep *sep,
+ 				void *user_data);
+ uint8_t a2dp_parse_config_error(const char *error_name);
+ 
++/* Re-select the codec configuration and send it with AVDTP RECONFIGURE on the
++ * open stream, so the sample rate can change without closing it.  Single
++ * flight: returns 0 while another reconfigure is in progress. */
++typedef void (*a2dp_reconfigure_cb_t) (struct avdtp *session, int err,
++					void *user_data);
++
++unsigned int a2dp_reconfigure_stream(struct avdtp *session,
++				a2dp_reconfigure_cb_t cb, void *user_data);
++
+ unsigned int a2dp_resume(struct avdtp *session, struct a2dp_sep *sep,
+ 				a2dp_stream_cb_t cb, void *user_data);
+ unsigned int a2dp_suspend(struct avdtp *session, struct a2dp_sep *sep,
+diff --git a/profiles/audio/avdtp.c b/profiles/audio/avdtp.c
+index 936aa9c..1d39e3f 100644
+--- a/profiles/audio/avdtp.c
++++ b/profiles/audio/avdtp.c
+@@ -414,6 +414,10 @@ struct avdtp {
+ 
+ 	/* Attempt stream setup instead of disconnecting */
+ 	gboolean stream_setup;
++
++	/* Pending AVDTP RECONFIGURE request */
++	avdtp_reconfigure_cb_t reconfigure_cb;
++	void *reconfigure_user_data;
+ };
+ 
+ static GSList *state_callbacks = NULL;
+@@ -904,6 +908,24 @@ static void cleanup_queue(struct avdtp *session, struct avdtp_stream *stream)
+ 	}
+ }
+ 
++/* Tell the waiter that a run-time RECONFIGURE failed, so a rejected or
++ * unanswered request does not block the next attempt. */
++static void reconfigure_notify_error(struct avdtp *session,
++					struct avdtp_stream *stream,
++					struct avdtp_error *err)
++{
++	avdtp_reconfigure_cb_t cb = session->reconfigure_cb;
++	void *user_data = session->reconfigure_user_data;
++
++	if (!cb)
++		return;
++
++	session->reconfigure_cb = NULL;
++	session->reconfigure_user_data = NULL;
++
++	cb(session, stream, err, user_data);
++}
++
+ static void handle_unanswered_req(struct avdtp *session,
+ 						struct avdtp_stream *stream)
+ {
+@@ -928,6 +950,7 @@ static void handle_unanswered_req(struct avdtp *session,
+ 	switch (req->signal_id) {
+ 	case AVDTP_RECONFIGURE:
+ 		error("No reply to Reconfigure request");
++		reconfigure_notify_error(session, stream, &err);
+ 		if (lsep && lsep->cfm && lsep->cfm->reconfigure)
+ 			lsep->cfm->reconfigure(session, lsep, stream, &err,
+ 						lsep->user_data);
+@@ -2906,6 +2929,18 @@ static gboolean avdtp_reconfigure_resp(struct avdtp *session,
+ 					struct avdtp_stream *stream,
+ 					struct avdtp_single_header *resp, int size)
+ {
++	if (session->reconfigure_cb) {
++		avdtp_reconfigure_cb_t cb = session->reconfigure_cb;
++		void *user_data = session->reconfigure_user_data;
++
++		session->reconfigure_cb = NULL;
++		session->reconfigure_user_data = NULL;
++
++		DBG("RECONFIGURE accepted");
++
++		cb(session, stream, NULL, user_data);
++	}
++
+ 	return TRUE;
+ }
+ 
+@@ -3162,6 +3197,7 @@ static gboolean avdtp_parse_rej(struct avdtp *session,
+ 			return FALSE;
+ 		error("RECONFIGURE request rejected: %s (%d)",
+ 				avdtp_strerror(&err), err.err.error_code);
++		reconfigure_notify_error(session, stream, &err);
+ 		if (sep && sep->cfm && sep->cfm->reconfigure)
+ 			sep->cfm->reconfigure(session, sep, stream, &err,
+ 						sep->user_data);
+@@ -3221,6 +3257,30 @@ static gboolean avdtp_parse_rej(struct avdtp *session,
+ 	}
+ }
+ 
++struct avdtp *avdtp_stream_get_session(struct avdtp_stream *stream)
++{
++	if (!stream)
++		return NULL;
++
++	return stream->session;
++}
++
++GSList *avdtp_stream_get_caps(struct avdtp_stream *stream)
++{
++	if (!stream)
++		return NULL;
++
++	return stream->caps;
++}
++
++struct avdtp_local_sep *avdtp_stream_get_lsep(struct avdtp_stream *stream)
++{
++	if (!stream)
++		return NULL;
++
++	return stream->lsep;
++}
++
+ struct avdtp_service_capability *avdtp_stream_get_codec(
+ 						struct avdtp_stream *stream)
+ {
+@@ -3657,6 +3717,71 @@ int avdtp_set_configuration(struct avdtp *session,
+ 	return err;
+ }
+ 
++
++int avdtp_reconfigure(struct avdtp *session, struct avdtp_stream *stream,
++			GSList *caps, avdtp_reconfigure_cb_t cb,
++			void *user_data)
++{
++	struct setconf_req *req;
++	unsigned char *ptr;
++	int err, caps_len;
++	struct avdtp_service_capability *cap;
++	GSList *l;
++
++	if (session->state != AVDTP_SESSION_STATE_CONNECTED)
++		return -ENOTCONN;
++
++	if (!stream)
++		return -EINVAL;
++
++	if (stream->state != AVDTP_STATE_STREAMING &&
++					stream->state != AVDTP_STATE_OPEN)
++		return -EINVAL;
++
++	if (stream->session != session)
++		return -EINVAL;
++
++	for (l = caps, caps_len = 0; l != NULL; l = g_slist_next(l)) {
++		cap = l->data;
++		caps_len += cap->length + 2;
++	}
++
++	req = g_malloc0(sizeof(struct setconf_req) + caps_len);
++
++	req->int_seid = stream->lsep->info.seid;
++	req->acp_seid = stream->rseid;
++
++	for (l = caps, ptr = req->caps; l != NULL; l = g_slist_next(l)) {
++		cap = l->data;
++		memcpy(ptr, cap, cap->length + 2);
++		ptr += cap->length + 2;
++	}
++
++	DBG("%p: int_seid=%u, acp_seid=%u", session,
++			stream->lsep->info.seid, stream->rseid);
++
++	session->reconfigure_cb = cb;
++	session->reconfigure_user_data = user_data;
++
++	err = send_request(session, FALSE, stream, AVDTP_RECONFIGURE, req,
++				sizeof(struct setconf_req) + caps_len);
++
++	g_free(req);
++
++	if (err < 0) {
++		session->reconfigure_cb = NULL;
++		session->reconfigure_user_data = NULL;
++		return err;
++	}
++
++	/* Keep the new configuration for later requests/answers. */
++	g_slist_free_full(stream->caps, g_free);
++	stream->caps = NULL;
++	g_slist_foreach(caps, copy_capabilities, &stream->caps);
++
++	return 0;
++}
++
+ int avdtp_open(struct avdtp *session, struct avdtp_stream *stream)
+ {
+ 	struct seid_req req;
+diff --git a/profiles/audio/avdtp.h b/profiles/audio/avdtp.h
+index 10c8f49..febe4e8 100644
+--- a/profiles/audio/avdtp.h
++++ b/profiles/audio/avdtp.h
+@@ -248,6 +248,10 @@ gboolean avdtp_stream_set_transport(struct avdtp_stream *stream, int fd,
+ gboolean avdtp_stream_get_transport(struct avdtp_stream *stream, int *sock,
+ 					uint16_t *imtu, uint16_t *omtu,
+ 					GSList **caps);
++struct avdtp *avdtp_stream_get_session(struct avdtp_stream *stream);
++struct avdtp_local_sep *avdtp_stream_get_lsep(struct avdtp_stream *stream);
++GSList *avdtp_stream_get_caps(struct avdtp_stream *stream);
++
+ struct avdtp_service_capability *avdtp_stream_get_codec(
+ 						struct avdtp_stream *stream);
+ gboolean avdtp_stream_has_capabilities(struct avdtp_stream *stream,
+@@ -271,6 +275,18 @@ int avdtp_get_configuration(struct avdtp *session,
+ 				struct avdtp_stream *stream);
+ 
+ int avdtp_open(struct avdtp *session, struct avdtp_stream *stream);
++
++/* Send AVDTP RECONFIGURE (0x05) carrying a new configuration, on an open
++ * stream, so the codec configuration can change without closing it (which is
++ * how a phone changes the aptX Adaptive sample rate). */
++typedef void (*avdtp_reconfigure_cb_t) (struct avdtp *session,
++					struct avdtp_stream *stream,
++					struct avdtp_error *err,
++					void *user_data);
++
++int avdtp_reconfigure(struct avdtp *session, struct avdtp_stream *stream,
++			GSList *caps, avdtp_reconfigure_cb_t cb,
++			void *user_data);
+ int avdtp_start(struct avdtp *session, struct avdtp_stream *stream);
+ int avdtp_suspend(struct avdtp *session, struct avdtp_stream *stream);
+ int avdtp_close(struct avdtp *session, struct avdtp_stream *stream,
+diff --git a/profiles/audio/media.c b/profiles/audio/media.c
+index 34ff251..959521f 100644
+--- a/profiles/audio/media.c
++++ b/profiles/audio/media.c
+@@ -609,14 +609,29 @@ static gboolean set_configuration(struct media_endpoint *endpoint,
+ 	DBusMessageIter iter;
+ 	struct media_transport *transport;
+ 	int8_t init_volume;
++	const char *remote_path;
+ 
+ 	transport = find_device_transport(endpoint, device);
+ 
+ 	if (transport != NULL)
+ 		return FALSE;
+ 
+-	transport = media_transport_create(device,
+-					a2dp_setup_remote_path(data->setup),
++	/* Without the remote SEP the transport would be created directly under
++	 * the device ("<device>/fdN" instead of "<remote sep>/fdN").  Audio
++	 * servers cannot attach such a transport, and it survives a profile
++	 * cycle, so the link stays silent for good.  This happens when the A2DP
++	 * profile is connected while the headset is still reconnecting: the
++	 * redundant connect fails with EBUSY and the stream that does get set up
++	 * has no remote SEP yet.  Fail the setup instead, so the next connect
++	 * attempt (wireplumber retries) builds a usable transport. */
++	remote_path = a2dp_setup_remote_path(data->setup);
++	if (remote_path == NULL) {
++		error("A2DP setup without a remote SEP, refusing to create a "
++			"transport that could never carry audio");
++		return FALSE;
++	}
++
++	transport = media_transport_create(device, remote_path,
+ 					configuration, size, endpoint, NULL);
+ 	if (transport == NULL)
+ 		return FALSE;
+diff --git a/profiles/audio/transport.c b/profiles/audio/transport.c
+index e001f73..26646b2 100644
+--- a/profiles/audio/transport.c
++++ b/profiles/audio/transport.c
+@@ -3034,6 +3034,43 @@ void media_transport_update_delay(struct media_transport *transport,
+ #endif /* HAVE_A2DP */
+ }
+ 
++/* Publish a codec configuration that was negotiated on the running stream
++ * (AVDTP RECONFIGURE) so that observers - PipeWire's bluez5 sink - can bring
++ * the node up with the new configuration while the transport stays acquired. */
++void media_transport_update_configuration(struct btd_device *device,
++					const uint8_t *configuration,
++					size_t size)
++{
++	GSList *l;
++
++	if (!device || !configuration || !size)
++		return;
++
++	for (l = transports; l; l = g_slist_next(l)) {
++		struct media_transport *transport = l->data;
++
++		if (transport->device != device)
++			continue;
++
++		if (transport->size == (int) size &&
++				!memcmp(transport->configuration,
++					configuration, size))
++			return;
++
++		g_free(transport->configuration);
++		transport->configuration = util_memdup(configuration, size);
++		transport->size = size;
++
++		DBG("%s: configuration updated", transport->path);
++
++		g_dbus_emit_property_changed(btd_get_dbus_connection(),
++					transport->path,
++					MEDIA_TRANSPORT_INTERFACE,
++					"Configuration");
++		return;
++	}
++}
++
+ struct btd_device *media_transport_get_dev(struct media_transport *transport)
+ {
+ 	return transport->device;
+diff --git a/profiles/audio/transport.h b/profiles/audio/transport.h
+index 90e079c..f16c66a 100644
+--- a/profiles/audio/transport.h
++++ b/profiles/audio/transport.h
+@@ -23,6 +23,9 @@ void *media_transport_get_stream(struct media_transport *transport);
+ struct btd_device *media_transport_get_dev(struct media_transport *transport);
+ void media_transport_update_delay(struct media_transport *transport,
+ 							uint16_t delay);
++void media_transport_update_configuration(struct btd_device *device,
++					const uint8_t *configuration,
++					size_t size);
+ void media_transport_update_volume(struct media_transport *transport,
+ 								int volume);
+ void transport_get_properties(struct media_transport *transport,
