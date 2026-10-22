@@ -17,7 +17,11 @@ pub const SCMST_COPY_FREE: u8 = 0x02;
 pub struct Options {
     pub replay: Option<PathBuf>,
     pub scmst: Option<u8>,
-    /// Log the drift line every 10 s. Not a dev switch: read in every build.
+    /// Log the drift line every 10 s. Off unless `APTX_ADAPTIVE_DRIFT_LOG` is
+    /// set: it is the only periodic writer, and a release install should not
+    /// write a line every 10 s just because audio is playing. The one-shot
+    /// lines (negotiated row at stream open, one line per bitrate change)
+    /// stay on in every build.
     pub drift_log: bool,
     /// Start the bitrate ladder here and never step off it (HQ profile: quality
     /// over latency).
@@ -31,7 +35,7 @@ impl Default for Options {
         Self {
             replay: None,
             scmst: None,
-            drift_log: true,
+            drift_log: false,
             pin_level: None,
             start_level: None,
         }
@@ -42,7 +46,7 @@ impl Options {
     /// # Errors
     /// A message if a variable is set to something unusable.
     pub fn from_env(var: impl Fn(&str) -> Option<OsString>) -> Result<Self, String> {
-        let drift_log = var(DRIFT_LOG_VAR).is_none_or(|v| v != "0");
+        let drift_log = var(DRIFT_LOG_VAR).is_some_and(|v| v != "0");
         if !cfg!(feature = "dev-replay") {
             return Ok(Self {
                 drift_log,
@@ -227,7 +231,7 @@ mod tests {
 
     #[test]
     fn drift_log_switch_in_every_build() {
-        assert!(Options::from_env(env(&[])).unwrap().drift_log);
+        assert!(!Options::from_env(env(&[])).unwrap().drift_log);
         assert!(
             Options::from_env(env(&[(DRIFT_LOG_VAR, "1")]))
                 .unwrap()

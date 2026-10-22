@@ -309,8 +309,17 @@ impl Session<AnyCore> {
         // HD pins the top row and refuses to step (quality over latency);
         // adaptive starts low and climbs as the link allows.
         let pin = opts.pin_level.filter(|l| (2..=7).contains(l));
-        let start_level = pin.or_else(|| opts.start_level.filter(|l| (2..=7).contains(l)));
-        let row = table_row(config, budget(mtu))?;
+        // A pinned profile opens on its row rather than stepping to it at the
+        // first packet: the ladder then never moves at all.
+        let row = match pin {
+            Some(level) => aptx_adaptive::table_row_at_level(config, budget(mtu), level)
+                .ok()
+                .filter(|r| {
+                    r.packet_bytes == table_row(config, budget(mtu)).map_or(0, |b| b.packet_bytes)
+                })
+                .unwrap_or(table_row(config, budget(mtu))?),
+            None => table_row(config, budget(mtu))?,
+        };
         // Which ladder row the negotiated link selected: latency claims need evidence.
         {
             let _ = writeln!(
@@ -350,14 +359,15 @@ impl Session<AnyCore> {
             s.fade = Fade::Steady;
             s.abr = false;
         }
-        if let Some(level) = start_level {
+        if pin.is_some() {
+            // The row is already the pinned one; disable stepping and do not
+            // queue another level change (that logged a bogus 3 -> 5 line).
+            s.abr = false;
+        } else if let Some(level) = opts.start_level.filter(|l| (2..=7).contains(l)) {
             // The bitrate ladder lives on the stream, not in the codec config.
             if s.stream.request_level(level) {
                 s.stream.apply_level_now();
             }
-        }
-        if pin.is_some() {
-            s.abr = false;
         }
         s.scmst = opts.scmst;
         s.drift_log = opts.drift_log;

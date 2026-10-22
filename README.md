@@ -49,9 +49,11 @@ and aptX-LL through to everything else unchanged.
 **Other ranking slots** (`ldac`, `lc3plus_hr`) if you want aptX Adaptive to take a different
 position in the codec preference order.
 
-**Self-check logging.** A drift line every 10 s, the negotiated ladder row at stream open, a
-log line for every bitrate change, and a WirePlumber guard that recovers a headset which
-configured aptX HD under an aptX Adaptive profile.
+**Self-check logging.** The negotiated ladder row is logged once per stream and every bitrate
+change gets one line; an optional drift line every 10 s is available with
+`APTX_ADAPTIVE_DRIFT_LOG=1`. There is also a WirePlumber guard that recovers a headset which
+configured aptX HD under an aptX Adaptive profile. Nothing writes log files: the lines go to
+stderr and land in the systemd journal, which is size-capped and self-vacuuming.
 
 MIT licensed, self-contained build.
 
@@ -202,13 +204,24 @@ audio.
 
 ## checking it is working
 
-While audio plays, the plugin logs the ladder row it selected, a drift line every 10 s, and
-one line per bitrate change:
+The plugin logs the ladder row it selected once per stream, and one line per bitrate change:
 
 ```sh
 journalctl --user -u wireplumber -f | grep 'aptx-adaptive: row'
-journalctl --user -u wireplumber -f | grep 'aptx-adaptive: drift'
 journalctl --user -u wireplumber -f | grep 'aptx-adaptive: level'
+```
+
+Those two are always on and cost almost nothing: a handful of lines per connection. The
+periodic drift line — backlog, drift and current level, every 10 s — is off by default
+because it is the only thing that would write continuously while audio plays. Turn it on when
+diagnosing a silent or stuttering stream, by adding to the drop-in and restarting:
+
+```conf
+Environment="APTX_ADAPTIVE_DRIFT_LOG=1"
+```
+
+```sh
+journalctl --user -u wireplumber -f | grep 'aptx-adaptive: drift'
 ```
 
 On the tested headset, LL reports `period=10ms bitrate=270kbps payload=348B`, and HQ holds
