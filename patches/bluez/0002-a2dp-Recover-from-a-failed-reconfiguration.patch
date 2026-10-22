@@ -1,0 +1,584 @@
+From b94de6497e5384c80d513352477b88ac7d365d25 Mon Sep 17 00:00:00 2001
+From: Prateek Mittal <finance.prateek.mittal@gmail.com>
+Date: Sun, 18 Oct 2026 06:07:19 +0530
+Subject: [PATCH 2/2] a2dp: Recover from a failed reconfiguration
+
+Close can only be sent from OPEN or STREAMING.  The error path then
+aborted the stream unconditionally, including when a Close was already in
+flight, and a failed SetConfiguration tore down the endpoint even though
+the previous configuration was still valid.
+
+- Reject a second request with EBUSY while a Close or Abort is pending,
+  and do not Abort a stream that cannot be closed.
+- Save the active capabilities and SEPs before closing, then restore them
+  if the remote or the local endpoint rejects the new configuration.
+- Propagate the A2DP configuration error name to the caller and return
+  InvalidArguments for malformed vendor configurations, without touching
+  the current stream.
+
+Assisted-by: DeepSeekHarness:deepseek-v4.1-flash-1017
+---
+ profiles/audio/a2dp.c | 387 ++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 356 insertions(+), 31 deletions(-)
+
+diff --git a/profiles/audio/a2dp.c b/profiles/audio/a2dp.c
+index 37f6d4a..858023d 100644
+--- a/profiles/audio/a2dp.c
++++ b/profiles/audio/a2dp.c
+@@ -107,7 +107,14 @@ struct a2dp_setup {
+ 	avdtp_set_configuration_cb setconf_cb;
+ 	GSList *seps;
+ 	GSList *caps;
++	GSList *prev_caps;
++	struct a2dp_sep *prev_sep;
++	struct a2dp_remote_sep *prev_rsep;
++	gboolean revert;
++	gboolean reverted;
++	int revert_errno;
+ 	gboolean reconfigure;
++	gboolean switching;
+ 	gboolean start;
+ 	GSList *cb;
+ 	GIOChannel *io;
+@@ -293,6 +300,7 @@ static void setup_free(struct a2dp_setup *s)
+ 		avdtp_unref(s->session);
+ 	g_slist_free_full(s->cb, g_free);
+ 	g_slist_free_full(s->caps, g_free);
++	g_slist_free_full(s->prev_caps, g_free);
+ 	g_free(s->err);
+ 	g_free(s);
+ }
+@@ -413,6 +421,9 @@ static gboolean finalize_config(gpointer data)
+ 	GSList *l;
+ 	struct avdtp_stream *stream = s->err ? NULL : s->stream;
+ 
++	s->switching = FALSE;
++	s->reconfigure = FALSE;
++
+ 	for (l = s->cb; l != NULL; ) {
+ 		struct a2dp_setup_cb *cb = l->data;
+ 
+@@ -429,6 +440,106 @@ static gboolean finalize_config(gpointer data)
+ 	return FALSE;
+ }
+ 
++static int a2dp_apply_config(struct a2dp_setup *setup,
++					struct a2dp_sep *sep,
++					struct a2dp_remote_sep *rsep,
++					GSList *caps)
++{
++	int err;
++
++	if (!setup->session || !sep || !sep->lsep || !rsep) {
++		error("Unable to apply configuration: invalid endpoint");
++		return -EINVAL;
++	}
++
++	err = avdtp_set_configuration(setup->session, rsep->sep, sep->lsep,
++					caps, &setup->stream);
++	if (err < 0)
++		error("avdtp_set_configuration: %s", strerror(-err));
++
++	return err;
++}
++
++static void a2dp_revert_failed(struct a2dp_setup *setup)
++{
++	setup->revert = FALSE;
++
++	error("Unable to restore previous configuration: %s",
++						strerror(-setup->revert_errno));
++
++	if (!setup->err)
++		setup_error_init(setup, AVDTP_ERRNO,
++						-setup->revert_errno);
++
++	finalize_config(setup);
++}
++
++static gboolean a2dp_revert_apply(gpointer data)
++{
++	struct a2dp_setup *setup = data;
++	int err;
++
++	err = a2dp_apply_config(setup, setup->prev_sep, setup->prev_rsep,
++							setup->prev_caps);
++	if (err < 0)
++		a2dp_revert_failed(setup);
++	else
++		info("Restored previous configuration");
++
++	setup_unref(setup);
++
++	return FALSE;
++}
++
++static void a2dp_revert(struct a2dp_setup *setup, int err)
++{
++	int ret;
++
++	if (setup->revert)
++		return;
++
++	setup->revert_errno = err;
++
++	if (!setup->session || !setup->prev_caps || !setup->prev_sep ||
++							!setup->prev_rsep) {
++		error("No previous configuration to restore");
++
++		if (setup->stream && avdtp_has_stream(setup->session,
++						setup->stream))
++			avdtp_abort(setup->session, setup->stream);
++
++		goto failed;
++	}
++
++	setup->revert = TRUE;
++
++	if (setup->stream && avdtp_has_stream(setup->session, setup->stream) &&
++			avdtp_stream_get_state(setup->stream) !=
++							AVDTP_STATE_IDLE) {
++		ret = avdtp_abort(setup->session, setup->stream);
++		if (ret < 0) {
++			error("avdtp_abort: %s", strerror(-ret));
++			goto failed;
++		}
++
++		return;
++	}
++
++	if (a2dp_apply_config(setup, setup->prev_sep, setup->prev_rsep,
++						setup->prev_caps) < 0)
++		goto failed;
++
++	return;
++
++failed:
++	setup->revert = FALSE;
++
++	if (!setup->err)
++		setup_error_init(setup, AVDTP_ERRNO, -err);
++
++	finalize_config(setup);
++}
++
+ static gboolean finalize_resume(gpointer data)
+ {
+ 	struct a2dp_setup *s = data;
+@@ -1010,11 +1121,24 @@ static gboolean endpoint_getcap_ind(struct avdtp *session,
+ 
+ static void endpoint_open_cb(struct a2dp_setup *setup, uint8_t error_code)
+ {
+-	int err = error_to_errno(setup->err);
++	int err;
++
++	/* A rollback replays the previous configuration; the error kept in
++	 * setup->err belongs to the failed attempt, not to the rollback.
++	 */
++	if (setup->revert)
++		err = 0;
++	else
++		err = error_to_errno(setup->err);
+ 
+ 	if (error_code != 0) {
+-		setup->stream = NULL;
+-		finalize_setup_errno(setup, -EPERM, finalize_config, NULL);
++		if (setup->revert) {
++			a2dp_revert_failed(setup);
++			goto done;
++		}
++
++		setup_error_init(setup, AVDTP_MEDIA_CODEC, error_code);
++		a2dp_revert(setup, -EPERM);
+ 		goto done;
+ 	}
+ 
+@@ -1024,6 +1148,11 @@ static void endpoint_open_cb(struct a2dp_setup *setup, uint8_t error_code)
+ 	if (err == 0)
+ 		goto done;
+ 
++	if (setup->revert) {
++		a2dp_revert_failed(setup);
++		goto done;
++	}
++
+ 	error("avdtp_open %s (%d)", strerror(-err), -err);
+ 	setup->stream = NULL;
+ 	finalize_setup_errno(setup, err, finalize_config, NULL);
+@@ -1165,12 +1294,21 @@ static void setconf_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
+ 
+ 	if (err) {
+ 		if (setup) {
+-			setup_ref(setup);
++			int posix_err = error_to_errno(err);
++
+ 			setup_error_set(setup, err);
+ 			invalidate_remote_cache(setup, err);
+-			finalize_config(setup);
+-			setup_error_set(setup, NULL);
+-			setup_unref(setup);
++
++			if (setup->revert) {
++				a2dp_revert_failed(setup);
++				return;
++			}
++
++			/* The stream was rejected: release what is left
++			 * of it and put the previous configuration back.
++			 */
++			setup->stream = NULL;
++			a2dp_revert(setup, posix_err);
+ 		}
+ 
+ 		return;
+@@ -1369,6 +1507,25 @@ static void open_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
+ 	if (setup->reconfigure)
+ 		setup->reconfigure = FALSE;
+ 
++	if (setup->revert) {
++		if (err) {
++			error("avdtp_open: %s", avdtp_strerror(err));
++			a2dp_revert_failed(setup);
++			return;
++		}
++
++		setup->revert = FALSE;
++		setup->reverted = TRUE;
++		info("Restored previous configuration");
++
++		if (!setup->err)
++			setup_error_init(setup, AVDTP_ERRNO,
++						-setup->revert_errno);
++
++		finalize_config(setup);
++		return;
++	}
++
+ 	if (err) {
+ 		setup->stream = NULL;
+ 		setup_error_set(setup, err);
+@@ -1632,19 +1789,18 @@ static gboolean a2dp_reconfigure(gpointer data)
+ 		goto failed;
+ 	}
+ 
+-	posix_err = avdtp_set_configuration(setup->session, setup->rsep->sep,
+-						sep->lsep,
+-						setup->caps,
+-						&setup->stream);
+-	if (posix_err < 0) {
+-		error("avdtp_set_configuration: %s", strerror(-posix_err));
++	posix_err = a2dp_apply_config(setup, sep, setup->rsep, setup->caps);
++	if (posix_err < 0)
+ 		goto failed;
+-	}
+ 
+ 	return FALSE;
+ 
+ failed:
+-	finalize_setup_errno(setup, posix_err, finalize_config, NULL);
++	if (setup->revert)
++		a2dp_revert_failed(setup);
++	else
++		a2dp_revert(setup, posix_err);
++
+ 	return FALSE;
+ }
+ 
+@@ -1689,7 +1845,9 @@ static void close_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
+ 		return;
+ 
+ 	if (err) {
+-		setup->stream = NULL;
++		/* The stream is still configured; leave it in place so the
++		 * previous codec remains usable.
++		 */
+ 		setup_error_set(setup, err);
+ 		finalize_config(setup);
+ 		return;
+@@ -1742,6 +1900,21 @@ static void abort_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
+ 	if (!setup)
+ 		return;
+ 
++	if (setup->revert) {
++		if (err) {
++			a2dp_revert_failed(setup);
++			return;
++		}
++
++		setup_ref(setup);
++		if (g_idle_add(a2dp_revert_apply, setup) > 0)
++			return;
++
++		setup_unref(setup);
++		a2dp_revert_failed(setup);
++		return;
++	}
++
+ 	if (setup_reconfigure(setup))
+ 		return;
+ 
+@@ -2029,6 +2202,33 @@ static void caps_add_codec(GSList **l, uint8_t codec, uint8_t *caps,
+ 	g_free(cap);
+ }
+ 
++static void a2dp_reconfig_save(struct a2dp_setup *setup,
++					struct a2dp_sep *sep,
++					struct a2dp_remote_sep *rsep,
++					struct avdtp_stream *stream)
++{
++	struct avdtp_service_capability *cap;
++	struct avdtp_media_codec_capability *codec;
++
++	g_slist_free_full(setup->prev_caps, g_free);
++	setup->prev_caps = NULL;
++	setup->prev_sep = sep;
++	setup->prev_rsep = rsep;
++	setup->revert = FALSE;
++	setup->reverted = FALSE;
++
++	cap = avdtp_stream_get_codec(stream);
++	if (!cap)
++		return;
++
++	if (cap->length < sizeof(*codec))
++		return;
++
++	codec = (struct avdtp_media_codec_capability *) cap->data;
++	caps_add_codec(&setup->prev_caps, sep->codec, codec->data,
++					cap->length - sizeof(*codec));
++}
++
+ struct client {
+ 	const char *sender;
+ 	const char *path;
+@@ -2092,19 +2292,66 @@ static int parse_properties(DBusMessageIter *props, uint8_t **caps, int *size)
+ 	return -EINVAL;
+ }
+ 
++struct reconfig_data {
++	DBusMessage *msg;
++	struct a2dp_setup *setup;
++};
++
++static const char *a2dp_config_error_name(uint8_t code)
++{
++	size_t i;
++
++	for (i = 0; i < ARRAY_SIZE(config_errors); i++)
++		if (config_errors[i].error_code == code)
++			return config_errors[i].error_name;
++
++	return NULL;
++}
++
+ static void reconfig_cb(struct avdtp *session, struct a2dp_sep *sep,
+ 			struct avdtp_stream *stream, int err, void *user_data)
+ {
+-	DBusMessage *msg = user_data;
++	struct reconfig_data *data = user_data;
++	struct a2dp_setup *setup = data->setup;
++	DBusMessage *msg = data->msg;
++
++	if (err) {
++		const char *name = NULL;
++		char *error_name;
++		char *text;
++
++		if (setup->err && avdtp_error_category(setup->err) ==
++						AVDTP_MEDIA_CODEC)
++			name = a2dp_config_error_name(
++					avdtp_error_error_code(setup->err));
++
++		if (name)
++			error_name = g_strdup_printf("%s.A2DP.%s",
++							ERROR_INTERFACE, name);
++		else
++			error_name = g_strdup(ERROR_INTERFACE ".Failed");
++
++		if (setup->reverted)
++			text = g_strdup_printf("Configuration failed: %s; "
++					"previous configuration restored",
++					strerror(-err));
++		else
++			text = g_strdup_printf("Configuration failed: %s",
++							strerror(-err));
+ 
+-	if (err)
+ 		g_dbus_send_message(btd_get_dbus_connection(),
+-					btd_error_failed(msg, strerror(-err)));
+-	else
++				g_dbus_create_error(msg, error_name,
++							"%s", text));
++
++		g_free(text);
++		g_free(error_name);
++	} else {
+ 		g_dbus_send_reply(btd_get_dbus_connection(), msg,
+-					DBUS_TYPE_INVALID);
++							DBUS_TYPE_INVALID);
++	}
+ 
+ 	dbus_message_unref(msg);
++	g_free(data);
+ }
+ 
+ static int a2dp_reconfig(struct a2dp_channel *chan, const char *sender,
+@@ -2114,6 +2361,7 @@ static int a2dp_reconfig(struct a2dp_channel *chan, const char *sender,
+ 	struct a2dp_setup *setup;
+ 	struct a2dp_stream *stream;
+ 	struct a2dp_setup_cb *cb_data;
++	struct reconfig_data *data;
+ 	GSList *l;
+ 	int err;
+ 
+@@ -2125,11 +2373,25 @@ static int a2dp_reconfig(struct a2dp_channel *chan, const char *sender,
+ 		return -ENOMEM;
+ 
+ 	cb_data = setup_cb_add(setup);
++	data = g_new0(struct reconfig_data, 1);
++	data->msg = user_data;
++	data->setup = setup;
+ 	cb_data->config_cb = reconfig_cb;
+-	cb_data->user_data = user_data;
++	cb_data->user_data = data;
++
++	/* PipeWire rate limits its calls, but a second caller must not
++	 * queue another Close/Abort while one is still in flight.
++	 */
++	if (setup->switching || setup->reconfigure || setup->id ||
++				setup->revert) {
++		error("Reconfiguration already in progress");
++		err = -EBUSY;
++		goto fail;
++	}
+ 
+ 	setup->sep = lsep;
+ 	setup->rsep = rsep;
++	setup->reverted = FALSE;
+ 
+ 	g_slist_free_full(setup->caps, g_free);
+ 	setup->caps = NULL;
+@@ -2143,6 +2405,7 @@ static int a2dp_reconfig(struct a2dp_channel *chan, const char *sender,
+ 	/* Check for existing stream and close it */
+ 	for (; l; l = g_slist_next(l)) {
+ 		struct a2dp_sep *tmp = l->data;
++		avdtp_state_t state;
+ 
+ 		/* Attempt to reconfigure if a stream already exists */
+ 		stream = queue_find(tmp->streams, match_stream_session,
+@@ -2159,8 +2422,34 @@ static int a2dp_reconfig(struct a2dp_channel *chan, const char *sender,
+ 			if (!avdtp_has_stream(chan->session, stream->stream))
+ 				continue;
+ 
+-			err = avdtp_close(chan->session, stream->stream, FALSE);
++			state = avdtp_stream_get_state(stream->stream);
++
++			if (state == AVDTP_STATE_CLOSING ||
++					state == AVDTP_STATE_ABORTING) {
++				error("Stream is already closing");
++				err = -EBUSY;
++				goto fail;
++			}
++
++			a2dp_reconfig_save(setup, tmp,
++					get_remote_sep(chan, stream->stream),
++					stream->stream);
++
++			err = avdtp_close(chan->session, stream->stream,
++								FALSE);
+ 			if (err < 0) {
++				/* The Close was not queued.  Abort only a
++				 * stream that was never opened; every other
++				 * case is a Close already in flight or a
++				 * stream we must not tear down.
++				 */
++				if (state != AVDTP_STATE_CONFIGURED) {
++					error("Unable to close stream: %s",
++							strerror(-err));
++					err = -EBUSY;
++					goto fail;
++				}
++
+ 				err = avdtp_abort(chan->session,
+ 							stream->stream);
+ 				if (err < 0) {
+@@ -2171,23 +2460,22 @@ static int a2dp_reconfig(struct a2dp_channel *chan, const char *sender,
+ 			}
+ 
+ 			setup->reconfigure = TRUE;
++			setup->switching = TRUE;
+ 
+ 			return 0;
+ 		}
+ 	}
+ 
+-	err = avdtp_set_configuration(setup->session, setup->rsep->sep,
+-						lsep->lsep,
+-						setup->caps,
+-						&setup->stream);
+-	if (err < 0) {
+-		error("avdtp_set_configuration: %s", strerror(-err));
++	err = a2dp_apply_config(setup, lsep, rsep, setup->caps);
++	if (err < 0)
+ 		goto fail;
+-	}
++
++	setup->switching = TRUE;
+ 
+ 	return 0;
+ 
+ fail:
++	g_free(data);
+ 	setup_cb_free(cb_data);
+ 	return err;
+ }
+@@ -2230,11 +2518,48 @@ static DBusMessage *set_configuration(DBusConnection *conn, DBusMessage *msg,
+ 	if (parse_properties(&props, &caps, &size) < 0)
+ 		return btd_error_invalid_args(msg);
+ 
++	if (lsep->codec == A2DP_CODEC_VENDOR) {
++		a2dp_vendor_codec_t *codec_caps;
++		a2dp_vendor_codec_t *local_caps;
++		uint8_t *local_data;
++		size_t local_size;
++
++		if (size < (int) sizeof(*codec_caps))
++			return btd_error_invalid_args_str(msg,
++					"Invalid vendor codec configuration");
++
++		codec_caps = (a2dp_vendor_codec_t *) caps;
++		local_size = lsep->endpoint->get_capabilities(lsep,
++							&local_data,
++							lsep->user_data);
++		local_caps = (a2dp_vendor_codec_t *) local_data;
++
++		if (local_size < sizeof(*local_caps) ||
++		    A2DP_GET_VENDOR_ID(*codec_caps) !=
++					A2DP_GET_VENDOR_ID(*local_caps) ||
++		    A2DP_GET_CODEC_ID(*codec_caps) !=
++					A2DP_GET_CODEC_ID(*local_caps))
++			return btd_error_invalid_args_str(msg,
++					"Vendor codec configuration does not "
++					"match the endpoint");
++	}
++
+ 	err = a2dp_reconfig(chan, sender, lsep, rsep, caps, size,
+ 					dbus_message_ref(msg));
+ 	if (err < 0) {
++		DBusMessage *reply;
++
++		if (err == -EINVAL)
++			reply = btd_error_invalid_args_str(msg,
++					"Invalid codec configuration");
++		else if (err == -EBUSY)
++			reply = btd_error_in_progress_str(msg,
++					"Reconfiguration already in progress");
++		else
++			reply = btd_error_failed(msg, strerror(-err));
++
+ 		dbus_message_unref(msg);
+-		return btd_error_failed(msg, strerror(-err));
++		return reply;
+ 	}
+ 
+ 	return NULL;
