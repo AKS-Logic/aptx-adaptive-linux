@@ -2,6 +2,21 @@
 
 Clean-room aptX Adaptive encoder in Rust, plus a PipeWire bluez5 codec plugin. See `docs/adr/0001-architecture.md`.
 
+## spec-driven development (hard)
+
+- This repo is developed spec-first. Read `spec/README.md` for the layout and workflow,
+  and `spec/constitution.md` for the rules every change must satisfy.
+- Behaviour is agreed in a `spec/features/NNN-slug/spec.md` requirement (`REQ-nnn`) before
+  it is implemented. A task cites the requirement it satisfies; a behaviour with no
+  requirement is not agreed even if the code already does it.
+- Each feature directory holds `spec.md` (what/why, EARS requirements, Given/When/Then
+  acceptance), `plan.md` (how), `research.md` (decisions and evidence), `tasks.md`
+  (ordered, traceable work), `quickstart.md` (hardware verification).
+- The `spec/*.md` files at the root are the reference corpus (protocol, encoder, research).
+  Do not move them into a feature directory.
+- Record measurements as evidence, with how they were obtained. Telemetry is not
+  audibility; say which one a claim rests on.
+
 ## clean room rules (hard)
 
 - Implement only from `spec/` and `tests/vectors/`.

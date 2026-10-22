@@ -103,6 +103,83 @@ impl Table {
     }
 }
 
+/// Three of our entries (LL, adaptive, HQ), each on its own endpoint so each
+/// becomes its own card profile, then the real plugin's codecs passed through.
+#[repr(C)]
+pub struct Table3 {
+    ours: [media_codec; 3],
+    real: UnsafeCell<[MaybeUninit<media_codec>; MAX_REAL]>,
+    list: UnsafeCell<[*const media_codec; 3 + MAX_REAL + 1]>,
+    once: Once,
+}
+
+// SAFETY: as `Table`: the cells are written only inside `once`.
+unsafe impl Sync for Table3 {}
+
+impl Table3 {
+    pub const fn new(owner: media_codec, second: media_codec, third: media_codec) -> Self {
+        Self {
+            ours: [owner, second, third],
+            real: UnsafeCell::new([const { MaybeUninit::uninit() }; MAX_REAL]),
+            list: UnsafeCell::new([ptr::null(); 3 + MAX_REAL + 1]),
+            once: Once::new(),
+        }
+    }
+
+    pub fn ours(&self) -> [*const media_codec; 3] {
+        [
+            &raw const self.ours[0],
+            &raw const self.ours[1],
+            &raw const self.ours[2],
+        ]
+    }
+
+    pub fn codecs(
+        &self,
+        info: *const spa_dict,
+        support: *const spa_support,
+        n_support: u32,
+    ) -> *const *const media_codec {
+        self.once.call_once(|| {
+            let res = find_and_load(info, support, n_support);
+            // SAFETY: inside `once`, nobody else touches the cells.
+            unsafe { self.fill(res) };
+        });
+        self.list.get().cast()
+    }
+
+    /// # Safety
+    /// Only from inside `self.once`.
+    unsafe fn fill(&self, res: Result<Loaded, String>) {
+        // SAFETY: caller contract.
+        let list = unsafe { &mut *self.list.get() };
+        // The third entry is opt-in so the default export stays the two-entry
+        // contract the rest of the tree and its tests are written against.
+        let three = std::env::var_os("APTX_ADAPTIVE_THREE_PROFILES").is_some();
+        let ours = self.ours();
+        let n = if three { 3 } else { 2 };
+        list[..n].copy_from_slice(&ours[..n]);
+        match res {
+            Ok(l) => {
+                let real = self.real.get().cast::<media_codec>();
+                for (i, &c) in l.codecs.iter().enumerate() {
+                    // SAFETY: `c` passed `validate`; a bitwise copy keeps its pointers.
+                    unsafe {
+                        real.add(i).write(ptr::read(c));
+                        list[n + i] = real.add(i);
+                    }
+                }
+                log(&format!(
+                    "aptX passthrough: {} codecs from {}",
+                    l.codecs.len(),
+                    l.path.display()
+                ));
+            }
+            Err(e) => log(&format!("aptX/aptX HD unavailable: {e}")),
+        }
+    }
+}
+
 fn log(msg: &str) {
     let _ = writeln!(std::io::stderr(), "aptx-adaptive: {msg}");
 }

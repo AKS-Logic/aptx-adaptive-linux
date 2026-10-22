@@ -119,9 +119,9 @@ fn load_from(path: &Path, factory_name: &CStr) -> Loaded {
             [
                 ids::FACTORY_NAME_APTX,
                 ids::FACTORY_NAME_LC3PLUS,
-                ids::FACTORY_NAME_NATIVE,
+                ids::FACTORY_NAME_HQ,
             ],
-            "both file names' factories plus the native-encoder port"
+            "both file names' factories plus the HQ-only factory"
         );
     }
 
@@ -148,6 +148,20 @@ fn load_from(path: &Path, factory_name: &CStr) -> Loaded {
     unsafe {
         while let Some(c) = (*iface.codecs.add(all.len())).as_ref() {
             all.push(c);
+        }
+    }
+    if std::env::var_os("APTX_DUMP_CODECS").is_some() {
+        for c in &all {
+            // SAFETY: static NUL-terminated strings.
+            unsafe {
+                eprintln!(
+                    "CODEC id=0x{:04x} name={:?} endpoint={:?} desc={:?}",
+                    c.id,
+                    CStr::from_ptr(c.name),
+                    CStr::from_ptr(c.endpoint_name),
+                    CStr::from_ptr(c.description)
+                );
+            }
         }
     }
     Loaded {
@@ -1678,4 +1692,20 @@ fn aptx_slot_without_real_plugin_exports_only_ours() {
     );
     check_alias(l.ll, l.codec, SPA_BLUETOOTH_AUDIO_CODEC_APTX);
     std::process::exit(SLOT_CHILD_OK);
+}
+
+#[test]
+fn hq_factory_exports_one_entry() {
+    let l = load_from(plugin_path(), ids::FACTORY_NAME_HQ);
+    assert_eq!(l.all.len(), 1, "HQ factory must export exactly one entry");
+    let c = l.all[0];
+    assert_eq!(c.id, 0x0303);
+    // SAFETY: static NUL-terminated string.
+    assert_eq!(unsafe { CStr::from_ptr(c.name) }, ids::ADAPTIVE_HQ_NAME);
+    // SAFETY: static NUL-terminated string.
+    assert_eq!(
+        unsafe { CStr::from_ptr(c.endpoint_name) },
+        ids::ADAPTIVE_HQ_ENDPOINT
+    );
+    assert!(c.fill_caps.is_some());
 }

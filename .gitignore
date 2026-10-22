@@ -1,3 +1,7 @@
 /target
 /.scratch
 /.worktrees
+
+# Working data, never published: protocol/encoder reference corpus, table-extraction
+# notes, questions, and the feature specs derived from them.
+/spec/

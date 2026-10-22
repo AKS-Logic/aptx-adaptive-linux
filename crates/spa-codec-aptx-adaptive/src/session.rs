@@ -305,7 +305,23 @@ impl Session<AnyCore> {
         if opts.replay.is_some() || link_row(config, mtu).is_none() {
             config.profile = Profile::Hq;
         }
+        // Profile level policy, set per card profile by the service environment.
+        // HD pins the top row and refuses to step (quality over latency);
+        // adaptive starts low and climbs as the link allows.
+        let pin = opts.pin_level.filter(|l| (2..=7).contains(l));
+        let start_level = pin.or_else(|| opts.start_level.filter(|l| (2..=7).contains(l)));
         let row = table_row(config, budget(mtu))?;
+        // Which ladder row the negotiated link selected: latency claims need evidence.
+        {
+            let _ = writeln!(
+                std::io::stderr(),
+                "aptx-adaptive: row profile={:?} period={}ms bitrate={}kbps payload={}B",
+                config.profile,
+                row.period_ms,
+                row.bitrate / 1000,
+                row.packet_bytes
+            );
+        }
         let core = match &opts.replay {
             None => AnyCore::Encoder(Encoder::new(config, row.bitrate)?),
             Some(path) => {
@@ -332,6 +348,15 @@ impl Session<AnyCore> {
             s.pcm = vec![0; s.stream.samples_per_packet()];
             s.rows[Profile::Ll.index()] = None;
             s.fade = Fade::Steady;
+            s.abr = false;
+        }
+        if let Some(level) = start_level {
+            // The bitrate ladder lives on the stream, not in the codec config.
+            if s.stream.request_level(level) {
+                s.stream.apply_level_now();
+            }
+        }
+        if pin.is_some() {
             s.abr = false;
         }
         s.scmst = opts.scmst;
@@ -389,6 +414,20 @@ impl<C: Core> Session<C> {
     #[cfg(test)]
     pub fn level(&self) -> u8 {
         self.stream.level()
+    }
+
+    /// Runtime level policy for an in-band mode change: `Some(level)` pins the
+    /// ladder (HQ: quality over latency), `None` lets it adapt (adaptive mode).
+    pub fn set_level_policy(&mut self, pin: Option<u8>) {
+        match pin {
+            Some(level) => {
+                self.abr = false;
+                if self.stream.request_level(level) {
+                    // Lands at the next packet boundary (encode applies it).
+                }
+            }
+            None => self.abr = true,
+        }
     }
 
     /// `reduce_bitpool` (`down`) or `increase_bitpool`: asks for the next level down (floor 2)
@@ -680,6 +719,12 @@ impl<C: Core> Session<C> {
     /// # Errors
     /// Encoder failures, or `NoSpace` if `dst` can't hold a packet.
     pub fn encode(&mut self, src: &[u8], dst: &mut [u8]) -> Result<EncodeResult, SessionError> {
+        // A start-level request is queued at open time but cannot be applied
+        // while the stream still holds its start mute; land it at the first
+        // packet boundary where the stream allows a level change.
+        if self.stream.pending_level().is_some() {
+            self.stream.apply_level_now();
+        }
         let block = self.block_size();
         if src.len() < block {
             return Ok(EncodeResult {

@@ -19,6 +19,11 @@ pub struct Options {
     pub scmst: Option<u8>,
     /// Log the drift line every 10 s. Not a dev switch: read in every build.
     pub drift_log: bool,
+    /// Start the bitrate ladder here and never step off it (HQ profile: quality
+    /// over latency).
+    pub pin_level: Option<u8>,
+    /// Start the bitrate ladder here and keep adapting (adaptive profile).
+    pub start_level: Option<u8>,
 }
 
 impl Default for Options {
@@ -27,6 +32,8 @@ impl Default for Options {
             replay: None,
             scmst: None,
             drift_log: true,
+            pin_level: None,
+            start_level: None,
         }
     }
 }
@@ -58,6 +65,8 @@ impl Options {
             replay,
             scmst,
             drift_log,
+            pin_level: None,
+            start_level: None,
         })
     }
 

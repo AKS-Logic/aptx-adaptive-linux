@@ -17,7 +17,15 @@ pub const ADAPTIVE_LL_DESCRIPTION: &CStr = c"aptX Adaptive LL";
 pub const ADAPTIVE_HIRES_NAME: &CStr = c"aptx_adaptive_hires";
 pub const ADAPTIVE_HIRES_DESCRIPTION: &CStr = c"aptX Adaptive Hi-Res";
 pub const ADAPTIVE_ENDPOINT: &CStr = c"aptx_adaptive";
+// HQ is spec profile 3 ("HQ", not "HD": aptX HD is a different codec).
+pub const ADAPTIVE_HQ_NAME: &CStr = c"aptx_adaptive_hq";
+pub const ADAPTIVE_HQ_DESCRIPTION: &CStr = c"aptX Adaptive HQ";
+pub const ADAPTIVE_HQ_ENDPOINT: &CStr = c"aptx_adaptive_hq";
+pub const ADAPTIVE_LL_ENDPOINT: &CStr = c"aptx_adaptive_ll";
 pub const FACTORY_NAME_NATIVE: &CStr = c"api.codec.bluez5.media.aptx_adaptive";
+/// Own file/factory for the HQ profile: one endpoint per plugin file is the
+/// only shape the BlueZ side reliably registers as its own card profile.
+pub const FACTORY_NAME_HQ: &CStr = c"api.codec.bluez5.media.aptx_adaptive_hq";
 pub const FACTORY_DESCRIPTION_NATIVE: &CStr =
     c"aptX Adaptive native encoder plugin (Rust port of a2dp-codec-aptx-adaptive.c)";
 

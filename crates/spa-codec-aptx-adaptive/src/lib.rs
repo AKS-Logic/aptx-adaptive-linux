@@ -53,6 +53,24 @@ fn set_errno(e: c_int) {
     unsafe { *__errno_location() = e };
 }
 
+/// One entry with an explicit id, name, description and endpoint.
+const fn codec_named(
+    mode: DefaultMode,
+    slot: Slot,
+    owner: bool,
+    id: u32,
+    name: &'static CStr,
+    description: &'static CStr,
+    endpoint: &'static CStr,
+) -> media_codec {
+    let mut c = codec(mode, slot, owner);
+    c.id = id;
+    c.name = name.as_ptr();
+    c.description = description.as_ptr();
+    c.endpoint_name = endpoint.as_ptr();
+    c
+}
+
 /// One entry: the endpoint `owner` has the slot's id and `fill_caps`, the alias neither.
 const fn codec(mode: DefaultMode, slot: Slot, owner: bool) -> media_codec {
     let (name, description) = match mode {
@@ -125,6 +143,38 @@ static APTX_HQ: passthrough::Table = passthrough::Table::new(
     codec(DefaultMode::Hq, Slot::Aptx, true),
     codec(DefaultMode::Ll, Slot::Aptx, false),
 );
+
+/// The opt-in three-profile set: HQ (pinned), adaptive (scaling), LL.
+static APTX_HQ3: passthrough::Table3 = passthrough::Table3::new(
+    codec_named(
+        DefaultMode::Hq,
+        Slot::Aptx,
+        true,
+        crate::ffi::SPA_BLUETOOTH_AUDIO_CODEC_APTX_ADAPTIVE_HIRES,
+        ids::ADAPTIVE_HQ_NAME,
+        ids::ADAPTIVE_HQ_DESCRIPTION,
+        ids::ADAPTIVE_HQ_ENDPOINT,
+    ),
+    codec_named(
+        DefaultMode::Hq,
+        Slot::Aptx,
+        true,
+        crate::ffi::SPA_BLUETOOTH_AUDIO_CODEC_APTX_ADAPTIVE,
+        ids::CODEC_NAME,
+        ids::CODEC_DESCRIPTION,
+        ids::ADAPTIVE_ENDPOINT,
+    ),
+    codec_named(
+        DefaultMode::Ll,
+        Slot::Aptx,
+        true,
+        crate::ffi::SPA_BLUETOOTH_AUDIO_CODEC_APTX_ADAPTIVE_LL,
+        ids::ADAPTIVE_LL_NAME,
+        ids::ADAPTIVE_LL_DESCRIPTION,
+        ids::ADAPTIVE_LL_ENDPOINT,
+    ),
+);
+
 static APTX_LL: passthrough::Table = passthrough::Table::new(
     codec(DefaultMode::Ll, Slot::Aptx, true),
     codec(DefaultMode::Hq, Slot::Aptx, false),
@@ -151,6 +201,7 @@ fn entry_profile(codec: *const media_codec) -> Option<aptx_adaptive::Profile> {
     let [aptx_ll_owner, aptx_hq_alias] = APTX_LL.ours();
     let aptx_ll_alias = APTX_HQ.ours()[1];
     if is(&[
+        APTX_HQ3.ours()[2],
         &raw const LL_LDAC.0,
         &raw const LL_LC3PLUS_HR.0,
         &raw const LL_ALIAS.0,
@@ -158,7 +209,7 @@ fn entry_profile(codec: *const media_codec) -> Option<aptx_adaptive::Profile> {
         aptx_ll_alias,
     ]) {
         Some(aptx_adaptive::Profile::Ll)
-    } else if is(&[&raw const HQ_ALIAS.0, aptx_hq_alias]) {
+    } else if is(&[&raw const HQ_ALIAS.0, aptx_hq_alias, APTX_HQ3.ours()[0]]) {
         Some(aptx_adaptive::Profile::Hq)
     } else {
         None
@@ -189,7 +240,13 @@ fn codecs(
     n_support: u32,
 ) -> *const *const media_codec {
     let list = match config(factory) {
-        (Slot::Aptx, DefaultMode::Hq) => return APTX_HQ.codecs(info, support, n_support),
+        (Slot::Aptx, DefaultMode::Hq) => {
+            return if std::env::var_os("APTX_ADAPTIVE_THREE_PROFILES").is_some() {
+                APTX_HQ3.codecs(info, support, n_support)
+            } else {
+                APTX_HQ.codecs(info, support, n_support)
+            };
+        }
         (Slot::Aptx, DefaultMode::Ll) => return APTX_LL.codecs(info, support, n_support),
         (Slot::Ldac, DefaultMode::Hq) => &CODECS_HQ_LDAC,
         (Slot::Lc3plusHr, DefaultMode::Hq) => &CODECS_HQ_LC3PLUS_HR,
@@ -534,10 +591,30 @@ unsafe extern "C" fn codec_init(
         let mut config = caps::check_stream(config, &stream).map_err(caps_err)?;
         let var = |k: &str| std::env::var_os(k);
         // Write errors are ignored so logging cannot panic here.
-        let opts = dev::Options::from_env(var).map_err(|e| {
+        let mut opts = dev::Options::from_env(var).map_err(|e| {
             let _ = writeln!(std::io::stderr(), "aptx-adaptive: {e}");
             -EINVAL
         })?;
+        // Level policy per card profile. HQ keeps the top row; adaptive starts
+        // low and lets the bitpool callbacks climb as the link allows.
+        // HQ always pins: its whole point is quality over latency. The
+        // adaptive profile starts lower only when asked, so the default
+        // two-entry contract (level 3) stays untouched.
+        if !codec.is_null() {
+            // SAFETY: PipeWire passes one of our static entries or null.
+            let name = unsafe { (*codec).name };
+            if !name.is_null() {
+                // SAFETY: codec names are static NUL-terminated strings.
+                let n = unsafe { CStr::from_ptr(name) };
+                if n == ids::ADAPTIVE_HQ_NAME {
+                    opts.pin_level = Some(5);
+                } else if n == ids::CODEC_NAME
+                    && std::env::var_os("APTX_ADAPTIVE_START_LOW").is_some()
+                {
+                    opts.start_level = Some(2);
+                }
+            }
+        }
         if let Some(msg) = opts.describe(var) {
             let _ = writeln!(std::io::stderr(), "{msg}");
         }
@@ -640,6 +717,63 @@ unsafe extern "C" fn codec_start_encode(
     }
 }
 
+/// Mode control file: `echo ll > /run/user/1000/aptx-mode`. Changing it switches
+/// the running stream in-band (§7K) instead of renegotiating A2DP, so no
+/// disconnect. One read per 100 ms at most.
+fn poll_mode_file(s: &mut Session<dev::AnyCore>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static SEEN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    // Opt-in only: a stray mode file must never fight the card profile.
+    let Ok(path) = std::env::var("APTX_ADAPTIVE_MODE_FILE") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if now.saturating_sub(LAST.load(Ordering::Relaxed)) < 100 {
+        return;
+    }
+    LAST.store(now, Ordering::Relaxed);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let want = text.trim().to_ascii_lowercase();
+    {
+        let Ok(mut seen) = SEEN.lock() else { return };
+        if seen.as_deref() == Some(want.as_str()) {
+            return;
+        }
+        *seen = Some(want.clone());
+    }
+    let res = match want.as_str() {
+        "ll" => s.request(aptx_adaptive::Profile::Ll),
+        "hq" => {
+            s.set_level_policy(Some(5));
+            s.request(aptx_adaptive::Profile::Hq)
+        }
+        "adaptive" => {
+            s.set_level_policy(None);
+            s.request(aptx_adaptive::Profile::Hq)
+        }
+        other => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "aptx-adaptive: mode {other:?} is not ll/hq/adaptive"
+            );
+            return;
+        }
+    };
+    let _ = writeln!(
+        std::io::stderr(),
+        "aptx-adaptive: in-band mode -> {want} ({res:?})"
+    );
+}
+
 unsafe extern "C" fn codec_encode(
     data: *mut c_void,
     src: *const c_void,
@@ -662,7 +796,9 @@ unsafe extern "C" fn codec_encode(
     // SAFETY: PipeWire passes dst_size writable bytes.
     let dst = unsafe { slice::from_raw_parts_mut(dst.cast::<u8>(), dst_size) };
     // SAFETY: PipeWire passes the pointer from init.
-    match unsafe { session(data) }.encode(src, dst) {
+    let s = unsafe { session(data) };
+    poll_mode_file(s);
+    match s.encode(src, dst) {
         Ok(r) => {
             // SAFETY: checked non-null above.
             unsafe {
@@ -741,7 +877,11 @@ unsafe extern "C" fn factory_init(
     } else {
         slot::Factory::Lc3plus
     };
-    let codecs = codecs(which, info, support, n_support);
+    let codecs = if ptr::eq(factory, &raw const FACTORY_HQ.0) {
+        CODECS_HQ_ONLY.0.as_ptr()
+    } else {
+        codecs(which, info, support, n_support)
+    };
     let this = handle.cast::<Handle>();
     // SAFETY: the loader allocates get_size() bytes for the handle, suitably aligned.
     unsafe {
@@ -813,6 +953,20 @@ const fn factory(name: &'static CStr) -> spa_handle_factory {
 /// `codec-loader.c` asks each plugin file for the factory named after the file, so we export
 /// both names and the one PipeWire asks for tells us which file we were installed as.
 static FACTORY_APTX: SyncStatic<spa_handle_factory> = SyncStatic(factory(ids::FACTORY_NAME_APTX));
+/// The HQ entry, exported by its own plugin file so it becomes its own card
+/// profile (a third endpoint in one file is not registered by the BlueZ side).
+static HQ_CODEC: SyncStatic<media_codec> = SyncStatic(codec_named(
+    DefaultMode::Hq,
+    Slot::Aptx,
+    true,
+    crate::ffi::SPA_BLUETOOTH_AUDIO_CODEC_APTX_ADAPTIVE_HIRES,
+    ids::ADAPTIVE_HQ_NAME,
+    ids::ADAPTIVE_HQ_DESCRIPTION,
+    ids::ADAPTIVE_HQ_ENDPOINT,
+));
+static CODECS_HQ_ONLY: CodecList = SyncStatic([&raw const HQ_CODEC.0, ptr::null(), ptr::null()]);
+static FACTORY_HQ: SyncStatic<spa_handle_factory> = SyncStatic(factory(ids::FACTORY_NAME_HQ));
+
 static FACTORY_LC3PLUS: SyncStatic<spa_handle_factory> =
     SyncStatic(factory(ids::FACTORY_NAME_LC3PLUS));
 
@@ -832,7 +986,7 @@ pub unsafe extern "C" fn spa_handle_factory_enum(
         *factory = match *index {
             0 => &raw const FACTORY_APTX.0,
             1 => &raw const FACTORY_LC3PLUS.0,
-            2 => ptr::from_ref(ported::factory_ref()),
+            2 => &raw const FACTORY_HQ.0,
             _ => return 0,
         };
         *index += 1;
