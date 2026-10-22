@@ -34,6 +34,9 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 user_plugin_dir=$HOME/.local/lib/spa-0.2
 aptx_dest=$user_plugin_dir/bluez5/libspa-codec-bluez5-aptx.so
+# HQ is exported by its own factory and must live in its own file: a third
+# endpoint inside one plugin file is not registered by BlueZ.
+aptx_hq_dest=$user_plugin_dir/bluez5/libspa-codec-bluez5-aptx_adaptive_hq.so
 lc3plus_dest=$user_plugin_dir/bluez5/libspa-codec-bluez5-lc3plus.so
 units=(wireplumber.service pipewire.service)
 dev_dropin=$config_home/systemd/user/wireplumber.service.d/aptx-adaptive-dev-replay.conf
@@ -70,6 +73,7 @@ remove_guard() {
 case ${1-} in
 --uninstall)
 	remove "$aptx_dest"
+	remove "$aptx_hq_dest"
 	remove "$lc3plus_dest"
 	for unit in "${units[@]}"; do
 		remove "$config_home/systemd/user/$unit.d/aptx-adaptive.conf"
@@ -149,6 +153,12 @@ target_dir=$(cargo metadata --manifest-path "$repo/Cargo.toml" --format-version 
 install -Dm644 "$target_dir/release/libspa_codec_aptx_adaptive.so" "$dest"
 echo "installed $dest"
 remove "$other_dest"
+if [[ $slot == aptx ]]; then
+	install -Dm644 "$target_dir/release/libspa_codec_aptx_adaptive.so" "$aptx_hq_dest"
+	echo "installed $aptx_hq_dest"
+else
+	remove "$aptx_hq_dest"
+fi
 
 if [[ $slot == aptx ]]; then
 	# Recovers a headset that configured the real aptX HD under our profile (ADR 0004).
@@ -160,10 +170,18 @@ else
 	remove_guard
 fi
 
+# APTX_ADAPTIVE_ST0=1 is not optional: without it the plugin sends the §7F
+# latency-mode SSRC (0xA3) with a constant sample-count timestamp, which a sink
+# cannot schedule — the stream negotiates and then plays silence.
+# APTX_ADAPTIVE_START_LOW=1 makes the adaptive profile begin at the lowest
+# bitrate row and climb; HQ pins its own level in code.
 dropin_body="[Service]
 Environment=\"SPA_PLUGIN_DIR=$user_plugin_dir:$system_plugin_dir\"
 Environment=\"APTX_ADAPTIVE_SLOT=$slot\"
 Environment=\"APTX_ADAPTIVE_DEFAULT_MODE=$default_mode\"
+Environment=\"APTX_ADAPTIVE_ST0=1\"
+Environment=\"APTX_ADAPTIVE_START_LOW=1\"
+MemoryDenyWriteExecute=no
 "
 for unit in "${units[@]}"; do
 	dropin=$config_home/systemd/user/$unit.d/aptx-adaptive.conf
@@ -219,8 +237,9 @@ EOF
 esac
 cat <<EOF
 Default mode: $default_mode (APTX_ADAPTIVE_DEFAULT_MODE=hq|ll). Profiles:
-  $hq_profile   aptX Adaptive (HQ)
-  $ll_profile   aptX Adaptive (Low Latency)
-If monitor.bluez.properties sets bluez5.codecs, it must include "aptx_adaptive" and
-"aptx_adaptive_ll".
+  a2dp-sink                    aptX Adaptive HQ (pinned, quality over latency)
+  a2dp-sink-aptx_adaptive      aptX Adaptive (starts low, scales with the link)
+  a2dp-sink-aptx_adaptive_ll   aptX Adaptive LL (lowest latency)
+If monitor.bluez.properties sets bluez5.codecs, it must include "aptx_adaptive",
+"aptx_adaptive_ll" and "aptx_adaptive_hq".
 EOF
