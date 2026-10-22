@@ -5,11 +5,20 @@ needs two fixes. This directory carries those changes as **patch files only** â€
 source trees, no binaries, no build output. Everything here is a diff against the released
 source of a public project.
 
-| Patch | Base version | What it does |
+Every patch here is generated from a source tree we actually built and installed, and each
+was verified by applying it to a clean checkout of its base commit and comparing the result
+against that tree byte for byte.
+
+| Patch | Base | Verification |
 |---|---|---|
-| [`pipewire/0001-bluez5-aptx-adaptive.patch`](pipewire/0001-bluez5-aptx-adaptive.patch) | PipeWire **1.6.9** (`8fa27ca`) | lets the aptX Adaptive plugin expose three profiles and survive profile switches |
-| [`bluez/0001-avdtp-Keep-the-session-on-an-unanswered-Abort.patch`](bluez/0001-avdtp-Keep-the-session-on-an-unanswered-Abort.patch) | BlueZ **5.87** | keep the AVDTP session when a sink never answers an Abort |
-| [`bluez/0002-a2dp-Recover-from-a-failed-reconfiguration.patch`](bluez/0002-a2dp-Recover-from-a-failed-reconfiguration.patch) | BlueZ **5.87** | recover from a failed A2DP reconfiguration instead of dropping the link |
+| [`pipewire/0001-bluez5-aptx-adaptive.patch`](pipewire/0001-bluez5-aptx-adaptive.patch) | PipeWire **1.6.9**, commit `8fa27ca` (installed package `1:1.6.9-1`) | all **10** patched files identical to the build tree |
+| [`bluez/0001-avdtp-Keep-the-session-on-an-unanswered-Abort.patch`](bluez/0001-avdtp-Keep-the-session-on-an-unanswered-Abort.patch) | BlueZ `5.87` per `configure.ac`, commit `dd9d5ba` (installed package `5.87-2.1`) | first of three; see below |
+| [`bluez/0002-a2dp-Recover-from-a-failed-reconfiguration.patch`](bluez/0002-a2dp-Recover-from-a-failed-reconfiguration.patch) | same | second of three |
+| [`bluez/0003-aptx-adaptive-additions.patch`](bluez/0003-aptx-adaptive-additions.patch) | same, **applied on top of 0001 and 0002** | together the three reproduce all **7** modified files identically |
+
+`0001`/`0002` are the named fixes; `0003` carries the remaining changes our tree has beyond
+them. Skipping `0003` yields a `bluetoothd` that applies cleanly but does not match what we
+built â€” the failure mode this directory exists to avoid.
 
 ## Why the PipeWire patch exists
 
@@ -34,8 +43,10 @@ appeared while the codec was otherwise accepted by the loader.
 ## Why the BlueZ patches exist
 
 A profile change makes BlueZ send AVDTP `Close`/`Abort`. Some sinks (the tested Bose among
-them) ignore the Abort, so upstream BlueZ waits out its timeout and tears the link down. These
-two patches keep the session and recover the stream instead of dropping the connection.
+them) ignore the Abort, so upstream BlueZ waits out its timeout and tears the link down.
+`0001` keeps the session alive when the Abort goes unanswered, `0002` recovers a failed
+reconfiguration instead of dropping the link, and `0003` is the rest of what our build tree
+carries.
 
 ## Applying them
 
@@ -53,8 +64,8 @@ sudo install -m755 _build/spa/plugins/bluez5/libspa-bluez5.so \
 
 # BlueZ
 git clone https://git.kernel.org/pub/scm/bluetooth/bluez.git
-cd bluez && git checkout 5.87
-git am /path/to/patches/bluez/*.patch
+cd bluez && git checkout dd9d5ba      # 5.87; apply 0001..0003 in order
+for p in /path/to/patches/bluez/*.patch; do git apply "$p" || break; done
 ./bootstrap-configure && make -j"$(nproc)"
 sudo install -m755 src/bluetoothd /usr/lib/bluetooth/bluetoothd
 ```
