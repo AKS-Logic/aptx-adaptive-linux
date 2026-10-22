@@ -83,6 +83,51 @@ headset is unverified — no sink advertising 96 kHz was available.
 **Untested:** congestion-driven bitrate reduction on hardware, multi-hour stability, and
 every other headset.
 
+### community hardware report
+
+**Audio-Technica ATH-TWX9MK2 + Steam Deck:** successfully tested on SteamOS 3.9.3
+(build 20261015.100), PipeWire 1.6.8, WirePlumber 0.5.18 and BlueZ 5.87.
+
+Current `main` was tested at commit
+`42ae0e22678f3d74f1efc5014cb703c072ecc0ac`.
+
+The plugin was installed in the `lc3plus_hr` slot using the stock SteamOS
+PipeWire and BlueZ packages; the project's patched PipeWire/BlueZ system
+components were not installed. WirePlumber was restricted to the A2DP source
+role and to `sbc`, `aptx`, `aptx_adaptive` and `aptx_adaptive_ll`; HFP was
+disabled after initial pairing/A2DP connection attempts proved unreliable with
+the normal set of Bluetooth roles enabled.
+
+aptX Adaptive playback works correctly. The adaptive bitrate was observed
+moving between 270, 340 and 427 kbps according to link conditions.
+
+aptX Adaptive Low Latency also negotiates successfully. PipeWire reports
+`api.bluez5.codec = "aptx_adaptive_ll"` and a fresh LL stream reports:
+
+```text
+aptx-adaptive: row profile=Ll period=10ms bitrate=270kbps payload=348B
+```
+
+The ATH-TWX9MK2 therefore appears to use the normal 10 ms LL mode rather than
+the optional 8 ms enhanced-LL mode.
+
+One compatibility issue was found with the current default ST0 transport.
+With `APTX_ADAPTIVE_ST0=1` present in the WirePlumber process environment,
+the LL profile negotiates successfully but playback on the ATH-TWX9MK2 is
+severely corrupted, consisting mainly of static-like fragments and popping
+from both earbuds.
+
+Removing only `APTX_ADAPTIVE_ST0`, restarting PipeWire/WirePlumber,
+reconnecting the earbuds and selecting the same LL profile restores clean
+playback immediately. No other codec or WirePlumber setting was changed for
+this A/B test.
+
+The working configuration therefore uses the current codec implementation with
+ST0 disabled for this headset.
+
+Standard aptX was also verified independently, helping separate general
+Bluetooth/A2DP behaviour from aptX Adaptive codec negotiation.
+
 ## requirements
 
 Tested with PipeWire 1.6.9, BlueZ 5.87 and WirePlumber 0.5; the plugin requires PipeWire
@@ -114,34 +159,6 @@ binary that differs from ours.
 
 Building needs `mise` (it provides Rust, Python and uv), `pkg-config` with the libspa
 development files, and `python3`.
-
-### community hardware report
-
-**Audio-Technica ATH-TWX9MK2 + Steam Deck:** successfully tested on SteamOS 3.9.3
-(build 20261015.100), PipeWire 1.6.8, WirePlumber 0.5.18 and BlueZ 5.87.
-
-This test was performed against commit
-`859fa14dd10c29312eeb86339a44a0da59bef8b8`, before the current three-profile
-layout and patched PipeWire/BlueZ stack were introduced. It therefore documents
-compatibility of that revision rather than claiming that current `main` has been
-re-tested on this hardware.
-
-The plugin was installed in the `lc3plus_hr` slot so that standard aptX remained
-available as the safe connection codec. WirePlumber was restricted to the A2DP
-source role and to `sbc`, `aptx`, `aptx_adaptive` and `aptx_adaptive_ll`; HFP was
-disabled after initial pairing/A2DP connection attempts proved unreliable with
-the normal set of Bluetooth roles enabled.
-
-Both aptX Adaptive modes were verified during actual playback. In the normal
-aptX Adaptive mode, `api.bluez5.codec` reported `aptx_adaptive` and the runtime
-log stepped from 270 kbps to 340 kbps and then to 427 kbps, remaining stable at
-the top level. Switching to the low-latency profile succeeded without
-disconnecting the earbuds, with `api.bluez5.codec` reporting
-`aptx_adaptive_ll`.
-
-Standard aptX was also verified independently before enabling Adaptive, which
-helped separate general Bluetooth/A2DP behaviour from aptX Adaptive codec
-negotiation.
 
 ## install
 
