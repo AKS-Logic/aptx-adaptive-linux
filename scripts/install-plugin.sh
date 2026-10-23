@@ -168,17 +168,21 @@ else
 	remove_guard
 fi
 
-# APTX_ADAPTIVE_ST0=1 is not optional: without it the plugin sends the §7F
-# latency-mode SSRC (0xA3) with a constant sample-count timestamp, which a sink
-# cannot schedule — the stream negotiates and then plays silence.
+# Source type is per headset and both values are needed in the field:
+#   source-timed 0x00 (this default): the tested Bose QC Ultra. With host timing
+#     its stream dies and the headset restarts.
+#   host-timed 0x02: the community ATH-TWX9MK2 report, which is corrupted by 0x00.
+# Set the other value for one headset with
+#   APTX_ADAPTIVE_SOURCE_TYPE_OVERRIDES="ADDR=2"
+# without disturbing the rest.
 # APTX_ADAPTIVE_START_LOW=1 makes the adaptive profile begin at the lowest
 # bitrate row and climb; HQ pins its own level in code.
 dropin_body="[Service]
 Environment=\"SPA_PLUGIN_DIR=$user_plugin_dir:$system_plugin_dir\"
 Environment=\"APTX_ADAPTIVE_SLOT=$slot\"
 Environment=\"APTX_ADAPTIVE_DEFAULT_MODE=$default_mode\"
-Environment=\"APTX_ADAPTIVE_ST0=1\"
 Environment=\"APTX_ADAPTIVE_THREE_PROFILES=1\"
+Environment=\"APTX_ADAPTIVE_ST0=1\"
 Environment=\"APTX_ADAPTIVE_START_LOW=1\"
 MemoryDenyWriteExecute=no
 "

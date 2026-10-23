@@ -141,26 +141,32 @@ It selects the transport timing mode, which changes two things: the SSRC becomes
 instead of the §7F latency-mode value (`0xA1` LL, `0xA3` HQ), and the RTP timestamp becomes an
 absolute microsecond time-to-play instead of a constant sample count.
 
-Measured on both sides, on the current code:
+Both values are needed in the field, measured on the current code with real music:
 
-| Headset | `ST0=1` | ST0 unset (source type `0x02`) |
+| Headset | source-timed (`ST0=1`, `0x00`) | host-timed (`0x02`) |
 |---|---|---|
-| Bose Quiet Comfort Ultra (ours) | 1382 frames, SSRC `0xAE`, clean | **9 frames, then silence** — both HQ and LL |
-| Audio-Technica ATH-TWX9MK2 (community report) | negotiates, then static/popping | clean |
+| Bose Quiet Comfort Ultra (ours) | clean | **stream dies and the headset restarts** |
+| Audio-Technica ATH-TWX9MK2 (community report) | static / popping | clean |
 
-`ST0` is not a workaround we invented: **Android sources advertise source type `0x00`**, and
-with an advancing time-to-play, which is what this mode emulates. The opposite — a host
-sending `0x02` and waiting — is what stalls Qualcomm sinks. The same failure was measured
-independently on a Sennheiser MOMENTUM 5 (`A2DP` write returning `EAGAIN` under `0x02`), see
-[`arkq/openaptx` PR #16](https://github.com/arkq/openaptx/pull/16), `STATUS.md` §5.
+Neither is universally right, so the plugin chooses per headset: it reads the device address
+from the settings dict and an outlier list can override the default for one device without
+touching the rest:
 
-So `0x00` is the reference behaviour and `0x02` is the experiment. It still is not universal:
-the ATH-TWX9MK2 plays under `0x02` and is corrupted by `0x00`, so the setting remains
-configurable per headset.
+```conf
+Environment="APTX_ADAPTIVE_SOURCE_TYPE_OVERRIDES=11:22:33:44:55:66=2"
+```
 
-If a headset plays static or goes silent, try the other value before assuming the codec is
-broken. Note that the variable is read for **presence only**: remove the line to disable ST0.
-Writing `APTX_ADAPTIVE_ST0=0` still enables it.
+Format: `ADDR=0;OTHER=2`, matched case-insensitively against `api.bluez5.address`. Unlisted
+headsets follow `APTX_ADAPTIVE_ST0` (default source-timed). The plugin logs its choice, which
+makes a compatibility report self-diagnosing:
+
+```sh
+journalctl --user -u wireplumber | grep 'aptx-adaptive: source-type'
+```
+
+If a headset plays static, goes silent or restarts the link, try the other value first. Note
+that `APTX_ADAPTIVE_ST0` is read for **presence only**: remove the line to disable it, because
+`APTX_ADAPTIVE_ST0=0` still enables it.
 
 By default the plugin is installed as PipeWire's **aptX plugin** and loads the
 system one behind it, so headsets without aptX Adaptive behave exactly as before. The other
