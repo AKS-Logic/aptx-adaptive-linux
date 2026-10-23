@@ -128,16 +128,35 @@ which exports all three endpoints, and writes systemd user drop-ins. In the defa
 installs a small WirePlumber guard script that recovers a headset which configured aptX HD
 under an aptX Adaptive profile. Re-running it is safe.
 
-The drop-ins carry one setting that is not cosmetic:
+### ST0 is headset-dependent
+
+The installer sets `APTX_ADAPTIVE_ST0=1` by default, and that is a **default for the headset
+we test on, not a rule**:
 
 ```conf
 Environment="APTX_ADAPTIVE_ST0=1"
 ```
 
-Without it the plugin sends the §7F latency-mode SSRC (`0xA3`) together with a constant
-sample-count RTP timestamp. The stream negotiates and the transport starts, but the sink
-cannot schedule it: it decodes nothing and the link eventually times out. With ST0 the
-plugin sends SSRC `0xAE` and a microsecond timestamp that advances by the frame period.
+It selects the transport timing mode, which changes two things: the SSRC becomes `0xAE`
+instead of the §7F latency-mode value (`0xA1` LL, `0xA3` HQ), and the RTP timestamp becomes an
+absolute microsecond time-to-play instead of a constant sample count.
+
+Measured on both sides, on the current code:
+
+| Headset | `ST0=1` | ST0 unset (source type `0x02`) |
+|---|---|---|
+| Bose Quiet Comfort Ultra (ours) | 1382 frames, SSRC `0xAE`, clean | **9 frames, then silence** — both HQ and LL |
+| Audio-Technica ATH-TWX9MK2 (community report) | negotiates, then static/popping | clean |
+
+So neither setting is universally right: the QC Ultra will not schedule a host-timed stream,
+and the ATH-TWX9MK2 is corrupted by the source-timed one. The specification expects a
+software encoder to advertise source type `0x02` (source-timed mode is meant for phone
+offload, where the controller writes link-clock timestamps), so `ST0` is a workaround for
+sinks that reject the normal host path — not the normal thing to send.
+
+If a headset plays static or goes silent, try the other value before assuming the codec is
+broken. Note that the variable is read for **presence only**: remove the line to disable ST0.
+Writing `APTX_ADAPTIVE_ST0=0` still enables it.
 
 By default the plugin is installed as PipeWire's **aptX plugin** and loads the
 system one behind it, so headsets without aptX Adaptive behave exactly as before. The other
