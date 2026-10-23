@@ -17,7 +17,7 @@ vendor source code, SDK, headers, NDA material, or vendor binary is included
 or redistributed in this repository; all original code was written by the
 project. See [`LEGAL.md`](LEGAL.md) for the full statement.
 
-## what it can do
+## capabilities
 
 **Three listening modes on one headset.** HQ, adaptive and low latency appear as three
 card profiles, and you can switch between them while playing:
