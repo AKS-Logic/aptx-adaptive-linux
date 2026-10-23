@@ -298,7 +298,7 @@ index 34b39a9..d1bd75b 100644
  
  fail:
 diff --git a/spa/plugins/bluez5/bluez5-device.c b/spa/plugins/bluez5/bluez5-device.c
-index fc659f6..006494a 100644
+index fc659f6..76a10bd 100644
 --- a/spa/plugins/bluez5/bluez5-device.c
 +++ b/spa/plugins/bluez5/bluez5-device.c
 @@ -628,7 +628,7 @@ static void emit_node(struct impl *this, struct spa_bt_transport *t,
@@ -381,7 +381,21 @@ index fc659f6..006494a 100644
  	switch (id) {
  	case SPA_PARAM_Profile:
  	{
-@@ -3340,6 +3362,7 @@ impl_init(const struct spa_handle_factory *factory,
+@@ -3322,7 +3344,12 @@ filter_bluez_device_setting(struct impl *this, const struct spa_dict *dict)
+ 		; i++)
+ 	{
+ 		const struct spa_dict_item *it = &dict->items[i];
+-		if (it->key != NULL && strncmp(it->key, "bluez", 5) == 0 && it->value != NULL) {
++		/* Also pass the device identity: a codec may need to know which sink it
++		 * is configuring (per-headset quirks such as the aptX Adaptive source
++		 * type). Keys still have to be listed explicitly, never bulk-copied. */
++		if (it->key != NULL && it->value != NULL &&
++		    (strncmp(it->key, "bluez", 5) == 0 ||
++		     spa_streq(it->key, SPA_KEY_API_BLUEZ5_ADDRESS))) {
+ 			this->setting_items[n_items++] =
+ 				SPA_DICT_ITEM_INIT(strdup(it->key), strdup(it->value));
+ 		}
+@@ -3340,6 +3367,7 @@ impl_init(const struct spa_handle_factory *factory,
  {
  	struct impl *this;
  	const char *str;
@@ -389,7 +403,7 @@ index fc659f6..006494a 100644
  	unsigned int i;
  
  	spa_return_val_if_fail(factory != NULL, -EINVAL);
-@@ -3355,12 +3378,13 @@ impl_init(const struct spa_handle_factory *factory,
+@@ -3355,12 +3383,13 @@ impl_init(const struct spa_handle_factory *factory,
  
  	spa_log_topic_init(this->log, &log_topic);
  
