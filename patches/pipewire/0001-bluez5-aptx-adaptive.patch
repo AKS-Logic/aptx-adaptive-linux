@@ -56,7 +56,7 @@ index 89c4d69..fba706f 100644
  	&a2dp_codec_aptx,
  	&a2dp_codec_aptx_ll_0,
 diff --git a/spa/plugins/bluez5/bluez5-dbus.c b/spa/plugins/bluez5/bluez5-dbus.c
-index 34b39a9..d1bd75b 100644
+index 34b39a9..78fe786 100644
 --- a/spa/plugins/bluez5/bluez5-dbus.c
 +++ b/spa/plugins/bluez5/bluez5-dbus.c
 @@ -86,6 +86,8 @@ struct spa_bt_monitor {
@@ -68,7 +68,20 @@ index 34b39a9..d1bd75b 100644
  	struct spa_log *log;
  	struct spa_loop *main_loop;
  	struct spa_loop *data_loop;
-@@ -1769,6 +1771,27 @@ static uint32_t adapter_connectable_profiles(struct spa_bt_adapter *adapter)
+@@ -762,6 +764,12 @@ static void bap_features_clear(struct bap_features *feat)
+ 
+ const struct spa_dict *get_device_codec_settings(struct spa_bt_device *device, bool bap)
+ {
++    /* Device settings for every codec kind, not just BAP. A codec needs to know
++     * which sink it is configuring (per-headset quirks), and callers of this
++     * function always have the device. The BlueZ-initiated SelectConfiguration()
++     * path still has no device context and keeps using globals. */
++    if (!bap && device->settings != NULL)
++        return device->settings;
+     return bap ? device->settings : &device->monitor->global_settings;
+ }
+ 
+@@ -1769,6 +1777,27 @@ static uint32_t adapter_connectable_profiles(struct spa_bt_adapter *adapter)
  	return mask;
  }
  
@@ -96,7 +109,7 @@ index 34b39a9..d1bd75b 100644
  struct spa_bt_device *spa_bt_device_find(struct spa_bt_monitor *monitor, const char *path)
  {
  	struct spa_bt_device *d;
-@@ -1809,6 +1832,7 @@ static struct spa_bt_device *device_create(struct spa_bt_monitor *monitor, const
+@@ -1809,6 +1838,7 @@ static struct spa_bt_device *device_create(struct spa_bt_monitor *monitor, const
  		return NULL;
  
  	d->id = monitor->id++;
@@ -104,7 +117,7 @@ index 34b39a9..d1bd75b 100644
  	d->monitor = monitor;
  	d->path = strdup(path);
  	d->battery_path = battery_get_name(d->path);
-@@ -2028,7 +2052,7 @@ static void emit_device_info(struct spa_bt_monitor *monitor,
+@@ -2028,7 +2058,7 @@ static void emit_device_info(struct spa_bt_monitor *monitor,
  	items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_API_BLUEZ5_ICON, device->icon);
  	items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_API_BLUEZ5_PATH, device->path);
  	items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_API_BLUEZ5_ADDRESS, device->address);
@@ -113,7 +126,7 @@ index 34b39a9..d1bd75b 100644
  	items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_API_BLUEZ5_DEVICE, dev);
  	snprintf(class, sizeof(class), "0x%06x", device->bluetooth_class);
  	items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_API_BLUEZ5_CLASS, class);
-@@ -3233,6 +3257,18 @@ static void remote_endpoint_free(struct spa_bt_remote_endpoint *remote_endpoint)
+@@ -3233,6 +3263,18 @@ static void remote_endpoint_free(struct spa_bt_remote_endpoint *remote_endpoint)
  	free(remote_endpoint);
  }
  
@@ -132,7 +145,7 @@ index 34b39a9..d1bd75b 100644
  struct spa_bt_transport *spa_bt_transport_find(struct spa_bt_monitor *monitor, const char *path)
  {
  	struct spa_bt_transport *t;
-@@ -3263,6 +3299,7 @@ struct spa_bt_transport *spa_bt_transport_create(struct spa_bt_monitor *monitor,
+@@ -3263,6 +3305,7 @@ struct spa_bt_transport *spa_bt_transport_create(struct spa_bt_monitor *monitor,
  	if (t == NULL)
  		return NULL;
  
@@ -140,7 +153,7 @@ index 34b39a9..d1bd75b 100644
  	t->acquire_refcount = 0;
  	t->monitor = monitor;
  	t->path = path;
-@@ -3401,6 +3438,15 @@ void spa_bt_transport_free(struct spa_bt_transport *transport)
+@@ -3401,6 +3444,15 @@ void spa_bt_transport_free(struct spa_bt_transport *transport)
  	free(transport->endpoint_path);
  	free(transport->remote_endpoint_path);
  	free(transport->path);
@@ -156,7 +169,7 @@ index 34b39a9..d1bd75b 100644
  	free(transport);
  }
  
-@@ -3432,7 +3478,16 @@ int spa_bt_transport_acquire(struct spa_bt_transport *transport, bool optional)
+@@ -3432,7 +3484,16 @@ int spa_bt_transport_acquire(struct spa_bt_transport *transport, bool optional)
  		spa_bt_transport_emit_state_changed(transport, transport->state, transport->state);
  		return 0;
  	}
@@ -174,7 +187,7 @@ index 34b39a9..d1bd75b 100644
  
  	/* If we are getting into error state too often, stop trying */
  	if (get_time_now(monitor) > transport->last_error_time + TRANSPORT_ERROR_TIMEOUT)
-@@ -3440,15 +3495,18 @@ int spa_bt_transport_acquire(struct spa_bt_transport *transport, bool optional)
+@@ -3440,15 +3501,18 @@ int spa_bt_transport_acquire(struct spa_bt_transport *transport, bool optional)
  	if (transport->error_count >= TRANSPORT_ERROR_MAX_RETRY)
  		return -EIO;
  
@@ -196,7 +209,7 @@ index 34b39a9..d1bd75b 100644
  	if (res >= 0) {
  		transport->acquire_refcount = 1;
  		transport->acquired = true;
-@@ -3461,10 +3519,19 @@ static void spa_bt_transport_do_release(struct spa_bt_transport *transport)
+@@ -3461,10 +3525,19 @@ static void spa_bt_transport_do_release(struct spa_bt_transport *transport)
  {
  	struct spa_bt_monitor *monitor = transport->monitor;
  
@@ -218,7 +231,7 @@ index 34b39a9..d1bd75b 100644
  		if (!transport->keepalive) {
  			spa_bt_transport_impl(transport, release, 0);
  			transport->acquired = false;
-@@ -3492,8 +3559,15 @@ int spa_bt_transport_release(struct spa_bt_transport *transport)
+@@ -3492,8 +3565,15 @@ int spa_bt_transport_release(struct spa_bt_transport *transport)
  		spa_log_info(monitor->log, "transport %s already released", transport->path);
  		return 0;
  	}
@@ -236,7 +249,7 @@ index 34b39a9..d1bd75b 100644
  
  	/* Postpone active transport releases, since we might need it again soon.
  	 * If not active, release now since it has to be reacquired before using again.
-@@ -3507,6 +3581,25 @@ int spa_bt_transport_release(struct spa_bt_transport *transport)
+@@ -3507,6 +3587,25 @@ int spa_bt_transport_release(struct spa_bt_transport *transport)
  	}
  }
  
@@ -262,7 +275,7 @@ index 34b39a9..d1bd75b 100644
  static int spa_bt_transport_release_now(struct spa_bt_transport *transport)
  {
  	int res;
-@@ -5299,6 +5392,16 @@ static DBusHandlerResult endpoint_set_configuration(DBusConnection *conn,
+@@ -5299,6 +5398,16 @@ static DBusHandlerResult endpoint_set_configuration(DBusConnection *conn,
  
  	transport = spa_bt_transport_find(monitor, transport_path);
  
@@ -279,7 +292,7 @@ index 34b39a9..d1bd75b 100644
  	if (transport == NULL) {
  		char *tpath = strdup(transport_path);
  
-@@ -6950,6 +7053,8 @@ static int impl_clear(struct spa_handle *handle)
+@@ -6950,6 +7059,8 @@ static int impl_clear(struct spa_handle *handle)
  
  	monitor = (struct spa_bt_monitor *) handle;
  
@@ -288,7 +301,7 @@ index 34b39a9..d1bd75b 100644
  	/*
  	 * We don't call BlueZ API unregister methods here, since BlueZ generally does the
  	 * unregistration when the DBus connection is closed below.  We'll unregister DBus
-@@ -7609,6 +7714,8 @@ impl_init(const struct spa_handle_factory *factory,
+@@ -7609,6 +7720,8 @@ impl_init(const struct spa_handle_factory *factory,
  	this->backends[BACKEND_OFONO] = backend_ofono_new(this, this->conn, info, this->quirks, support, n_support);
  	this->backends[BACKEND_HSPHFPD] = backend_hsphfpd_new(this, this->conn, info, this->quirks, support, n_support);
  
