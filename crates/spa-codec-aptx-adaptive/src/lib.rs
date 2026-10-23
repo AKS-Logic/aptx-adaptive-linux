@@ -311,16 +311,56 @@ unsafe extern "C" fn codec_fill_caps(
     write_out(&caps::fill_caps(), caps_out)
 }
 
+/// `APTX_ADAPTIVE_SOURCE_TYPE_OVERRIDES="ADDR=0;ADDR=2"` maps a headset address to
+/// the aptX Adaptive source type it needs. Falls back to `APTX_ADAPTIVE_ST0`
+/// (present = source-timed `0x00`) and then to host-timed `0x02`.
+fn resolve_source_type(address: Option<&str>) -> u8 {
+    if let (Some(addr), Ok(map)) = (
+        address,
+        std::env::var("APTX_ADAPTIVE_SOURCE_TYPE_OVERRIDES"),
+    ) {
+        for entry in map.split(';') {
+            let mut kv = entry.split('=');
+            let (Some(k), Some(v)) = (kv.next(), kv.next()) else {
+                continue;
+            };
+            if k.trim().eq_ignore_ascii_case(addr) {
+                return match v.trim() {
+                    "0" => 0,
+                    _ => 2,
+                };
+            }
+        }
+    }
+    if crate::session::st0_env_default() {
+        0
+    } else {
+        2
+    }
+}
+
 unsafe extern "C" fn codec_select_config(
     _codec: *const media_codec,
     _flags: u32,
     caps: *const c_void,
     caps_size: usize,
     info: *const media_codec_audio_info,
-    _settings: *const spa_dict,
+    settings: *const spa_dict,
     config: *mut u8,
     _config_data: *mut *mut c_void,
 ) -> c_int {
+    // Pick the source type for *this* device: the settings dict carries
+    // api.bluez5.address (patched into the bluez5 device), so an outlier list
+    // keyed by address can override the default.
+    // SAFETY: PipeWire passes the device settings dict or null.
+    let address = unsafe { dict_lookup(settings, "api.bluez5.address") };
+    let source_type = resolve_source_type(address);
+    crate::session::set_source_type(source_type);
+    let _ = writeln!(
+        std::io::stderr(),
+        "aptx-adaptive: source-type {source_type} for {}",
+        address.unwrap_or("<unknown device>")
+    );
     // SAFETY: PipeWire passes caps_size readable bytes.
     let Some(caps) = (unsafe { bytes(caps, caps_size) }) else {
         return -EINVAL;
@@ -484,11 +524,48 @@ unsafe fn shared_props<'a>(props: *mut c_void) -> Option<&'a Props> {
     unsafe { props.cast::<Props>().as_ref() }
 }
 
+/// Diagnostic: dump the device settings dict handed to the codec at init, so we
+/// can see whether the OS tells us which device we are configuring.
+fn dump_settings(dict: *const spa_dict) {
+    // SAFETY: caller contract.
+    let Some(d) = (unsafe { dict.as_ref() }) else {
+        return;
+    };
+    if d.items.is_null() {
+        return;
+    }
+    // SAFETY: a spa_dict holds n_items items.
+    let items = unsafe { slice::from_raw_parts(d.items, d.n_items as usize) };
+    let _ = writeln!(
+        std::io::stderr(),
+        "aptx-adaptive: settings dict has {} item(s)",
+        items.len()
+    );
+    for it in items {
+        // SAFETY: entries are NUL-terminated strings owned by the caller.
+        unsafe {
+            if it.key.is_null() || it.value.is_null() {
+                continue;
+            }
+            let _ = writeln!(
+                std::io::stderr(),
+                "aptx-adaptive: setting {}={}",
+                CStr::from_ptr(it.key).to_string_lossy(),
+                CStr::from_ptr(it.value).to_string_lossy()
+            );
+        }
+    }
+}
+
 unsafe extern "C" fn codec_init_props(
     codec: *const media_codec,
     _flags: u32,
     settings: *const spa_dict,
 ) -> *mut c_void {
+    if std::env::var_os("APTX_ADAPTIVE_DUMP_SETTINGS").is_some() {
+        // SAFETY: PipeWire passes the device settings dict or null.
+        dump_settings(settings);
+    }
     let p = entry_profile(codec).map_or_else(
         || {
             // SAFETY: PipeWire passes the device settings dict or null.

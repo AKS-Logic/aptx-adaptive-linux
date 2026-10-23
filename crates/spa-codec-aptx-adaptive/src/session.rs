@@ -11,6 +11,7 @@ use aptx_adaptive::{Config, Core, Encoder, Error, Profile, Row, Stream, packet_b
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::dev::{AnyCore, Options, Replay};
 use crate::drift::Drift;
@@ -19,8 +20,29 @@ use crate::drift::Drift;
 /// accepts source type 0 (spec §7D/§7E). The RTP timestamp becomes a µs time-to-play clock
 /// advancing by the packet's audio duration, and the SSRC is the phone's `00 00 00 AE`
 /// marker instead of the §7F latency-mode value.
-pub fn st0_mode() -> bool {
+/// Source type chosen for the stream being negotiated (0 = source-timed,
+/// 2 = host-timed). Set from `select_config`, which is the only callback that
+/// both writes the codec element and receives the device settings, so the
+/// choice can follow the headset rather than the process.
+static SOURCE_TYPE: AtomicU8 = AtomicU8::new(u8::MAX);
+
+/// Record the source type for the stream about to be negotiated.
+pub fn set_source_type(v: u8) {
+    SOURCE_TYPE.store(v, Ordering::Relaxed);
+}
+
+/// The environment default, used only when `select_config` has not chosen for a
+/// device yet (tests, and the first packet before negotiation completes).
+pub fn st0_env_default() -> bool {
     std::env::var_os("APTX_ADAPTIVE_ST0").is_some()
+}
+
+pub fn st0_mode() -> bool {
+    match SOURCE_TYPE.load(Ordering::Relaxed) {
+        u8::MAX => st0_env_default(),
+        0 => true,
+        _ => false,
+    }
 }
 
 /// The §7F SSRC for a profile: the whole 32-bit value selects the sink's latency mode.
