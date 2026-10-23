@@ -148,11 +148,15 @@ Measured on both sides, on the current code:
 | Bose Quiet Comfort Ultra (ours) | 1382 frames, SSRC `0xAE`, clean | **9 frames, then silence** — both HQ and LL |
 | Audio-Technica ATH-TWX9MK2 (community report) | negotiates, then static/popping | clean |
 
-So neither setting is universally right: the QC Ultra will not schedule a host-timed stream,
-and the ATH-TWX9MK2 is corrupted by the source-timed one. The specification expects a
-software encoder to advertise source type `0x02` (source-timed mode is meant for phone
-offload, where the controller writes link-clock timestamps), so `ST0` is a workaround for
-sinks that reject the normal host path — not the normal thing to send.
+`ST0` is not a workaround we invented: **Android sources advertise source type `0x00`**, and
+with an advancing time-to-play, which is what this mode emulates. The opposite — a host
+sending `0x02` and waiting — is what stalls Qualcomm sinks. The same failure was measured
+independently on a Sennheiser MOMENTUM 5 (`A2DP` write returning `EAGAIN` under `0x02`), see
+[`arkq/openaptx` PR #16](https://github.com/arkq/openaptx/pull/16), `STATUS.md` §5.
+
+So `0x00` is the reference behaviour and `0x02` is the experiment. It still is not universal:
+the ATH-TWX9MK2 plays under `0x02` and is corrupted by `0x00`, so the setting remains
+configurable per headset.
 
 If a headset plays static or goes silent, try the other value before assuming the codec is
 broken. Note that the variable is read for **presence only**: remove the line to disable ST0.
