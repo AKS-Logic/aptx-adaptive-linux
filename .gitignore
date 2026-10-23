@@ -6,6 +6,7 @@
 # notes, questions, and the feature specs derived from them.
 /spec/
 
-# Reverse-engineering corpus (protocol byte layouts, table extraction, captures).
-# Same rule as spec/: working data, never published.
-/impl/protocol/
+# Implementation record, same rule as spec/: working data, never published.
+# Both folders are local: spec/ is the behaviour contract, impl/ the notes behind
+# it (architecture, protocol corpus, decisions, tasks, verification commands).
+/impl/
