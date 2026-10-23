@@ -10,3 +10,6 @@
 # Both folders are local: spec/ is the behaviour contract, impl/ the notes behind
 # it (architecture, protocol corpus, decisions, tasks, verification commands).
 /impl/
+
+# Agent instructions are local, not part of the shared source.
+/AGENTS.md
