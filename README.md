@@ -17,6 +17,8 @@ vendor source code, SDK, headers, NDA material, or vendor binary is included
 or redistributed in this repository; all original code was written by the
 project. See [`LEGAL.md`](LEGAL.md) for the full statement.
 
+This falls under fair use as the objective is to research AI capabilities and introduce compatibility with linux.
+
 ## capabilities
 
 **Three listening modes on one headset.** HQ, adaptive and low latency appear as three
