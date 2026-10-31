@@ -11,9 +11,9 @@ against that tree byte for byte.
 
 | Patch | Base | Verification |
 |---|---|---|
-| [`pipewire/0001-bluez5-aptx-adaptive.patch`](pipewire/0001-bluez5-aptx-adaptive.patch) | PipeWire **1.6.9**, commit `8fa27ca` (installed package `1:1.6.9-1`) | all **10** patched files identical to the build tree |
-| [`bluez/0001-avdtp-Keep-the-session-on-an-unanswered-Abort.patch`](bluez/0001-avdtp-Keep-the-session-on-an-unanswered-Abort.patch) | BlueZ `5.87` per `configure.ac`, commit `dd9d5ba` (installed package `5.87-2.1`) | first of three; see below |
-| [`bluez/0002-a2dp-Recover-from-a-failed-reconfiguration.patch`](bluez/0002-a2dp-Recover-from-a-failed-reconfiguration.patch) | same | second of three |
+| [`pipewire/0001-bluez5-aptx-adaptive.patch`](pipewire/0001-bluez5-aptx-adaptive.patch) | PipeWire git master, commit `4cfc47112` | all **10** patched files identical to the build tree |
+| [`bluez/0001-avdtp-Keep-the-session-on-an-unanswered-Abort.patch`](bluez/0001-avdtp-Keep-the-session-on-an-unanswered-Abort.patch) | BlueZ git master, commit `14bd6ab65` | first of three; applies cleanly |
+| [`bluez/0002-a2dp-Recover-from-a-failed-reconfiguration.patch`](bluez/0002-a2dp-Recover-from-a-failed-reconfiguration.patch) | same | second of three; applies cleanly |
 | [`bluez/0003-aptx-adaptive-additions.patch`](bluez/0003-aptx-adaptive-additions.patch) | same, **applied on top of 0001 and 0002** | together the three reproduce all **7** modified files identically |
 
 `0001`/`0002` are the named fixes; `0003` carries the remaining changes our tree has beyond
@@ -56,7 +56,7 @@ overwrites them — it writes the package copy as `.pacnew`. To build them from 
 ```sh
 # PipeWire
 git clone https://gitlab.freedesktop.org/pipewire/pipewire.git
-cd pipewire && git checkout 1.6.9
+cd pipewire && git checkout 4cfc47112      # git master
 git apply /path/to/patches/pipewire/0001-bluez5-aptx-adaptive.patch
 meson setup _build && ninja -C _build spa/plugins/bluez5/libspa-bluez5.so
 sudo install -m755 _build/spa/plugins/bluez5/libspa-bluez5.so \
@@ -64,7 +64,7 @@ sudo install -m755 _build/spa/plugins/bluez5/libspa-bluez5.so \
 
 # BlueZ
 git clone https://git.kernel.org/pub/scm/bluetooth/bluez.git
-cd bluez && git checkout dd9d5ba      # 5.87; apply 0001..0003 in order
+cd bluez && git checkout 14bd6ab65         # git master; apply 0001..0003 in order
 for p in /path/to/patches/bluez/*.patch; do git apply "$p" || break; done
 ./bootstrap-configure && make -j"$(nproc)"
 sudo install -m755 src/bluetoothd /usr/lib/bluetooth/bluetoothd
