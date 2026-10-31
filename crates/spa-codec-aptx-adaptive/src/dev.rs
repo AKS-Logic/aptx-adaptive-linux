@@ -9,6 +9,7 @@ use crate::drift::DRIFT_LOG_VAR;
 pub const REPLAY_VAR: &str = "APTX_ADAPTIVE_REPLAY";
 pub const SCMST_VAR: &str = "APTX_ADAPTIVE_SCMST";
 pub const SCMST_BYTE_VAR: &str = "APTX_ADAPTIVE_SCMST_BYTE";
+pub const HEADROOM_VAR: &str = "APTX_ADAPTIVE_HEADROOM_DB";
 
 /// SCMS-T copy-free header (Bluetooth Assigned Numbers, A/V content protection, note 3).
 pub const SCMST_COPY_FREE: u8 = 0x02;
@@ -28,6 +29,8 @@ pub struct Options {
     pub pin_level: Option<u8>,
     /// Start the bitrate ladder here and keep adapting (adaptive profile).
     pub start_level: Option<u8>,
+    /// Digital headroom scale in Q16 (65536 = 1.0, 58409 ≈ -1.0 dB).
+    pub headroom_scale: Option<i64>,
 }
 
 impl Default for Options {
@@ -38,6 +41,7 @@ impl Default for Options {
             drift_log: false,
             pin_level: None,
             start_level: None,
+            headroom_scale: None,
         }
     }
 }
@@ -47,9 +51,25 @@ impl Options {
     /// A message if a variable is set to something unusable.
     pub fn from_env(var: impl Fn(&str) -> Option<OsString>) -> Result<Self, String> {
         let drift_log = var(DRIFT_LOG_VAR).is_some_and(|v| v != "0");
+        let headroom_scale = match var(HEADROOM_VAR) {
+            Some(v) => {
+                let s = v.to_str().unwrap_or("").trim();
+                let db: f64 = s
+                    .parse()
+                    .map_err(|_| format!("{HEADROOM_VAR}={s} is not a valid number"))?;
+                if db <= 0.0 {
+                    Some(65536)
+                } else {
+                    let factor = 10.0f64.powf(-db / 20.0);
+                    Some((factor * 65536.0).round() as i64)
+                }
+            }
+            None => None,
+        };
         if !cfg!(feature = "dev-replay") {
             return Ok(Self {
                 drift_log,
+                headroom_scale,
                 ..Self::default()
             });
         }
@@ -71,6 +91,7 @@ impl Options {
             drift_log,
             pin_level: None,
             start_level: None,
+            headroom_scale,
         })
     }
 
@@ -88,6 +109,12 @@ impl Options {
         }
         if let Some(b) = self.scmst {
             parts.push(format!("SCMS-T header: {b:#04x}"));
+        }
+        if let Some(scale) = self.headroom_scale {
+            if scale != 65536 {
+                let db = -20.0 * (scale as f64 / 65536.0).log10();
+                parts.push(format!("headroom: -{db:.1} dB"));
+            }
         }
         (!parts.is_empty()).then(|| format!("aptx-adaptive: {}", parts.join("; ")))
     }

@@ -54,6 +54,10 @@ const FEATURES_R2_0: u32 = 0x0F00_0000;
 const FEATURES_LOW_BYTE: u32 = 0xff;
 const SINK_22_DECODER: u32 = 1 << 7;
 
+/// Body byte 26: declared bits-per-sample (0x02 = 24-bit PCM).
+const BITS_PER_SAMPLE: usize = 26;
+const BITS_24: u8 = 0x02;
+
 const R1_DATA: [u8; 9] = {
     let t = TTP_DEFAULTS;
     [t[0], t[1], t[2], t[3], t[4], t[5], 0, 0x00, 0xaa]
@@ -249,7 +253,11 @@ fn select_config_with(
             // working Snapdragon phone sends to this sink class.
             const FEATURES_LOW: u32 = 0x92;
             let features = (FEATURES_R2_0 & !FEATURES_LOW_BYTE) | FEATURES_LOW;
-            element(bytes.len(), rate, mode, &r2_data(features))
+            let mut c = element(bytes.len(), rate, mode, &r2_data(features));
+            if c.len() > BITS_PER_SAMPLE {
+                c[BITS_PER_SAMPLE] = BITS_24;
+            }
+            c
         }
         DecoderLevel::R1 => {
             let mut c = element(bytes.len(), rate, mode, &caps.0[APTX_DATA..R2_DATA_END]);
@@ -404,7 +412,7 @@ mod tests {
             0xd7, 0, 0, 0, 0xad, 0, 0x12, 0x02,
             0x50, 0x64, 0x64, 0x64, 0xff, 0xff, 0x00, 0x01,
             0x92, 0x00, 0x00, 0x0f, 0x02, 0x03, 0x03, 0x03, 0x00, 0xaa,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         assert_eq!(config, want);
         assert_eq!(validate_config(&config), Ok(self::config(DecoderLevel::R2)));

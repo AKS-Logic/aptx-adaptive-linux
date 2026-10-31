@@ -266,6 +266,8 @@ pub struct Session<C> {
     /// Whether `st0_ts_us` has been seeded for this stream. The link clock is read lazily
     /// so a stream that never sends ST0 packets leaves it untouched.
     st0_seeded: bool,
+    /// Headroom scale in Q16 (65536 = 1.0, 58409 ≈ -1.0 dB).
+    headroom_scale: i64,
 }
 
 /// `reduce_bitpool` never goes below this level (§7L); level 1 is treated as 2 anyway.
@@ -393,6 +395,7 @@ impl Session<AnyCore> {
         }
         s.scmst = opts.scmst;
         s.drift_log = opts.drift_log;
+        s.headroom_scale = opts.headroom_scale.unwrap_or(65536);
         Ok(s)
     }
 }
@@ -440,6 +443,7 @@ impl<C: Core> Session<C> {
             logged: (c.profile, (stream_level, stream_bitrate)),
             st0_ts_us: monotonic_seed(),
             st0_seeded: false,
+            headroom_scale: 65536,
         })
     }
 
@@ -767,8 +771,14 @@ impl<C: Core> Session<C> {
         }
         let room = self.mtu.saturating_sub(RTP_HEADER_LEN).min(dst.len());
         let (samples, _) = src[..block].as_chunks::<4>();
+        let scale = self.headroom_scale;
         for (s, b) in self.pcm.iter_mut().zip(samples) {
-            *s = (i32::from_ne_bytes(*b) << 8) >> 8;
+            let raw = (i32::from_ne_bytes(*b) << 8) >> 8;
+            *s = if scale == 65536 {
+                raw
+            } else {
+                ((i64::from(raw) * scale) >> 16) as i32
+            };
         }
         self.apply_fade();
         self.hold_level_if_switching();

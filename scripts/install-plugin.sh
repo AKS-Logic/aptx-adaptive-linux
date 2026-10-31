@@ -177,6 +177,8 @@ fi
 # without disturbing the rest.
 # APTX_ADAPTIVE_START_LOW=1 makes the adaptive profile begin at the lowest
 # bitrate row and climb; HQ pins its own level in code.
+# APTX_ADAPTIVE_HEADROOM_DB=1 provides 1.0 dB digital headroom to prevent CMFB
+# synthesis filterbank overshoot from clipping on full-scale 24-bit audio.
 dropin_body="[Service]
 Environment=\"SPA_PLUGIN_DIR=$user_plugin_dir:$system_plugin_dir\"
 Environment=\"APTX_ADAPTIVE_SLOT=$slot\"
@@ -184,6 +186,7 @@ Environment=\"APTX_ADAPTIVE_DEFAULT_MODE=$default_mode\"
 Environment=\"APTX_ADAPTIVE_THREE_PROFILES=1\"
 Environment=\"APTX_ADAPTIVE_ST0=1\"
 Environment=\"APTX_ADAPTIVE_START_LOW=1\"
+Environment=\"APTX_ADAPTIVE_HEADROOM_DB=1\"
 MemoryDenyWriteExecute=no
 "
 for unit in "${units[@]}"; do
