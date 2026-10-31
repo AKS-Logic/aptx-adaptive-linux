@@ -212,10 +212,37 @@ index 555a058ef..55c46fcf5 100644
  		char *tpath = strdup(transport_path);
  
 diff --git a/spa/plugins/bluez5/bluez5-device.c b/spa/plugins/bluez5/bluez5-device.c
-index 1250dc2c4..4b73ffa76 100644
+index 1250dc2c4..472c020f0 100644
 --- a/spa/plugins/bluez5/bluez5-device.c
 +++ b/spa/plugins/bluez5/bluez5-device.c
-@@ -3518,7 +3518,11 @@ filter_bluez_device_setting(struct impl *this, const struct spa_dict *dict)
+@@ -236,6 +236,9 @@ static size_t get_media_codec_quality_priority (const struct media_codec *mc)
+ 		SPA_BLUETOOTH_AUDIO_CODEC_OPUS_G,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD,
++		SPA_BLUETOOTH_AUDIO_CODEC_APTX_ADAPTIVE_LL,
++		SPA_BLUETOOTH_AUDIO_CODEC_APTX_ADAPTIVE,
++		SPA_BLUETOOTH_AUDIO_CODEC_APTX_ADAPTIVE_HD,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_LDAC,
+ 	};
+ 	size_t i;
+@@ -253,13 +256,16 @@ static size_t get_media_codec_latency_priority (const struct media_codec *mc)
+ 	/* From highest latency to lowest latency */
+ 	static const enum spa_bluetooth_audio_codec latency_priorities[] = {
+ 		SPA_BLUETOOTH_AUDIO_CODEC_START,
++		SPA_BLUETOOTH_AUDIO_CODEC_APTX_ADAPTIVE_HD,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_SBC,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_APTX,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_OPUS_G,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_FASTSTREAM_DUPLEX,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_FASTSTREAM,
++		SPA_BLUETOOTH_AUDIO_CODEC_APTX_ADAPTIVE,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_APTX_LL_DUPLEX,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_APTX_LL,
++		SPA_BLUETOOTH_AUDIO_CODEC_APTX_ADAPTIVE_LL,
+ 	};
+ 	size_t i;
+ 
+@@ -3518,7 +3524,11 @@ filter_bluez_device_setting(struct impl *this, const struct spa_dict *dict)
  		; i++)
  	{
  		const struct spa_dict_item *it = &dict->items[i];
