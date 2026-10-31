@@ -2,7 +2,7 @@ use std::ffi::{c_char, c_int, c_void};
 
 pub const SPA_VERSION_HANDLE: u32 = 0;
 pub const SPA_VERSION_HANDLE_FACTORY: u32 = 1;
-pub const SPA_VERSION_BLUEZ5_CODEC_MEDIA: u32 = 16;
+pub const SPA_VERSION_BLUEZ5_CODEC_MEDIA: u32 = 17;
 
 #[cfg(test)]
 pub const SPA_PARAM_ENUM_FORMAT: u32 = 3;
@@ -201,6 +201,7 @@ pub struct media_codec_audio_info {
 pub type Opaque = c_void;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct media_codec {
     pub id: u32,
     pub kind: u32,
@@ -213,6 +214,7 @@ pub struct media_codec {
     pub send_buf_size: usize,
     pub duplex_codec: *const media_codec,
     pub stream_pkt: bool,
+    pub endpoint_companion: bool,
 
     pub get_bis_config: Option<
         unsafe extern "C" fn(
@@ -225,6 +227,16 @@ pub struct media_codec {
     >,
     pub fill_caps:
         Option<unsafe extern "C" fn(*const media_codec, u32, *const spa_dict, *mut u8) -> c_int>,
+    pub combine_caps: Option<
+        unsafe extern "C" fn(
+            *const media_codec,
+            u32,
+            *mut u8,
+            c_int,
+            *const u8,
+            c_int,
+        ) -> c_int,
+    >,
     pub select_config: Option<
         unsafe extern "C" fn(
             *const media_codec,
@@ -378,7 +390,7 @@ unsafe extern "C" {
 const _: () = {
     use std::mem::{align_of, offset_of, size_of};
 
-    assert!(size_of::<media_codec>() == 296);
+    assert!(size_of::<media_codec>() == 304);
     assert!(align_of::<media_codec>() == 8);
     assert!(offset_of!(media_codec, kind) == 4);
     assert!(offset_of!(media_codec, codec_id) == 8);
@@ -390,34 +402,36 @@ const _: () = {
     assert!(offset_of!(media_codec, send_buf_size) == 48);
     assert!(offset_of!(media_codec, duplex_codec) == 56);
     assert!(offset_of!(media_codec, stream_pkt) == 64);
+    assert!(offset_of!(media_codec, endpoint_companion) == 65);
     assert!(offset_of!(media_codec, get_bis_config) == 72);
     assert!(offset_of!(media_codec, fill_caps) == 80);
-    assert!(offset_of!(media_codec, select_config) == 88);
-    assert!(offset_of!(media_codec, enum_config) == 96);
-    assert!(offset_of!(media_codec, validate_config) == 104);
-    assert!(offset_of!(media_codec, get_qos) == 112);
-    assert!(offset_of!(media_codec, get_metadata) == 120);
-    assert!(offset_of!(media_codec, free_config_data) == 128);
-    assert!(offset_of!(media_codec, caps_preference_cmp) == 136);
-    assert!(offset_of!(media_codec, init_props) == 144);
-    assert!(offset_of!(media_codec, clear_props) == 152);
-    assert!(offset_of!(media_codec, enum_props) == 160);
-    assert!(offset_of!(media_codec, set_props) == 168);
-    assert!(offset_of!(media_codec, init) == 176);
-    assert!(offset_of!(media_codec, deinit) == 184);
-    assert!(offset_of!(media_codec, update_props) == 192);
-    assert!(offset_of!(media_codec, get_block_size) == 200);
-    assert!(offset_of!(media_codec, get_interval) == 208);
-    assert!(offset_of!(media_codec, abr_process) == 216);
-    assert!(offset_of!(media_codec, start_encode) == 224);
-    assert!(offset_of!(media_codec, encode) == 232);
-    assert!(offset_of!(media_codec, start_decode) == 240);
-    assert!(offset_of!(media_codec, decode) == 248);
-    assert!(offset_of!(media_codec, produce_plc) == 256);
-    assert!(offset_of!(media_codec, reduce_bitpool) == 264);
-    assert!(offset_of!(media_codec, increase_bitpool) == 272);
-    assert!(offset_of!(media_codec, set_log) == 280);
-    assert!(offset_of!(media_codec, get_delay) == 288);
+    assert!(offset_of!(media_codec, combine_caps) == 88);
+    assert!(offset_of!(media_codec, select_config) == 96);
+    assert!(offset_of!(media_codec, enum_config) == 104);
+    assert!(offset_of!(media_codec, validate_config) == 112);
+    assert!(offset_of!(media_codec, get_qos) == 120);
+    assert!(offset_of!(media_codec, get_metadata) == 128);
+    assert!(offset_of!(media_codec, free_config_data) == 136);
+    assert!(offset_of!(media_codec, caps_preference_cmp) == 144);
+    assert!(offset_of!(media_codec, init_props) == 152);
+    assert!(offset_of!(media_codec, clear_props) == 160);
+    assert!(offset_of!(media_codec, enum_props) == 168);
+    assert!(offset_of!(media_codec, set_props) == 176);
+    assert!(offset_of!(media_codec, init) == 184);
+    assert!(offset_of!(media_codec, deinit) == 192);
+    assert!(offset_of!(media_codec, update_props) == 200);
+    assert!(offset_of!(media_codec, get_block_size) == 208);
+    assert!(offset_of!(media_codec, get_interval) == 216);
+    assert!(offset_of!(media_codec, abr_process) == 224);
+    assert!(offset_of!(media_codec, start_encode) == 232);
+    assert!(offset_of!(media_codec, encode) == 240);
+    assert!(offset_of!(media_codec, start_decode) == 248);
+    assert!(offset_of!(media_codec, decode) == 256);
+    assert!(offset_of!(media_codec, produce_plc) == 264);
+    assert!(offset_of!(media_codec, reduce_bitpool) == 272);
+    assert!(offset_of!(media_codec, increase_bitpool) == 280);
+    assert!(offset_of!(media_codec, set_log) == 288);
+    assert!(offset_of!(media_codec, get_delay) == 296);
 
     assert!(size_of::<a2dp_vendor_codec_t>() == 6);
     assert!(size_of::<spa_bluez5_codec_a2dp>() == 40);

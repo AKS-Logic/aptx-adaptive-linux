@@ -84,11 +84,11 @@ impl Table {
         match res {
             Ok(l) => {
                 let real = self.real.get().cast::<media_codec>();
-                for (i, &c) in l.codecs.iter().enumerate() {
+                for (i, c) in l.codecs.iter().enumerate() {
                     // SAFETY: `c` passed `validate`, and i < MAX_REAL; a bitwise copy keeps
                     // every pointer inside it.
                     unsafe {
-                        real.add(i).write(ptr::read(c));
+                        real.add(i).write(*c);
                         list[2 + i] = real.add(i);
                     }
                 }
@@ -162,10 +162,10 @@ impl Table3 {
         match res {
             Ok(l) => {
                 let real = self.real.get().cast::<media_codec>();
-                for (i, &c) in l.codecs.iter().enumerate() {
+                for (i, c) in l.codecs.iter().enumerate() {
                     // SAFETY: `c` passed `validate`; a bitwise copy keeps its pointers.
                     unsafe {
-                        real.add(i).write(ptr::read(c));
+                        real.add(i).write(*c);
                         list[n + i] = real.add(i);
                     }
                 }
@@ -186,7 +186,7 @@ fn log(msg: &str) {
 
 struct Loaded {
     path: PathBuf,
-    codecs: Vec<*const media_codec>,
+    codecs: Vec<media_codec>,
 }
 
 /// Where to look, in order: `SPA_PLUGIN_DIR` (colon-separated, like PipeWire) or, if it's
@@ -294,7 +294,7 @@ unsafe fn probe(
     info: *const spa_dict,
     support: *const spa_support,
     n_support: u32,
-) -> Result<Vec<*const media_codec>, String> {
+) -> Result<Vec<media_codec>, String> {
     // SAFETY: caller contract; the symbol has the C type of spa_handle_factory_enum.
     unsafe {
         let sym = crate::ffi::dlsym(lib, c"spa_handle_factory_enum".as_ptr());
@@ -357,11 +357,11 @@ unsafe fn probe(
         let mut codecs = Vec::new();
         if !iface.codecs.is_null() {
             while codecs.len() <= MAX_REAL {
-                let c = *iface.codecs.add(codecs.len());
-                if c.is_null() {
+                let ptr = *iface.codecs.add(codecs.len());
+                if ptr.is_null() {
                     break;
                 }
-                codecs.push(c);
+                codecs.push(*ptr);
             }
         }
         if let Err(e) = validate(&codecs) {
@@ -389,14 +389,12 @@ unsafe fn is_ours(info: *const spa_dict) -> bool {
 /// has the version but not the contents we expect. Every entry needs a name, A2DP kind,
 /// vendor codec type and the callbacks PipeWire calls on any A2DP codec; `aptx_hd` and `aptx`
 /// must also have their ids and vendor ids where we expect them.
-fn validate(codecs: &[*const media_codec]) -> Result<(), String> {
+fn validate(codecs: &[media_codec]) -> Result<(), String> {
     if codecs.len() > MAX_REAL {
         return Err(format!("more than {MAX_REAL} codecs"));
     }
     let mut found = [false; 2];
-    for &c in codecs {
-        // SAFETY: entries of a NULL-terminated list from the plugin.
-        let c = unsafe { &*c };
+    for c in codecs {
         let (v, cid) = (c.vendor.vendor_id, c.vendor.codec_id);
         if c.codec_id == A2DP_CODEC_VENDOR && (v, cid) == (ids::VENDOR_ID, ids::CODEC_ID) {
             return Err("it's another copy of the aptX Adaptive plugin".into());
@@ -472,31 +470,31 @@ mod tests {
     fn validate_rejects_missing_or_wrong_entries() {
         assert_eq!(validate(&[]), Err("no aptx_hd codec".into()));
         let ours = crate::codec_for_test();
-        assert!(validate(&[&raw const ours]).unwrap_err().contains("copy"));
+        assert!(validate(&[ours]).unwrap_err().contains("copy"));
         let mut hd = crate::codec_for_test();
         hd.name = c"aptx_hd".as_ptr();
         hd.vendor.codec_id = 0x24;
-        assert!(validate(&[&raw const hd]).unwrap_err().contains("layout"));
+        assert!(validate(&[hd]).unwrap_err().contains("layout"));
         hd.id = SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD;
-        assert_eq!(validate(&[&raw const hd]), Err("no aptx codec".into()));
+        assert_eq!(validate(&[hd]), Err("no aptx codec".into()));
         let mut aptx = crate::codec_for_test();
         aptx.name = c"aptx".as_ptr();
         aptx.vendor.vendor_id = 0x4F;
         aptx.vendor.codec_id = 0x01;
         aptx.id = SPA_BLUETOOTH_AUDIO_CODEC_APTX;
-        assert_eq!(validate(&[&raw const hd, &raw const aptx]), Ok(()));
+        assert_eq!(validate(&[hd, aptx]), Ok(()));
 
         let mut other = crate::codec_for_test();
         other.name = c"aptx_ll".as_ptr();
         other.vendor.vendor_id = 0x0A;
-        let check = |o: &media_codec| validate(&[&raw const hd, &raw const aptx, o]);
-        assert_eq!(check(&other), Ok(()));
+        let check = |o: media_codec| validate(&[hd, aptx, o]);
+        assert_eq!(check(other), Ok(()));
         other.kind = 1;
-        assert!(check(&other).unwrap_err().contains("aptx_ll is kind 1"));
+        assert!(check(other).unwrap_err().contains("aptx_ll is kind 1"));
         other.kind = MEDIA_CODEC_A2DP;
         other.init = None;
-        assert!(check(&other).unwrap_err().contains("layout"));
+        assert!(check(other).unwrap_err().contains("layout"));
         other.name = ptr::null();
-        assert!(check(&other).unwrap_err().contains("without a name"));
+        assert!(check(other).unwrap_err().contains("without a name"));
     }
 }
