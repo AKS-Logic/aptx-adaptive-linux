@@ -1,23 +1,26 @@
 # aptx-adaptive-for-linux
 
-This is a research project which shows that AI is capable of integrating audio
-technologies and demonstrates the AI capability in clean room implementation of 
-Bluetooth codecs.
+This is a research project which shows that AI is capable of integrating audio and
+Bluetooth technologies and demonstrates the AI's ability to do a clean room 
+implementation of Bluetooth codecs.
 
-aptX Adaptive for Linux contains a Rust encoder and PipeWire Bluetooth codec plugin.
+AptX Adaptive for Linux contains a Rust encoder and a Bluetooth codec plugin 
+for PipeWire.
+
 It streams audio from a Linux desktop to aptX Adaptive headphones over stock
 BlueZ and PipeWire, with no USB dongle and no external codec files. 
 This project was tested with Bose Quiet Comfort Ultra (gen 1).
 It may or may not work directly with other headphones; some simple tweaks
-made by AI agent may allow it to work with other headphones and machines,
-demonstrating AI's capability even more.
+made by an AI agent may allow it to work with other headphones and machines,
+demonstrating AI's capability to integrate even more.
 
 **Clean-room notice:** this is an independent clean-room reimplementation. No
 vendor source code, SDK, headers, NDA material, or vendor binary is included
 or redistributed in this repository; all original code was written by the
 project. See [`LEGAL.md`](LEGAL.md) for the full statement.
 
-This falls under fair use as the objective is to research AI capabilities and introduce compatibility with linux.
+This falls under fair use as the objective is to research AI capabilities and
+introduce compatibility with other softwares (in this case, linux).
 
 ## capabilities
 
@@ -37,13 +40,14 @@ the last profile you picked for a headset.
 
 HQ never steps its ladder — it holds level 5 and accepts the extra latency. Adaptive starts
 at the bottom row and steps up when the connection allows, dropping back when it does not;
-every change applies from the next packet. LL is the lowest latency this headset can reach:
+every change applies from the next packet. LL is the lowest latency tested headset could reach:
 the table also holds 8 ms / 384-sample rows, but they need a sink that advertises
-*enhanced LL*, which the Bose does not.
+*enhanced LL*, which the tested Bose headphones does not.
 
 **Switching.** Pick another card profile in GNOME/KDE settings, pavucontrol or pwvucontrol.
-On the tested headset the link stays up across all three; A2DP still renegotiates, so a
-short chime is normal. For a change that does not renegotiate at all, use the in-band §7K
+On the tested headset the link stays up across all three, A2DP renegotiates. 
+
+For a change that does not renegotiate at all, use the in-band §7K
 path — the node's quality property, or the optional control file described below.
 
 **Sample rates on R2 headsets:** 44.1, 48 and 96 kHz; 96 kHz in HQ only, 44.1 kHz in HQ or
