@@ -228,14 +228,7 @@ pub struct media_codec {
     pub fill_caps:
         Option<unsafe extern "C" fn(*const media_codec, u32, *const spa_dict, *mut u8) -> c_int>,
     pub combine_caps: Option<
-        unsafe extern "C" fn(
-            *const media_codec,
-            u32,
-            *mut u8,
-            c_int,
-            *const u8,
-            c_int,
-        ) -> c_int,
+        unsafe extern "C" fn(*const media_codec, u32, *mut u8, c_int, *const u8, c_int) -> c_int,
     >,
     pub select_config: Option<
         unsafe extern "C" fn(

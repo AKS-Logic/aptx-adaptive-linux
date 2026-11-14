@@ -52,9 +52,23 @@ fn plugin_path() -> &'static PathBuf {
             .status()
             .unwrap();
         assert!(status.success(), "cargo build of the plugin failed");
-        std::env::current_exe()
-            .unwrap()
-            .with_file_name("libspa_codec_aptx_adaptive.so")
+        let exe = std::env::current_exe().unwrap();
+        let next_to_test = exe.with_file_name("libspa_codec_aptx_adaptive.so");
+        if next_to_test.is_file() {
+            return next_to_test;
+        }
+        // cargo places the cdylib in target/{debug,release}/, while the
+        // test binary may live in deps/ or build/.../out/.
+        let mut dir = exe.parent();
+        for _ in 0..6 {
+            let Some(d) = dir else { break };
+            let top = d.join("libspa_codec_aptx_adaptive.so");
+            if top.is_file() {
+                return top;
+            }
+            dir = d.parent();
+        }
+        next_to_test
     })
 }
 
