@@ -1,0 +1,132 @@
+diff --git a/profiles/audio/hfp-hf.c b/profiles/audio/hfp-hf.c
+index 4e62665..0dad4b3 100644
+--- a/profiles/audio/hfp-hf.c
++++ b/profiles/audio/hfp-hf.c
+@@ -41,6 +41,7 @@
+ #include "src/plugin.h"
+ #include "src/profile.h"
+ #include "src/service.h"
++#include "src/textfile.h"
+ #include "src/shared/hfp.h"
+ #include "src/shared/queue.h"
+ 
+@@ -355,6 +356,96 @@ static void hfp_hf_call_line_id_updated(uint id, const char *number,
+ 	telephony_call_set_line_id(call, number);
+ }
+ 
++static void hfp_hf_store_codec(struct hfp_device *dev)
++{
++	struct btd_device *device;
++	struct btd_adapter *adapter;
++	char filename[PATH_MAX];
++	char dst_addr[18];
++	GKeyFile *key_file;
++	GError *gerr = NULL;
++	char *data;
++	size_t len = 0;
++
++	device = telephony_get_device(dev->telephony);
++
++	if (!device)
++		return;
++
++	adapter = device_get_adapter(device);
++
++	if (!adapter)
++		return;
++
++	ba2str(device_get_address(device), dst_addr);
++
++	create_filename(filename, PATH_MAX, "/%s/cache/%s",
++			btd_adapter_get_storage_dir(adapter), dst_addr);
++
++	key_file = g_key_file_new();
++
++	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr))
++		g_clear_error(&gerr);
++
++	g_key_file_set_integer(key_file, "HFP", "LastCodec", dev->codec);
++
++	data = g_key_file_to_data(key_file, &len, NULL);
++
++	if (!g_file_set_contents(filename, data, len, &gerr)) {
++		error("Unable to set contents for %s: (%s)", filename,
++							gerr->message);
++		g_error_free(gerr);
++	}
++
++	g_free(data);
++	g_key_file_free(key_file);
++}
++
++static uint8_t hfp_hf_load_codec(struct btd_device *device)
++{
++	struct btd_adapter *adapter;
++	char filename[PATH_MAX];
++	char dst_addr[18];
++	GKeyFile *key_file;
++	GError *gerr = NULL;
++	int codec;
++
++	adapter = device_get_adapter(device);
++
++	if (!adapter)
++		return 1;
++
++	ba2str(device_get_address(device), dst_addr);
++
++	create_filename(filename, PATH_MAX, "/%s/cache/%s",
++			btd_adapter_get_storage_dir(adapter), dst_addr);
++
++	key_file = g_key_file_new();
++
++	if (!g_key_file_load_from_file(key_file, filename, 0, &gerr)) {
++		g_clear_error(&gerr);
++		g_key_file_free(key_file);
++
++		return 1;
++	}
++
++	codec = g_key_file_get_integer(key_file, "HFP", "LastCodec", &gerr);
++
++	if (gerr) {
++		g_clear_error(&gerr);
++		g_key_file_free(key_file);
++
++		return 1;
++	}
++
++	g_key_file_free(key_file);
++
++	if (codec <= 0 || codec > UINT8_MAX)
++		return 1;
++
++	return (uint8_t) codec;
++}
++
+ static uint8_t hfp_hf_get_codecs(uint8_t *codecs, uint8_t max_codecs,
+ 							void *user_data)
+ {
+@@ -390,6 +481,9 @@ static bool hfp_hf_select_codec(uint8_t codec, void *user_data)
+ 	for (l = server->endpoints; l; l = l->next) {
+ 		if (media_endpoint_get_codec(l->data) == codec) {
+ 			dev->codec = codec;
++
++			hfp_hf_store_codec(dev);
++
+ 			return true;
+ 		}
+ 	}
+@@ -874,8 +968,10 @@ static int hfp_probe(struct btd_service *service)
+ 		return -EINVAL;
+ 
+ 	dev->telephony = telephony_new(service, dev, &hfp_callbacks);
+-	/* Use CVSD codec by default */
+-	dev->codec = 1;
++	/*
++	 * Use last codec if stored, CVSD otherwise.
++	 */
++	dev->codec = hfp_hf_load_codec(device);
+ 	btd_service_set_user_data(service, dev);
+ 	telephony_add_uri_scheme(dev->telephony, URI);
+ 

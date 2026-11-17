@@ -11,14 +11,15 @@ against that tree byte for byte.
 
 | Patch | Base | Verification |
 |---|---|---|
-| [`pipewire/0001-bluez5-aptx-adaptive.patch`](pipewire/0001-bluez5-aptx-adaptive.patch) | PipeWire git master, commit `4cfc47112` | all **10** patched files identical to the build tree |
-| [`bluez/0001-avdtp-Keep-the-session-on-an-unanswered-Abort.patch`](bluez/0001-avdtp-Keep-the-session-on-an-unanswered-Abort.patch) | BlueZ git master, commit `14bd6ab65` | first of three; applies cleanly |
-| [`bluez/0002-a2dp-Recover-from-a-failed-reconfiguration.patch`](bluez/0002-a2dp-Recover-from-a-failed-reconfiguration.patch) | same | second of three; applies cleanly |
-| [`bluez/0003-aptx-adaptive-additions.patch`](bluez/0003-aptx-adaptive-additions.patch) | same, **applied on top of 0001 and 0002** | together the three reproduce all **7** modified files identically |
+| [`pipewire/0001-bluez5-aptx-adaptive.patch`](pipewire/0001-bluez5-aptx-adaptive.patch) | PipeWire git master, commit `a9dbcf677` | all **11** patched files identical to the build tree |
+| [`bluez/0001-aptx-adaptive-additions.patch`](bluez/0001-aptx-adaptive-additions.patch) | BlueZ git master, commit `20ffd285b` | **8** modified files reproduce the build tree identically |
+| [`bluez/0002-hfp-hf-remember-last-codec.patch`](bluez/0002-hfp-hf-remember-last-codec.patch) | same, applied on top of 0001 | HFP HF keeps the last negotiated codec |
 
-`0001`/`0002` are the named fixes; `0003` carries the remaining changes our tree has beyond
-them. Skipping `0003` yields a `bluetoothd` that applies cleanly but does not match what we
-built — the failure mode this directory exists to avoid.
+BlueZ `0001` already contains the AVDTP unanswered-Abort handling and the A2DP
+reconfiguration recovery; they are part of the same tree, so they are not separate files.
+The PipeWire set now also carries two HFP fixes: a wideband codec wins over CVSD when both
+are offered, and an idle SLC no longer activates the HFP profile (which made a headset
+announce "call ended" on the first playback).
 
 ## Why the PipeWire patch exists
 
@@ -28,13 +29,14 @@ Without it the third profile cannot exist at all, and a profile switch can kill 
 |---|---|---|
 | `spa/include/spa/param/bluetooth/audio.h` | +8 | register the aptX Adaptive codec ids in the codec enum |
 | `spa/include/spa/param/bluetooth/type-info.h` | +6 | **the `0x303` row** — card profiles are enumerated by codec id, so without a row here the HQ profile can never be listed |
-| `spa/plugins/bluez5/codec-loader.c` | +35 | plugin table entry for `aptx_adaptive_hq`, so the loader opens that file |
-| `spa/plugins/bluez5/bluez5-device.c` | +29 | profile construction for the extra codec ids |
-| `spa/plugins/bluez5/bluez5-dbus.c` | +116 | endpoint/transport handling around reconfiguration |
-| `spa/plugins/bluez5/defs.h` | +10 | codec-id definitions used by the files above |
+| `spa/plugins/bluez5/codec-loader.c` | +27 | plugin table entry for `aptx_adaptive_hq`, so the loader opens that file |
+| `spa/plugins/bluez5/bluez5-device.c` | +12 | profile construction for the extra codec ids |
+| `spa/plugins/bluez5/bluez5-dbus.c` | +88 | endpoint/transport handling around reconfiguration |
+| `spa/plugins/bluez5/defs.h` | +2 | codec-id definitions used by the files above |
 | `spa/plugins/bluez5/a2dp-codec-aptx.c` | +8 | accept the Adaptive codec id in the combined aptX plugin |
-| `spa/plugins/bluez5/media-sink.c` | +372 | sink-side transport path, including the `aptxdiag` write-active line |
-| `spa/plugins/bluez5/media-source.c` | +154 | source-side transport path |
+| `spa/plugins/bluez5/media-sink.c` | +369 | sink-side transport path, including the `aptxdiag` write-active line |
+| `spa/plugins/bluez5/media-source.c` | +152 | source-side transport path |
+| `spa/plugins/bluez5/backend-native.c` | +18 | wideband codec preferred over CVSD; no HFP profile activation without a call |
 | `spa/plugins/bluez5/meson.build` | +3 | build wiring for the above |
 
 The single most important hunk is the `type-info.h` row. It was the actual reason HQ never
@@ -44,9 +46,9 @@ appeared while the codec was otherwise accepted by the loader.
 
 A profile change makes BlueZ send AVDTP `Close`/`Abort`. Some sinks (the tested Bose among
 them) ignore the Abort, so upstream BlueZ waits out its timeout and tears the link down.
-`0001` keeps the session alive when the Abort goes unanswered, `0002` recovers a failed
-reconfiguration instead of dropping the link, and `0003` is the rest of what our build tree
-carries.
+`0001` carries the AVDTP unanswered-Abort handling, the A2DP reconfiguration recovery, and
+the aptX Adaptive endpoint/transport additions. `0002` makes HFP HF keep the codec it last
+negotiated instead of falling back to CVSD on every connect.
 
 ## Applying them
 
@@ -56,7 +58,7 @@ overwrites them — it writes the package copy as `.pacnew`. To build them from 
 ```sh
 # PipeWire
 git clone https://gitlab.freedesktop.org/pipewire/pipewire.git
-cd pipewire && git checkout 4cfc47112      # git master
+cd pipewire && git checkout a9dbcf677      # git master
 git apply /path/to/patches/pipewire/0001-bluez5-aptx-adaptive.patch
 meson setup _build && ninja -C _build spa/plugins/bluez5/libspa-bluez5.so
 sudo install -m755 _build/spa/plugins/bluez5/libspa-bluez5.so \
@@ -64,7 +66,7 @@ sudo install -m755 _build/spa/plugins/bluez5/libspa-bluez5.so \
 
 # BlueZ
 git clone https://git.kernel.org/pub/scm/bluetooth/bluez.git
-cd bluez && git checkout 14bd6ab65         # git master; apply 0001..0003 in order
+cd bluez && git checkout 20ffd285b         # git master; apply 0001..0002 in order
 for p in /path/to/patches/bluez/*.patch; do git apply "$p" || break; done
 ./bootstrap-configure && make -j"$(nproc)"
 sudo install -m755 src/bluetoothd /usr/lib/bluetooth/bluetoothd
